@@ -1,0 +1,15 @@
+node_modules
+config/*
+data
+.env
+.git
+*.sqlite*
+test
+**/*.pem
+**/*.key
+**/*.crt
+**/*.p12
+**/*.pfx
+**/*.log
+backups
+private

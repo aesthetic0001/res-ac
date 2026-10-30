@@ -1,0 +1,44 @@
+name: temperature-sensors
+services:
+  backend:
+    image: temperature-backend:local
+    build: .
+    init: true
+    restart: unless-stopped
+    env_file:
+      - path: ./config/server.env
+        required: false
+    ports:
+      - "${HTTPS_PORT:-443}:3000"
+    volumes:
+      - sensor-data:/data
+      - sensor-tls:/run/sensor-tls:ro
+    stop_grace_period: 15s
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+  certbot:
+    image: certbot/certbot:v5.9.0
+    restart: unless-stopped
+    env_file:
+      - path: ./config/server.env
+        required: false
+    entrypoint: ["/bin/sh", "/opt/certbot/renew.sh"]
+    ports:
+      - "80:80"
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - sensor-tls:/run/sensor-tls
+      - ./deploy/certbot:/opt/certbot:ro
+  setup:
+    image: temperature-backend:local
+    build: .
+    profiles: [setup]
+    entrypoint: ["node", "deploy/setup.mjs"]
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./config:/setup
+volumes:
+  sensor-data:
+  letsencrypt:
+  sensor-tls:

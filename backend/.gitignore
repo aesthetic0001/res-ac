@@ -1,0 +1,7 @@
+config/*
+!config/.gitkeep
+!config/example.env
+data/
+node_modules/
+.env
+*.sqlite*
