@@ -199,6 +199,17 @@ single Node process; multiple replicas need shared storage and poll notification
 npm test
 ```
 
+For the Docker-specific Certbot mount and publication regression check:
+
+```sh
+npm run test:docker
+```
+
+This uses a disposable Compose project, performs no certificate issuance, and
+removes its test volumes afterward. The hook scripts mount at
+`/opt/sensor-backend-hooks`; `/opt/certbot` belongs to Certbot's Python package
+installation and must not be shadowed by a bind mount.
+
 Tests cover authentication/CSRF, device isolation, readings and duplicate uploads,
 long-poll timeout/wakeup/disconnect, ordered leased delivery and result retries,
 command expiry, persistence, credential rotation, public-IP selection, and TLS

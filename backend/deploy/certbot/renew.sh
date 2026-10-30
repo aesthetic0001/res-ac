@@ -8,7 +8,7 @@ issue() {
   certbot certonly --non-interactive --agree-tos --email "$ACME_EMAIL" \
     --standalone --preferred-profile shortlived --ip-address "$VPS_IP" \
     --cert-name sensor-backend --key-type rsa --rsa-key-size 2048 \
-    --keep-until-expiring --renew-with-new-domains --deploy-hook 'python /opt/certbot/publish.py'
+    --keep-until-expiring --renew-with-new-domains --deploy-hook 'python /opt/sensor-backend-hooks/publish.py'
 }
 # Initial issuance is retried if DNS/routing/firewall or CA connectivity is unavailable.
 until issue; do
@@ -16,10 +16,10 @@ until issue; do
   sleep 300 & wait $! || exit 0
 done
 # Publish an existing valid certificate too, e.g. when recreating only the shared TLS volume.
-RENEWED_LINEAGE=/etc/letsencrypt/live/sensor-backend python /opt/certbot/publish.py
+RENEWED_LINEAGE=/etc/letsencrypt/live/sensor-backend python /opt/sensor-backend-hooks/publish.py
 while :; do
   # Short-lived certificates need frequent renewal checks. Certbot renews only when due.
-  if ! certbot renew --non-interactive --deploy-hook 'python /opt/certbot/publish.py'; then
+  if ! certbot renew --non-interactive --deploy-hook 'python /opt/sensor-backend-hooks/publish.py'; then
     echo 'Renewal failed; keeping the existing certificate and retrying in one hour.' >&2
   fi
   sleep 3600 & wait $! || exit 0
