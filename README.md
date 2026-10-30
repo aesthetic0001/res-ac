@@ -32,10 +32,16 @@ use their own tokens; browser logins use server-side cookie sessions.
 
 ## Device status
 
-`src/main.cpp` currently provides a USB-to-Linux serial terminal for the
-Seeeduino Cloud. It is not yet the sensor/IR execution agent. The backend API
-and web interface are implemented; AVR sensor posting and hardware-command
-execution still need integration with a Linux-side device agent.
+`src/main.cpp` reads a DHT11 on digital pin 3 and publishes temperature/humidity
+through the internal Arduino Bridge. A Linux-side agent posts readings over
+verified HTTPS every 10 seconds, buffers samples during short outages, and
+retries with stable IDs to avoid duplicate records. Device credentials and the
+backend address are configured privately at installation time.
+
+[Device setup and reporting](device/README.md) covers installation, diagnostics,
+and retry behavior. The original USB-to-Linux terminal is preserved as a
+[separate recovery project](recovery/serial-terminal/README.md). Hardware command
+polling and IR execution remain to be implemented on the device.
 
 [Eduroam tooling](EDUROAM.md) describes the credential/checking helpers without
 including a deployed network profile or institution-specific settings.

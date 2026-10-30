@@ -1,0 +1,17 @@
+#!/bin/sh /etc/rc.common
+START=95
+STOP=10
+
+start() {
+    umask 077
+    test -f /etc/res-ac/agent.json || return 0
+    if test -f /usr/lib/res-ac/curl.gz; then
+        gzip -dc /usr/lib/res-ac/curl.gz > /tmp/res-ac-curl.new || return 1
+        chmod 700 /tmp/res-ac-curl.new
+        mv /tmp/res-ac-curl.new /tmp/res-ac-curl
+    fi
+    start-stop-daemon -S -b -m -p /var/run/res-ac-agent.pid -x /usr/bin/python -- -u /usr/lib/res-ac/res_ac_agent.py >> /tmp/res-ac-agent.log 2>&1
+}
+stop() {
+    start-stop-daemon -K -p /var/run/res-ac-agent.pid
+}
