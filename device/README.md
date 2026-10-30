@@ -1,4 +1,4 @@
-# Seeeduino Cloud temperature and humidity reporting
+# Seeeduino Cloud telemetry and ping
 
 The AVR sketch in `src/main.cpp` reads a **DHT11 on digital pin 3**. It uses the
 internal Arduino Bridge to publish a single sample containing temperature,
@@ -72,10 +72,43 @@ The POST route is `/api/devices/<device-id>/readings` with a device bearer token
 Curl reads the URL/token from a private temporary config rather than command-line
 arguments. Temporary request files are removed afterward. Logs exclude tokens,
 server URLs, and response bodies; `/tmp/res-ac-agent.log` is bounded in size.
-The AVR USB serial monitor shows sensor values and the latest uploader status.
+The AVR USB serial monitor shows sensor values and the latest uploader and
+command status.
 
-Commands/IR execution are not implemented in this telemetry agent yet. Their
-polling mechanism can be added independently without blocking the poster.
+## Ping commands
+
+In the backend dashboard, queue command type `device.ping` with payload `{}`.
+Linux maintains one 30-second long poll on `GET /api/devices/<device-id>/commands`
+with a 35-second curl timeout. Polling runs alongside sensor uploads. On delivery,
+it writes `v1,<command-UUID>,ping` to the Bridge `resac_command` key. The AVR
+checks this key every 250 ms and returns `v1,<command-UUID>,pong,<uptime-ms>` in
+`resac_command_result`. Linux requires a matching UUID and Arduino response;
+it does not answer ping on the Arduino's behalf.
+Polling starts only after the Arduino advertises its ping handler through Bridge,
+so an older sketch cannot start the command poller.
+
+The agent posts the result to
+`POST /api/devices/<device-id>/commands/<command-UUID>/result`:
+
+```json
+{"status":"succeeded","result":{"reply":"pong","uptimeMs":12345}}
+```
+
+Missing Arduino responses fail after 10 seconds. Unsupported command types
+report `failed`; IR execution is not implemented. Network failures use bounded
+exponential retries. The agent waits for result acceptance before polling the
+next command. Expired or removed commands (HTTP 409/404) are abandoned.
+
+The AVR caches its last ping reply, and the agent saves its latest completed
+result atomically in `/etc/res-ac/command-result.json` (mode 600). A lost result
+acknowledgment or agent restart retries that same result without repeating the
+Arduino request. Ping itself is harmless to repeat if power is lost before the
+result is saved; this is not an exactly-once guarantee for future IR actions.
+Only completed commands write this small journal to flash, not empty polls.
+
+To upgrade an existing device through USB, upload the recovery project first,
+run the installer above (the existing TLS binary is reused), then upload the
+main project again. Both the Linux agent and AVR sketch need this upgrade.
 
 ## Diagnosis and recovery
 
@@ -102,4 +135,6 @@ python3 -m unittest discover -s device/test -v
 
 Tests cover sensor frame validation, legacy JSON variants, fragmented Bridge
 responses, epoch initialization, bounded buffering, in-flight sampling, retry
-IDs, HTTPS trust verification, and private request-file cleanup.
+IDs, HTTPS trust verification, and private request-file cleanup. Ping tests cover
+the HTTPS poll/result exchange with a simulated Arduino, stale acknowledgments,
+execution timeout, unsupported commands, retry identity, and restart recovery.

@@ -5,9 +5,11 @@ from pathlib import Path
 import secrets
 import socketserver
 import ssl
+import uuid
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -118,10 +120,21 @@ class AgentTests(unittest.TestCase):
                             '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1',
                             '-keyout', key, '-out', cert], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             received = []
+            ping_id = str(uuid.uuid4())
+            offered = []
             class Handler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    received.append((self.path, self.headers['Authorization'], None))
+                    commands = [] if offered else [dict(id=ping_id, type='device.ping', payload={})]
+                    offered.append(True)
+                    self.send_response(200 if commands else 204)
+                    self.end_headers()
+                    if commands:
+                        self.wfile.write(json.dumps(dict(commands=commands)).encode())
                 def do_POST(self):
                     received.append((self.path, self.headers['Authorization'], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
-                    self.send_response(201); self.end_headers(); self.wfile.write(b'{"duplicate":false}')
+                    self.send_response(200 if self.path.endswith('/result') else 201)
+                    self.end_headers(); self.wfile.write(b'{"duplicate":false}')
                 def log_message(self, *args):
                     pass
             server = HTTPServer(('127.0.0.1', 0), Handler)
@@ -146,6 +159,31 @@ class AgentTests(unittest.TestCase):
                 with patch.object(agent.subprocess, 'Popen', inspect):
                     self.assertEqual(agent.post(config, sample)[0], 201)
                 self.assertEqual(received[0], ('/api/devices/test-board/readings', 'Bearer ' + config['device_token'], sample))
+                class Arduino:
+                    def __init__(self):
+                        self.response = ''
+                    def get(self, key):
+                        return 'v1' if key == 'resac_command_ready' else self.response
+                    def put(self, key, value):
+                        if key == 'resac_command' and value:
+                            self.response = 'v1,%s,pong,4321' % ping_id
+                processor = agent.CommandProcessor(config, Arduino(), str(Path(directory) / 'ping.json'))
+                try:
+                    with patch.object(agent.subprocess, 'Popen', inspect):
+                        deadline = time.monotonic() + 5
+                        while time.monotonic() < deadline:
+                            processor.tick()
+                            if processor.cached and processor.reply is None:
+                                break
+                            time.sleep(0.01)
+                    self.assertIsNotNone(processor.cached)
+                    self.assertIsNone(processor.reply)
+                    self.assertIn(('/api/devices/test-board/commands', 'Bearer ' + config['device_token'], None), received)
+                    self.assertIn(('/api/devices/test-board/commands/%s/result' % ping_id,
+                                   'Bearer ' + config['device_token'],
+                                   dict(status='succeeded', result=dict(reply='pong', uptimeMs=4321))), received)
+                finally:
+                    processor.close()
                 self.assertTrue(all(not Path(path).exists() for path in files))
                 # Trusting the issuer must not accept a different server identity.
                 origin = config['server_url']
@@ -164,6 +202,14 @@ class AgentTests(unittest.TestCase):
     def test_sampling_continues_while_an_upload_is_pending(self):
         ticks = []
         closed = []
+        command_ticks = []
+        class Commands:
+            def __init__(self, config):
+                pass
+            def tick(self):
+                command_ticks.append(True)
+            def close(self):
+                closed.append(True)
         class Collector:
             def __init__(self, config, pending):
                 self.pending = pending
@@ -188,11 +234,118 @@ class AgentTests(unittest.TestCase):
                 return 201, b'{}'
             def close(self):
                 closed.append(True)
-        with patch.object(agent, 'Collector', Collector), patch.object(agent, 'CurlUpload', Upload), patch.object(agent.time, 'sleep'):
+        with patch.object(agent, 'Collector', Collector), patch.object(agent, 'CurlUpload', Upload), \
+                patch.object(agent, 'CommandProcessor', Commands), patch.object(agent.time, 'sleep'):
             with self.assertRaises(KeyboardInterrupt):
                 agent.run(dict(queue_limit=2))
         self.assertEqual(len(ticks), 7)
+        self.assertEqual(len(command_ticks), 6)
         self.assertTrue(closed)
+
+    def test_ping_round_trip_retries_and_restart_preserve_result(self):
+        command_id = str(uuid.uuid4())
+        calls = []
+        class Request:
+            def __init__(self, config, payload=None, **options):
+                self.payload, self.options = payload, options
+                self.response = None
+                self.process = self
+                self.closed = False
+                calls.append(self)
+            def poll(self):
+                return 0 if self.response is not None else None
+            def finish(self):
+                return self.response
+            def close(self):
+                self.closed = True
+        class Bridge:
+            def __init__(self):
+                self.values = {}
+                self.deliveries = []
+                self.ready = False
+            def get(self, key):
+                return ('v1' if self.ready else '') if key == 'resac_command_ready' else self.values.get(key)
+            def put(self, key, value):
+                self.values[key] = value
+                if key == 'resac_command' and value:
+                    self.deliveries.append(value)
+        bridge = Bridge()
+        clock = [10.0]
+        with tempfile.TemporaryDirectory() as directory, patch.object(agent, 'CurlUpload', Request), \
+                patch.object(agent, 'monotonic', lambda: clock[0]):
+            path = str(Path(directory) / 'command.json')
+            processor = agent.CommandProcessor({}, bridge, path)
+            processor.tick()
+            self.assertFalse(calls)  # Recovery/older firmware must not claim commands.
+            bridge.ready = True
+            clock[0] += 2
+            processor.tick()
+            poll = calls[-1]
+            self.assertEqual(poll.options, dict(route='commands', method='GET', timeout=35))
+            # An open long poll never blocks ticks or produces an AVR command.
+            for _ in range(5):
+                processor.tick()
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(bridge.deliveries)
+            poll.response = (200, json.dumps(dict(commands=[dict(id=command_id, type='device.ping', payload={})])).encode())
+            processor.tick()
+            self.assertTrue(poll.closed)
+            self.assertEqual(bridge.deliveries, ['v1,%s,ping' % command_id])
+            self.assertEqual(len(calls), 1)  # No success until the AVR responds.
+            bridge.values['resac_command_result'] = 'v1,%s,pong,12345' % command_id
+            clock[0] += 0.5
+            processor.tick()
+            result = calls[-1]
+            expected = dict(status='succeeded', result=dict(reply='pong', uptimeMs=12345))
+            self.assertEqual(result.payload, expected)
+            self.assertEqual(result.options['route'], 'commands/%s/result' % command_id)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            result.response = (500, b'{}')
+            processor.tick()
+            self.assertEqual(len(calls), 2)
+            clock[0] += 1
+            processor.tick()
+            self.assertEqual(calls[-1].payload, expected)
+            self.assertEqual(len(bridge.deliveries), 1)
+            processor.close()
+            # A restart resumes the saved result, without executing ping again.
+            processor = agent.CommandProcessor({}, bridge, path)
+            processor.tick()
+            self.assertEqual(calls[-1].payload, expected)
+            calls[-1].response = (200, b'{"ok":true}')
+            processor.tick()
+            self.assertEqual(calls[-1].options['method'], 'GET')
+            # A redelivery after a lost acknowledgment reuses that exact result.
+            calls[-1].response = poll.response
+            processor.tick()
+            self.assertEqual(calls[-1].payload, expected)
+            self.assertEqual(len(bridge.deliveries), 1)
+            processor.close()
+
+    def test_unsupported_commands_and_unresponsive_arduino_fail(self):
+        class Bridge:
+            def __init__(self):
+                self.sent = []
+            def get(self, key):
+                return 'v1,%s,pong,10' % str(uuid.uuid4())  # Stale, unrelated reply.
+            def put(self, key, value):
+                self.sent.append((key, value))
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = Bridge()
+            processor = agent.CommandProcessor({}, bridge, str(Path(directory) / 'command.json'))
+            processor._accept(dict(id=str(uuid.uuid4()), type='ir.send', payload={}))
+            self.assertEqual(processor.reply['status'], 'failed')
+            self.assertEqual(processor.reply['result']['error'], 'Unsupported command type')
+            self.assertFalse(bridge.sent)
+            processor.reply = None
+            with patch.object(agent, 'monotonic', return_value=10):
+                processor._accept(dict(id=str(uuid.uuid4()), type='device.ping', payload={}))
+                processor._arduino()
+                self.assertIsNone(processor.reply)
+            with patch.object(agent, 'monotonic', return_value=21):
+                processor._arduino()
+            self.assertEqual(processor.reply['status'], 'failed')
+            self.assertEqual(processor.reply['result']['error'], 'Arduino ping timed out')
 
     def test_config_requires_https_and_private_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
