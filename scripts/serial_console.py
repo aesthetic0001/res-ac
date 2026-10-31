@@ -80,6 +80,44 @@ class Console:
                  ' && chmod ' + format(mode, 'o') + ' ' + shlex.quote(destination) +
                  ' && rm -f ' + shlex.quote(temporary), timeout=180)
 
+    def download(self, source, progress=None, max_bytes=32 * 1024 * 1024):
+        """Read a board file without echoing its contents; verify before returning.
+
+        ACK each block to keep the AVR's small serial buffers bounded. Callers
+        must store configuration/flash backups in an ignored private directory.
+        """
+        sender = ("import sys,binascii\nf=open(%r,'rb')\n"
+                  "print('RESAC_DOWNLOAD_READY');sys.stdout.flush()\nsys.stdin.readline()\n"
+                  "while True:\n b=f.read(2304)\n if not b:break\n"
+                  " sys.stdout.write('RESAC_DOWNLOAD_DATA:'+binascii.b2a_base64(b));sys.stdout.flush()\n"
+                  " if sys.stdin.readline().strip()!='ACK':sys.exit(1)\n"
+                  "f.close()\nprint('RESAC_DOWNLOAD_DONE');sys.stdout.flush()\n") % source
+        self.send(('python -u -c ' + shlex.quote(sender) + '\r').encode())
+        self.expect(b'RESAC_DOWNLOAD_READY')
+        self.send(b'ACK\n')
+        data = bytearray()
+        while True:
+            line = self.expect(b'\n', 15)
+            if b'RESAC_DOWNLOAD_DONE' in line:
+                break
+            match = re.search(rb'RESAC_DOWNLOAD_DATA:([A-Za-z0-9+/=]+)', line)
+            if not match:
+                continue
+            data.extend(base64.b64decode(match.group(1), validate=True))
+            if len(data) > max_bytes:
+                self.send(b'CANCEL\n')
+                self.expect(b'/# ')
+                raise RuntimeError('Board download exceeds the configured size limit')
+            if progress:
+                progress(len(data))
+            self.send(b'ACK\n')
+        if b'/# ' not in line:
+            self.expect(b'/# ')
+        digest = self.run('md5sum ' + shlex.quote(source), timeout=60)
+        if hashlib.md5(data).hexdigest().encode() not in digest:
+            raise RuntimeError('Board download checksum mismatch')
+        return bytes(data)
+
     def close(self):
         try:
             self.send(b'stty echo\r')

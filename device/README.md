@@ -1,5 +1,7 @@
 # Seeeduino Cloud telemetry and ping
 
+For Linux OS upgrades, see the [firmware compatibility assessment](../FIRMWARE.md).
+
 The AVR sketch in `src/main.cpp` reads a **DHT11 on digital pin 3**. It uses the
 internal Arduino Bridge to publish a single sample containing temperature,
 humidity, a sequence number, and a Linux-provided boot/session epoch. Invalid
