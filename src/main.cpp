@@ -13,6 +13,39 @@ const unsigned long DEFAULT_INTERVAL_MS = 10000;
 unsigned long intervalMs = DEFAULT_INTERVAL_MS;
 unsigned long lastSampleMs = 0;
 unsigned long sequence = 0;
+unsigned long lastCommandCheckMs = 0;
+char lastCommandId[37] = {0};
+char lastCommandReply[80] = {0};
+
+bool validCommandId(const char *id) {
+  if (strlen(id) != 36) return false;
+  for (uint8_t i = 0; i < 36; ++i) {
+    if (i == 8 || i == 13 || i == 18 || i == 23) {
+      if (id[i] != '-') return false;
+    } else if (!((id[i] >= '0' && id[i] <= '9') ||
+                 (id[i] >= 'a' && id[i] <= 'f'))) return false;
+  }
+  return true;
+}
+
+void processCommand() {
+  char frame[64] = {0};
+  Bridge.get("resac_command", frame, sizeof(frame) - 1);
+  // One atomic request: v1,<backend command UUID>,ping.
+  if (strncmp(frame, "v1,", 3) != 0) return;
+  char *id = frame + 3;
+  char *separator = strchr(id, ',');
+  if (!separator) return;
+  *separator = '\0';
+  if (!validCommandId(id) || strcmp(separator + 1, "ping") != 0) return;
+  if (strcmp(id, lastCommandId) != 0) {
+    strcpy(lastCommandId, id);
+    snprintf(lastCommandReply, sizeof(lastCommandReply), "v1,%s,pong,%lu", id, millis());
+    Serial.println(F("Ping handled by Arduino; replying pong"));
+  }
+  // A repeated delivery returns the original response without executing again.
+  Bridge.put("resac_command_result", lastCommandReply);
+}
 
 bool validEpoch(const char *epoch) {
   if (strlen(epoch) != 32) return false;
@@ -67,6 +100,12 @@ void publishSample() {
     Serial.print(F("Uploader: "));
     Serial.println(uploadStatus);
   }
+  char commandStatus[48] = {0};
+  Bridge.get("resac_command_status", commandStatus, sizeof(commandStatus) - 1);
+  if (commandStatus[0]) {
+    Serial.print(F("Commands: "));
+    Serial.println(commandStatus);
+  }
 }
 } // namespace
 
@@ -76,12 +115,17 @@ void setup() {
   Serial.println(F("Starting sensor Bridge; Linux boot may take a moment..."));
   Bridge.begin();
   Bridge.put("resac_sensor_status", "starting");
+  Bridge.put("resac_command_ready", "v1");
   Serial.println(F("Bridge ready; DHT11 on digital pin 3"));
   lastSampleMs = millis() - DEFAULT_INTERVAL_MS;
 }
 
 void loop() {
   const unsigned long now = millis();
+  if (static_cast<unsigned long>(now - lastCommandCheckMs) >= 250) {
+    lastCommandCheckMs = now;
+    processCommand();
+  }
   if (static_cast<unsigned long>(now - lastSampleMs) >= intervalMs) {
     lastSampleMs = now;
     updateInterval();

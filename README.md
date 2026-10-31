@@ -40,8 +40,10 @@ backend address are configured privately at installation time.
 
 [Device setup and reporting](device/README.md) covers installation, diagnostics,
 and retry behavior. The original USB-to-Linux terminal is preserved as a
-[separate recovery project](recovery/serial-terminal/README.md). Hardware command
-polling and IR execution remain to be implemented on the device.
+[separate recovery project](recovery/serial-terminal/README.md). The agent also
+long polls commands and supports `device.ping`: the Arduino returns `pong` and
+its uptime, and the agent posts the execution result. IR execution remains to be
+implemented.
 
 [Eduroam tooling](EDUROAM.md) describes the credential/checking helpers without
 including a deployed network profile or institution-specific settings.

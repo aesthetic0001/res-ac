@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Linux-side DHT telemetry poster for Python 2.7/3, including legacy Yun JSON.
+"""Linux-side telemetry and Arduino ping agent for Python 2.7/3 and legacy Yun JSON.
 
 Private configuration: /etc/res-ac/agent.json. No deployment addresses or tokens
 are included here. --probe validates HTTPS and device authentication without
@@ -18,6 +18,8 @@ import time
 
 CONFIG_PATH = '/etc/res-ac/agent.json'
 LOG_PATH = '/tmp/res-ac-agent.log'
+COMMAND_STATE_PATH = '/etc/res-ac/command-result.json'
+COMMAND_ID = r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'
 monotonic = getattr(time, 'monotonic', lambda: os.times()[4])
 try:
     text_type = unicode
@@ -161,7 +163,7 @@ def temporary(prefix):
 
 class CurlUpload(object):
     """A bounded curl subprocess; polling completion never waits for the network."""
-    def __init__(self, config, payload):
+    def __init__(self, config, payload=None, route='readings', method='POST', timeout=25):
         self.process = None
         self.files = []
         try:
@@ -170,19 +172,23 @@ class CurlUpload(object):
             response_fd, self.response_path = temporary('res-ac-response-')
             self.files.append(self.response_path)
             os.close(response_fd)
-            url = config['server_url'] + '/api/devices/' + config['device_id'] + '/readings'
+            url = config['server_url'] + '/api/devices/' + config['device_id'] + '/' + route
             def quote(value):
                 return value.replace('\\', '\\\\').replace('"', '\\"')
             with os.fdopen(header_fd, 'w') as stream:
                 stream.write('url = "%s"\n' % quote(url))
                 stream.write('header = "Authorization: Bearer %s"\n' % quote(config['device_token']))
-            self.process = subprocess.Popen([config.get('curl_binary', 'curl'), '--config', header_path, '--cacert', config['ca_file'],
-                                            '--silent', '--show-error', '--connect-timeout', '10', '--max-time', '25',
-                                            '--request', 'POST', '--header', 'Content-Type: application/json',
-                                            '--data-binary', '@-', '--output', self.response_path, '--write-out', '%{http_code}'],
+            arguments = [config.get('curl_binary', 'curl'), '--config', header_path, '--cacert', config['ca_file'],
+                         '--silent', '--show-error', '--connect-timeout', '10', '--max-time', str(timeout),
+                         '--max-filesize', '32768', '--request', method, '--header', 'Content-Type: application/json',
+                         '--output', self.response_path, '--write-out', '%{http_code}']
+            if payload is not None:
+                arguments += ['--data-binary', '@-']
+            self.process = subprocess.Popen(arguments,
                                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             # Sample bodies are small, well below the pipe buffer size.
-            self.process.stdin.write(encode_json(payload).encode('utf-8'))
+            if payload is not None:
+                self.process.stdin.write(encode_json(payload).encode('utf-8'))
             self.process.stdin.close()
             self.process.stdin = None
         except BaseException:
@@ -287,9 +293,170 @@ class Collector(object):
             pass
 
 
+class CommandProcessor(object):
+    """One 30-second poll or result request alongside the independent poster.
+
+    Only device.ping is executable. The AVR must return the matching UUID and
+    its uptime before success can be reported. Keep the last result on flash so
+    an interrupted acknowledgment can be retried with the identical payload.
+    """
+    def __init__(self, config, bridge=None, state_path=COMMAND_STATE_PATH):
+        self.config = config
+        self.bridge = bridge or BridgeStore()
+        self.state_path = state_path
+        self.request = None
+        self.request_kind = None
+        self.current = None
+        self.reply = None
+        self.cached = None
+        self.persisted = False
+        self.retry_at = 0
+        self.backoff = 1
+        self.bridge_due = 0
+        self.deadline = 0
+        try:
+            with open(state_path) as stream:
+                saved = decode_json(stream.read())
+            if (not isinstance(saved, dict) or not re.match(COMMAND_ID, saved.get('id', '')) or
+                    saved.get('status') not in ('succeeded', 'failed') or not isinstance(saved.get('result'), dict)):
+                raise ValueError('Invalid saved result')
+            self.cached = self.reply = saved
+            self.persisted = True
+        except IOError:
+            pass
+        except Exception:
+            log('Saved command result could not be read; ping redelivery is safe')
+
+    def _status(self, value):
+        try:
+            self.bridge.put('resac_command_status', value)
+        except Exception:
+            pass
+
+    def _complete(self, status, result):
+        self.reply = dict(id=self.current['id'], status=status, result=result)
+        self.current = None
+        self.persisted = False
+
+    def _save(self):
+        # The enclosing /etc/res-ac directory is private. Writes happen once per
+        # command, never once per sensor reading or empty long poll.
+        path = self.state_path + '.tmp'
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(encode_json(self.reply))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.rename(path, self.state_path)
+        self.cached = self.reply
+        self.persisted = True
+        try:
+            self.bridge.put('resac_command', '')
+        except Exception:
+            pass
+
+    def _accept(self, command):
+        if not isinstance(command, dict) or not re.match(COMMAND_ID, command.get('id', '')):
+            raise ValueError('Invalid command ID')
+        self.backoff = 1
+        if self.cached and self.cached['id'] == command['id']:
+            self.reply = self.cached
+            self.persisted = True
+            return
+        self.current = command
+        if command.get('type') != 'device.ping':
+            self._complete('failed', dict(error='Unsupported command type'))
+            return
+        self.deadline = monotonic() + 10
+        self.bridge_due = 0
+        self._status('ping received; waiting for Arduino')
+
+    def _arduino(self):
+        if monotonic() >= self.deadline:
+            self._complete('failed', dict(error='Arduino ping timed out'))
+            return
+        if monotonic() < self.bridge_due:
+            return
+        self.bridge_due = monotonic() + 0.5
+        try:
+            frame = self.bridge.get('resac_command_result') or ''
+            fields = frame.split(',')
+            if (len(fields) == 4 and fields[:3] == ['v1', self.current['id'], 'pong'] and
+                    re.match(r'^\d{1,10}$', fields[3]) and int(fields[3]) <= 0xffffffff):
+                self._complete('succeeded', dict(reply='pong', uptimeMs=int(fields[3])))
+                return
+            self.bridge.put('resac_command', 'v1,%s,ping' % self.current['id'])
+        except Exception:
+            pass  # Wait for Bridge/AVR within the bounded execution timeout.
+
+    def _failed_request(self, error):
+        self.retry_at = monotonic() + self.backoff
+        detail = str(error) if isinstance(error, UploadError) else type(error).__name__
+        log('Command request failed (%s); retrying in %ds' % (detail, self.backoff))
+        self.backoff = min(self.backoff * 2, 60)
+
+    def tick(self):
+        if self.request is not None and self.request.process.poll() is not None:
+            try:
+                status, body = self.request.finish()
+                if self.request_kind == 'result':
+                    if status not in (200, 404, 409):
+                        raise UploadError(status=status)
+                    self.reply = None
+                    self.backoff = 1
+                    if status == 200:
+                        log('Command result accepted by backend')
+                        self._status('result accepted HTTP=200')
+                    else:
+                        log('Command result no longer accepted (HTTP %d)' % status)
+                        self._status('result rejected HTTP=%d' % status)
+                elif status == 200:
+                    value = decode_json(body.decode('utf-8'))
+                    commands = value.get('commands')
+                    if not isinstance(commands, list) or len(commands) != 1:
+                        raise ValueError('Expected one command')
+                    self._accept(commands[0])
+                elif status == 204:
+                    self.backoff = 1
+                else:
+                    raise UploadError(status=status)
+            except Exception as error:
+                self._failed_request(error)
+            finally:
+                self.request.close()
+                self.request = None
+        if self.current is not None:
+            self._arduino()
+        if self.request is not None or self.current is not None or monotonic() < self.retry_at:
+            return
+        try:
+            if self.reply is not None:
+                if not self.persisted:
+                    self._save()
+                payload = dict(status=self.reply['status'], result=self.reply['result'])
+                self.request = CurlUpload(self.config, payload,
+                                          route='commands/%s/result' % self.reply['id'])
+                self.request_kind = 'result'
+            else:
+                if self.bridge.get('resac_command_ready') != 'v1':
+                    self.retry_at = monotonic() + 2
+                    return
+                # Server waits 30 seconds; leave 5 seconds for transport overhead.
+                self.request = CurlUpload(self.config, route='commands', method='GET', timeout=35)
+                self.request_kind = 'poll'
+        except Exception as error:
+            self._failed_request(error)
+
+    def close(self):
+        if self.request is not None:
+            self.request.close()
+
+
 def run(config):
     pending = Buffer(config.get('queue_limit', 100))
     collector = Collector(config, pending)
+    commands = CommandProcessor(config)
     backoff = 1
     retry_at = 0
     upload = None
@@ -297,6 +464,7 @@ def run(config):
     try:
         while True:
             collector.tick()
+            commands.tick()
             if upload is not None and upload.process.poll() is not None:
                 try:
                     status, response = upload.finish()
@@ -320,6 +488,7 @@ def run(config):
                     upload = CurlUpload(config, sample)
             time.sleep(0.1)
     finally:
+        commands.close()
         if upload is not None:
             upload.close()
 
