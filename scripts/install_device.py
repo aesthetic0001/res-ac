@@ -81,6 +81,7 @@ def main():
                         'chmod 700 /tmp/res-ac-curl.new && mv /tmp/res-ac-curl.new /tmp/res-ac-curl', timeout=30)
             console.run('/tmp/res-ac-curl --version')
         console.upload((root / 'device/res_ac_agent.py').read_bytes(), '/usr/lib/res-ac/res_ac_agent.py')
+        console.upload((root / 'device/dhcp_route_repair.py').read_bytes(), '/usr/lib/res-ac/dhcp_route_repair.py')
         console.upload(bundle, '/etc/res-ac/ca-bundle.pem', 0o644)
         # Probe the staged private config before replacing an existing working one.
         staged = '/etc/res-ac/agent.pending.json'
@@ -95,6 +96,14 @@ def main():
         console.run('mv /etc/res-ac/agent.pending.json /etc/res-ac/agent.json; chmod 600 /etc/res-ac/agent.json')
         console.upload((root / 'device/res-ac-agent.init').read_bytes(), '/etc/init.d/res-ac-agent', 0o755)
         console.run('/etc/init.d/res-ac-agent enable')
+        # Preserve other user DHCP hooks; the helper only repairs missing routes.
+        hook = ('# res-ac DHCP route repair\n'
+                'python /usr/lib/res-ac/dhcp_route_repair.py "$1" || :\n')
+        console.run('touch /etc/udhcpc.user; chmod 600 /etc/udhcpc.user; '
+                    'grep -q "# res-ac DHCP route repair" /etc/udhcpc.user || '
+                    '{ umask 077; printf %s ' + shlex.quote(hook + '\n') +
+                    ' > /etc/udhcpc.user.res-ac.tmp && cat /etc/udhcpc.user >> /etc/udhcpc.user.res-ac.tmp && '
+                    'mv /etc/udhcpc.user.res-ac.tmp /etc/udhcpc.user; }')
         if not args.no_start:
             console.run('/etc/init.d/res-ac-agent start')
         print('Agent installed and enabled for boot. Private configuration was not printed.')

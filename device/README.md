@@ -52,6 +52,13 @@ about 9.9 MiB in RAM at service startup. Serial transfer takes several minutes.
 Subsequent installs reuse an identical compressed copy. Omit this flag on firmware
 whose system curl already validates the backend certificate correctly.
 
+The installer also adds a small `/etc/udhcpc.user` hook, preserving other hooks,
+to work around legacy firmware that loses its IPv4 default route on DHCP renewal.
+`dhcp_route_repair.py` uses the current DHCP gateway and interface metric, and
+honors `defaultroute=0`. It adds only a missing route, using netifd's static-route
+protocol so normal lease cleanup can remove it. It never embeds or pins a campus
+gateway, replaces another route, or resets Wi-Fi to recover from this bug.
+
 ## Reporting and retries
 
 The default reporting interval is 10 seconds and can be changed in the private
