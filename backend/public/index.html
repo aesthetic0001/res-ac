@@ -2,6 +2,14 @@
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sensor backend</title><link rel="stylesheet" href="/assets/style.css"><script src="/assets/app.js" type="module"></script></head>
 <body><main><header><div><p class="eyebrow">SEEEDUINO CLOUD</p><h1>Sensor backend</h1></div><button class="secondary" id="logout" disabled>Sign out</button></header><p id="message" role="status">Loading devices…</p>
 <section aria-labelledby="devices-title"><h2 id="devices-title">Devices</h2><div id="devices" class="devices"></div></section>
+<section aria-labelledby="remote-title" class="fan-section">
+  <div class="remote-intro"><h2 id="remote-title">Fan remote</h2><p>Turn the fan on or off, or adjust its speed one step at a time.</p><label>Device<select id="remote-device-select" disabled></select></label><p id="remote-connection">Loading device connection…</p><p id="fan-estimate" class="measurement" role="status">Estimated state: unknown</p><p class="remote-note">This estimate assumes the fan receives every IR press. Recalibrate after using the physical remote or the fan's buttons.</p><details id="fan-calibration" open><summary>Calibrate fan</summary><p>Restart the fan to <strong>factory position: off</strong>. Unplug it, plug it back in, and leave it off.</p><form id="calibration-form"><label class="calibration-confirm"><input id="confirm-fan-off" type="checkbox" required>I restarted the fan and left it off.</label><button id="calibrate-fan" type="submit" disabled>Confirm off and enable remote</button></form></details></div>
+  <div class="fan-remote" aria-label="Fan controls">
+    <button type="button" class="remote-power" data-fan-button="power" disabled><span class="power-symbol" aria-hidden="true">⏻</span><span>Power on / off</span></button>
+    <div class="remote-speed" role="group" aria-label="Fan speed"><button type="button" class="secondary" data-fan-button="speed_down" disabled><span aria-hidden="true">−</span><span>Speed down</span></button><button type="button" class="secondary" data-fan-button="speed_up" disabled><span aria-hidden="true">+</span><span>Speed up</span></button></div>
+    <p id="remote-status" role="status" aria-live="polite" aria-atomic="true">Loading remote…</p>
+  </div>
+</section>
 <section aria-labelledby="readings-title"><h2 id="readings-title">Temperature and humidity over time</h2>
 <div class="fields"><label>Device<select id="history-device" disabled></select></label><label>Time range<select id="history-range"><option value="1">Last hour</option><option value="6">Last 6 hours</option><option value="24" selected>Last 24 hours</option><option value="168">Last 7 days</option></select></label></div>
 <p id="history-message" role="status">Loading reading history…</p>

@@ -20,11 +20,12 @@ IP-certificate issuance and renewal; no reverse proxy or domain is required.
 TCP port 80 and the chosen HTTPS port must be routed to the host.
 
 [Backend documentation](backend/README.md) describes configuration, Docker
-volumes, renewal, authentication, and the three device-facing endpoints:
+volumes, renewal, authentication, and the device-facing endpoints:
 
 - `POST /api/devices/:id/readings`
 - `GET /api/devices/:id/commands` (30-second long poll)
 - `POST /api/devices/:id/commands/:commandId/result`
+- `POST /api/devices/:id/fan-state` (live estimate and calibration session)
 
 The minimal web dashboard has a separate authenticated command-creation API.
 SQLite persists readings, command delivery/results, and web sessions. Devices
@@ -41,9 +42,12 @@ backend address are configured privately at installation time.
 [Device setup and reporting](device/README.md) covers installation, diagnostics,
 and retry behavior. The original USB-to-Linux terminal is preserved as a
 [separate recovery project](recovery/serial-terminal/README.md). The agent also
-long polls commands and supports `device.ping`: the Arduino returns `pong` and
-its uptime, and the agent posts the execution result. IR execution remains to be
-implemented.
+long polls commands and supports `device.ping`, named `fan.command` buttons, and
+numeric NEC `ir.send` requests. The Arduino acknowledges completed transmissions;
+this does not confirm the fan received them. [Woozoo IR setup](device/IR.md)
+covers the emitter wiring, button profile, and USB serial bench test. Remote
+control requires an AVR-confirmed calibration after restarting the fan to
+factory position: off; the dashboard displays the AVR's estimated power/speed.
 
 [Eduroam tooling](EDUROAM.md) describes the credential/checking helpers without
 including a deployed network profile or institution-specific settings.

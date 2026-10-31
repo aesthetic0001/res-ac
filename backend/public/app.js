@@ -1,6 +1,15 @@
 import { renderHistory } from './graphs.js';
 
 let csrf = '';
+let dashboardState = null;
+let remoteSending = false;
+let remoteError = '';
+let remotePollUntil = 0;
+let backendAvailable = false;
+let refreshSequence = 0;
+let updateError = '';
+let calibrationUiKey = '';
+const fanActions = { power: 'Power toggle', speed_down: 'Speed down', speed_up: 'Speed up' };
 let historyRequest = null, plottedHistory = null;
 const el = selector => document.querySelector(selector);
 const node = (tag, text, className) => { const value = document.createElement(tag); if (text !== undefined) value.textContent = text; if (className) value.className = className; return value; };
@@ -13,7 +22,10 @@ async function api(path, options = {}) {
   return data;
 }
 async function refresh() {
-  const state = await api('/api/admin/state'); csrf = state.csrf;
+  const sequence = ++refreshSequence;
+  const state = await api('/api/admin/state');
+  if (sequence !== refreshSequence) return;
+  csrf = state.csrf; dashboardState = state; backendAvailable = true;
   const selected = el('#device-select').value;
   el('#devices').replaceChildren(...state.devices.map(device => {
     const card = node('article', undefined, 'device');
@@ -38,7 +50,96 @@ async function refresh() {
   }));
   if (!state.commands.length) { const row = node('tr'), cell = node('td', 'No commands queued yet.'); cell.colSpan = 5; row.append(cell); el('#commands').append(row); }
   el('#logout').disabled = false; el('#send-command').disabled = !state.devices.length;
+  const remoteSelect = el('#remote-device-select');
+  const remoteSelected = remoteSelect.value;
+  if (JSON.stringify([...remoteSelect.options].map(option => option.value)) !== JSON.stringify(state.devices.map(device => device.id))) {
+    remoteSelect.replaceChildren(...state.devices.map(device => { const option = node('option', device.id); option.value = device.id; return option; }));
+    if (state.devices.some(device => device.id === remoteSelected)) remoteSelect.value = remoteSelected;
+  }
+  renderRemote();
   await refreshHistory();
+}
+
+function renderRemote() {
+  const device = dashboardState?.devices.find(device => device.id === el('#remote-device-select').value);
+  const commands = dashboardState?.commands.filter(command => command.device_id === device?.id && ['fan.command', 'fan.calibrate', 'ir.send'].includes(command.type)) || [];
+  const pending = commands.some(command => ['pending', 'inflight'].includes(command.status));
+  const fan = device?.fanState;
+  const fresh = !!fan && Date.now() - fan.receivedAt < 30_000;
+  const calibrated = fresh && fan.calibrated;
+  const key = `${device?.id}:${fan?.sessionId}:${calibrated}`;
+  if (key !== calibrationUiKey) {
+    calibrationUiKey = key; el('#confirm-fan-off').checked = false;
+    el('#fan-calibration').open = !calibrated;
+  }
+  el('#confirm-fan-off').disabled = !backendAvailable || !fresh || !fan?.sessionId || remoteSending || pending;
+  el('#calibrate-fan').disabled = el('#confirm-fan-off').disabled || !el('#confirm-fan-off').checked;
+  el('#fan-estimate').textContent = !fresh ? 'Estimated state: unknown (waiting for device)' : !calibrated
+    ? 'Calibration required' : fan.power === 'on' ? `Estimated: On · Speed ${fan.speed} / 5` : 'Estimated: Off';
+  el('#remote-device-select').disabled = !backendAvailable || remoteSending || !dashboardState?.devices.length;
+  for (const button of document.querySelectorAll('[data-fan-button]')) {
+    button.disabled = !backendAvailable || !calibrated || remoteSending || pending || (button.dataset.fanButton !== 'power' && fan.power !== 'on');
+  }
+  el('#remote-connection').textContent = !device ? 'No devices available.' : Date.now() - Date.parse(device.lastSeen || '') < 90_000
+    ? 'Device recently connected.' : 'Device has not checked in recently. Requests expire after 30 seconds.';
+  const status = el('#remote-status');
+  status.className = '';
+  if (!backendAvailable) { status.textContent = dashboardState ? 'Cannot refresh remote status. Reconnecting…' : 'Cannot load remote. Reconnecting…'; return; }
+  if (remoteSending) { status.textContent = 'Queuing button press…'; return; }
+  if (remoteError) { status.textContent = remoteError; status.className = 'remote-error'; return; }
+  if (!device) { status.textContent = 'Add a device to use the remote.'; return; }
+  const command = commands[0];
+  if (!calibrated && (!command || command.type !== 'fan.calibrate' || command.payload.sessionId !== fan?.sessionId)) {
+    status.textContent = fresh ? 'Remote locked. Restart the fan to factory position: off, then confirm calibration.' : 'Remote locked while waiting for current device state.';
+    return;
+  }
+  if (!command) { status.textContent = calibrated ? 'Ready. Aim the IR emitter at the fan.' : 'Remote locked until the fan is calibrated.'; return; }
+  const action = command.type === 'fan.calibrate' ? 'Calibration' : fanActions[command.payload.button] || 'IR command';
+  if (command.status === 'succeeded') {
+    status.textContent = command.result?.reply === 'calibrated' ? 'Calibration confirmed by device.' : command.result?.reply === 'ir_sent' ? `${action}: IR sent. Fan response unconfirmed.` : `${action}: command completed. Fan response unconfirmed.`;
+  } else if (command.status === 'failed') {
+    status.textContent = `${action} failed: ${command.result?.error || 'Check Recent commands for details.'}`;
+    status.className = 'remote-error';
+  } else if (command.status === 'expired') {
+    status.textContent = `${action} expired. Check the fan before sending another press.`;
+    status.className = 'remote-error';
+  } else {
+    status.textContent = `${action}: ${command.status === 'inflight' ? 'delivered; waiting for transmission' : 'queued; waiting for device'}…`;
+  }
+}
+
+el('#remote-device-select').addEventListener('change', () => { remoteError = ''; renderRemote(); });
+el('#confirm-fan-off').addEventListener('change', renderRemote);
+async function queueFanCommand(type, payload) {
+  const deviceId = el('#remote-device-select').value;
+  const device = dashboardState.devices.find(device => device.id === deviceId);
+  payload = { ...payload, sessionId: device.fanState.sessionId };
+  remoteSending = true; remoteError = ''; renderRemote();
+  try {
+    const queued = await api(`/api/admin/devices/${encodeURIComponent(deviceId)}/commands`, {
+      method: 'POST', body: JSON.stringify({ type, payload, ttlSeconds: 30 })
+    });
+    if (!dashboardState.commands.some(command => command.id === queued.id)) dashboardState.commands.unshift({
+      id: queued.id, device_id: deviceId, type, payload, status: queued.status, result: null
+    });
+    remotePollUntil = Date.now() + 35_000;
+    await refresh();
+  } catch (error) {
+    remoteError = `${error.message}. Check Recent commands before retrying.`;
+  } finally {
+    remoteSending = false; renderRemote();
+  }
+}
+el('#calibration-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (el('#calibrate-fan').disabled || remoteSending) return;
+  await queueFanCommand('fan.calibrate', { confirmOff: true });
+});
+for (const button of document.querySelectorAll('[data-fan-button]')) {
+  button.addEventListener('click', async () => {
+    if (button.disabled || remoteSending) return;
+    await queueFanCommand('fan.command', { button: button.dataset.fanButton });
+  });
 }
 async function refreshHistory(clear = false) {
   historyRequest?.abort();
@@ -85,8 +186,12 @@ el('#logout').addEventListener('click', async () => {
   catch (error) { el('#message').textContent = error.message; }
 });
 async function update() {
-  try { await refresh(); if (el('#message').textContent === 'Loading devices…') el('#message').textContent = 'Connected to backend.'; }
-  catch (error) { el('#message').textContent = error.message; }
-  finally { setTimeout(update, 5000); }
+  try {
+    await refresh();
+    if (el('#message').textContent === 'Loading devices…' || (updateError && el('#message').textContent === updateError)) el('#message').textContent = 'Connected to backend.';
+    updateError = '';
+  }
+  catch (error) { backendAvailable = false; renderRemote(); updateError = error.message; el('#message').textContent = updateError; }
+  finally { setTimeout(update, Date.now() < remotePollUntil ? 1000 : 5000); }
 }
 update();

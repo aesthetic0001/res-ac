@@ -159,16 +159,36 @@ export function createApp(config, store) {
         const value = await body(req);
         assert(typeof value.type === 'string' && /^[a-zA-Z][a-zA-Z0-9_.-]{0,63}$/.test(value.type), 'Invalid command type');
         assert(value.payload && typeof value.payload === 'object' && !Array.isArray(value.payload), 'Payload must be a JSON object');
+        if (['fan.command', 'ir.send', 'fan.calibrate'].includes(value.type)) {
+          const fan = store.fanState(deviceId);
+          if (!fan || Date.now() - fan.receivedAt > 30_000 || !fan.sessionId || value.payload.sessionId !== fan.sessionId)
+            throw new HttpError(409, 'Fan status is missing, stale, or changed. Wait for the device and recalibrate.');
+          if (value.type === 'fan.calibrate') {
+            assert(value.payload.confirmOff === true && Object.keys(value.payload).length === 2, 'Confirm the fan was restarted to factory position: off');
+          } else if (!fan.calibrated) throw new HttpError(409, 'Calibration required: restart fan to factory position: off');
+        }
         const ttl = value.ttlSeconds ?? 300;
         assert(Number.isInteger(ttl) && ttl >= 1 && ttl <= 86400, 'TTL must be between 1 and 86400 seconds');
         const command = store.enqueue(deviceId, value.type, value.payload, ttl);
         notify(deviceId);
         return json(res, 201, { id: command.id, status: command.status, expiresAt: new Date(command.expires_at).toISOString() });
       }
-      const deviceRoute = path.match(/^\/api\/devices\/([a-zA-Z0-9_-]+)\/(readings|commands)(?:\/([a-f0-9-]+)\/result)?$/);
+      const deviceRoute = path.match(/^\/api\/devices\/([a-zA-Z0-9_-]+)\/(readings|commands|fan-state)(?:\/([a-f0-9-]+)\/result)?$/);
       if (deviceRoute) {
         const [, id, route, commandId] = deviceRoute;
         requireDevice(req, id);
+        if (req.method === 'POST' && route === 'fan-state' && !commandId) {
+          const value = await body(req);
+          assert(value.sessionId === null || (typeof value.sessionId === 'string' && /^[a-f0-9]{32}$/.test(value.sessionId)), 'Invalid fan session');
+          assert(typeof value.calibrated === 'boolean' && ['on', 'off', 'unknown'].includes(value.power), 'Invalid fan estimate');
+          assert(Number.isInteger(value.revision) && value.revision >= 0 && value.revision <= 0xffffffff, 'Invalid fan revision');
+          assert(value.calibrated
+            ? value.sessionId !== null && ((value.power === 'off' && value.speed === 0) || (value.power === 'on' && Number.isInteger(value.speed) && value.speed >= 1 && value.speed <= 5))
+            : value.power === 'unknown' && value.speed === null, 'Inconsistent fan estimate');
+          const state = { sessionId: value.sessionId, calibrated: value.calibrated, power: value.power, speed: value.speed, revision: value.revision };
+          if (!store.setFanState(id, state)) throw new HttpError(409, 'Outdated fan revision');
+          return json(res, 200, { ok: true });
+        }
         if (req.method === 'POST' && route === 'readings' && !commandId) {
           const value = await body(req);
           assert(typeof value.temperatureC === 'number' && Number.isFinite(value.temperatureC) && value.temperatureC >= -80 && value.temperatureC <= 150, 'Invalid temperatureC');

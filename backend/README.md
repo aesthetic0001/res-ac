@@ -49,6 +49,16 @@ commands. Submit a command type, a JSON payload object, and its expiry duration.
 The page refreshes every five seconds. Commands are data for a device agent;
 the backend does not run shell commands or implement IR transmission itself.
 
+The **Fan remote** provides power on/off (toggle), speed down, and speed up for
+the selected device. Each press queues a `fan.command` with a 30-second expiry;
+status refreshes more frequently after a press. Controls stay disabled until the
+AVR accepts calibration after the user restarts the fan to **factory position:
+off** and confirms it. The page shows the AVR's estimated on/off state and speed,
+and locks again after a device restart, loss of tracking, or stale state.
+A successful IR result means transmission completed, not that the fan received
+it. The command form below the remote
+remains available for other buttons, ping, and numeric NEC requests.
+
 Check deployment:
 
 ```sh
@@ -107,7 +117,7 @@ References:
 
 ## Device API
 
-All three device endpoints require `Authorization: Bearer DEVICE_TOKEN`, scoped
+All device endpoints require `Authorization: Bearer DEVICE_TOKEN`, scoped
 to the configured device ID. Retrieve the token locally from the private
 `config/server.env` and put it in the Linux device agent's private configuration.
 Browser sessions do not authenticate device requests, and device tokens do not
@@ -166,6 +176,23 @@ extension before being supported. Expired commands reject later final results.
 
 ### Post a final command result
 
+The Seeeduino agent supports `device.ping`, session-bound `fan.calibrate`,
+`fan.command`, and NEC `ir.send`. See the [Woozoo setup](../device/IR.md)
+for wiring, the initial button profile, and delivery limitations. IR success
+confirms transmission only; the fan provides no acknowledgment.
+
+The device also posts its live estimate to `POST /api/devices/:id/fan-state`,
+authenticated with the same device token. Fields are `sessionId` (32 hex digits
+or null during initialization), `calibrated` (boolean), `power` (`on`, `off`,
+or `unknown`), `speed` (1–5 while on, 0 while off, null when uncalibrated), and
+`revision` (unsigned 32-bit integer). State is stored separately from readings.
+The admin snapshot exposes it as `device.fanState`, including server
+`receivedAt` in epoch milliseconds. Remote/calibration requests require the
+current `sessionId` and telemetry no older than 30 seconds. `fan.calibrate`
+additionally requires `confirmOff: true`. An old revision within the same
+session is rejected. Repeated telemetry refreshes freshness without adding
+historical readings.
+
 `POST /api/devices/seeeduino-cloud/commands/COMMAND_ID/result`
 
 ```json
@@ -184,7 +211,7 @@ The dashboard uses a password hash and durable server-side sessions, with
 HttpOnly/SameSite=Strict/Secure cookies in HTTPS mode. Administrative mutations
 require both the session's CSRF token and a matching Origin header. Login is
 rate-limited. The dashboard's command creation endpoint is
-`POST /api/admin/devices/:id/commands`; the three endpoints above are device-facing.
+`POST /api/admin/devices/:id/commands`; the endpoints above are device-facing.
 
 SQLite in the `sensor-data` volume stores readings, commands, results, and
 sessions. Back up that volume consistently (stop the backend before copying all

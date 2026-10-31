@@ -77,6 +77,58 @@ test('device tokens are scoped and readings are validated and deduplicated', asy
   assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM readings').get().n, 1);
 });
 
+test('fan remote buttons queue short-lived commands and expose transmission results without inferred state', async t => {
+  const f = await fixture(t), auth = await f.login();
+  const sessionId = randomBytes(16).toString('hex');
+  f.store.setFanState('board-1', { sessionId, calibrated: true, power: 'off', speed: 0, revision: 1 });
+  for (const button of ['power', 'speed_down', 'speed_up']) {
+    const response = await f.request('/api/admin/devices/board-1/commands', {
+      method: 'POST', headers: { cookie: auth.cookie, 'x-csrf-token': auth.csrf, 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'fan.command', payload: { button, sessionId }, ttlSeconds: 30 })
+    });
+    assert.equal(response.status, 201);
+    const queued = await response.json();
+    const stored = f.store.command(queued.id);
+    assert.equal(stored.expires_at - stored.created_at, 30_000);
+    const delivered = await (await f.request('/api/devices/board-1/commands', { headers: f.deviceHeaders })).json();
+    assert.deepEqual(delivered.commands[0].payload, { button, sessionId });
+    assert.equal(delivered.commands[0].type, 'fan.command');
+    const result = { reply: 'ir_sent', fanStateConfirmed: false };
+    assert.equal((await f.request(`/api/devices/board-1/commands/${queued.id}/result`, {
+      method: 'POST', headers: f.deviceHeaders, body: JSON.stringify({ status: 'succeeded', result })
+    })).status, 200);
+    const state = await (await f.request('/api/admin/state', { headers: { cookie: auth.cookie } })).json();
+    assert.deepEqual(state.commands.find(command => command.id === queued.id).result, result);
+  }
+});
+
+test('calibration gates remote requests, is session-bound, and stale telemetry cannot unlock controls', async t => {
+  const f = await fixture(t), auth = await f.login();
+  const sessionId = randomBytes(16).toString('hex');
+  const queue = (type, payload) => f.request('/api/admin/devices/board-1/commands', { method: 'POST',
+    headers: { cookie: auth.cookie, 'x-csrf-token': auth.csrf, 'content-type': 'application/json' }, body: JSON.stringify({ type, payload }) });
+  const report = state => f.request('/api/devices/board-1/fan-state', { method: 'POST', headers: f.deviceHeaders, body: JSON.stringify(state) });
+  assert.equal((await queue('fan.command', { button: 'power', sessionId })).status, 409);
+  const state = { sessionId, calibrated: false, power: 'unknown', speed: null, revision: 1 };
+  assert.equal((await report(state)).status, 200);
+  assert.equal((await queue('fan.command', { button: 'power', sessionId })).status, 409);
+  assert.equal((await queue('ir.send', { protocol: 'NEC', address: 56960, command: 0, sessionId })).status, 409);
+  assert.equal((await queue('fan.calibrate', { confirmOff: false, sessionId })).status, 400);
+  assert.equal((await queue('fan.calibrate', { confirmOff: true, sessionId: 'b'.repeat(32) })).status, 409);
+  assert.equal((await queue('fan.calibrate', { confirmOff: true, sessionId })).status, 201);
+  // Merely enqueuing confirmation is not calibration: only device telemetry unlocks.
+  assert.equal((await queue('fan.command', { button: 'power', sessionId })).status, 409);
+  assert.equal((await report({ ...state, calibrated: true, power: 'off', speed: 0, revision: 2 })).status, 200);
+  assert.equal((await report(state)).status, 409);
+  assert.equal((await queue('fan.command', { button: 'power', sessionId })).status, 201);
+  f.store.db.prepare('UPDATE fan_states SET received_at=?').run(Date.now()-31000);
+  assert.equal((await queue('fan.command', { button: 'power', sessionId })).status, 409);
+  assert.equal((await report({ ...state, sessionId: 'c'.repeat(32) })).status, 200);
+  assert.equal((await queue('fan.calibrate', { confirmOff: true, sessionId })).status, 409);
+  assert.equal((await report({ ...state, calibrated: true, power: 'off', speed: 3 })).status, 400);
+  assert.equal((await f.request('/api/devices/board-2/fan-state', { method: 'POST', headers: f.deviceHeaders, body: JSON.stringify(state) })).status, 401);
+});
+
 test('long polling returns 204 when empty and wakes immediately for new commands', async t => {
   const f = await fixture(t, { pollWaitMs: 1600 });
   const auth = await f.login();

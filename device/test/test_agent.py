@@ -210,6 +210,10 @@ class AgentTests(unittest.TestCase):
                 command_ticks.append(True)
             def close(self):
                 closed.append(True)
+        class FanReporter:
+            def __init__(self, config): pass
+            def tick(self): pass
+            def close(self): pass
         class Collector:
             def __init__(self, config, pending):
                 self.pending = pending
@@ -234,7 +238,7 @@ class AgentTests(unittest.TestCase):
                 return 201, b'{}'
             def close(self):
                 closed.append(True)
-        with patch.object(agent, 'Collector', Collector), patch.object(agent, 'CurlUpload', Upload), \
+        with patch.object(agent, 'FanReporter', FanReporter), patch.object(agent, 'Collector', Collector), patch.object(agent, 'CurlUpload', Upload), \
                 patch.object(agent, 'CommandProcessor', Commands), patch.object(agent.time, 'sleep'):
             with self.assertRaises(KeyboardInterrupt):
                 agent.run(dict(queue_limit=2))
@@ -333,7 +337,7 @@ class AgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             bridge = Bridge()
             processor = agent.CommandProcessor({}, bridge, str(Path(directory) / 'command.json'))
-            processor._accept(dict(id=str(uuid.uuid4()), type='ir.send', payload={}))
+            processor._accept(dict(id=str(uuid.uuid4()), type='unsupported', payload={}))
             self.assertEqual(processor.reply['status'], 'failed')
             self.assertEqual(processor.reply['result']['error'], 'Unsupported command type')
             self.assertFalse(bridge.sent)
