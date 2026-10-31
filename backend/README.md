@@ -61,7 +61,10 @@ remains available for other buttons, ping, and numeric NEC requests.
 
 **Set level** selects Off or levels 1–5. The AVR uses the shortest path around
 the five-level cycle. **Automatic temperature curve** provides Quiet, Balanced,
-Cooling, and Custom thresholds, an editable preview, and cooling hysteresis.
+Cooling, and Custom thresholds, a graph with mouse/touch dragging and keyboard
+editing, and cooling hysteresis. Thresholds may be equal; only decreasing
+temperatures are rejected, and the highest matching level wins at a shared
+temperature. Graph edits update the number fields and remain drafts until applied.
 The Seeeduino evaluates the curve locally against fresh readings, with at least
 30 seconds between automatic adjustments. Manual control disables automatic mode.
 See [target levels and temperature curves](../device/IR.md#target-levels-and-temperature-curves)

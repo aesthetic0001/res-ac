@@ -48,8 +48,8 @@ def validate_curve(payload):
     thresholds = payload.get('thresholdsC')
     if (not isinstance(thresholds, list) or len(thresholds) != 5 or
             any(isinstance(v, bool) or not isinstance(v, (int, float)) or not -20 <= v <= 60 for v in thresholds) or
-            any(b - a < 1 for a, b in zip(thresholds, thresholds[1:]))):
-        raise ValueError('Use five ascending temperatures, -20 to 60 C, at least 1 C apart')
+            any(b < a for a, b in zip(thresholds, thresholds[1:]))):
+        raise ValueError('Use five nondecreasing temperatures from -20 to 60 C; equal thresholds are allowed')
     hysteresis = payload.get('hysteresisC', 1)
     if isinstance(hysteresis, bool) or not isinstance(hysteresis, (int, float)) or not 0.5 <= hysteresis <= 5:
         raise ValueError('Hysteresis must be 0.5 to 5 C')

@@ -158,12 +158,27 @@ test('cyclic target levels and temperature curves validate inputs and remain cal
   for(const level of [0,1,2,3,4,5]) assert.equal((await queue('fan.level',{level,sessionId})).status,201);
   for(const level of [-1,6,2.5,true]) assert.equal((await queue('fan.level',{level,sessionId})).status,400);
   assert.equal((await queue('fan.curve',{...settings,sessionId})).status,201);
-  for(const thresholdsC of [[22,22,26,28,30],[22,24,26,28],[22,24,26,28,61]])
+  for(const thresholdsC of [[22,21,26,28,30],[22,24,26,28],[22,24,26,28,61]])
     assert.equal((await queue('fan.curve',{...settings,thresholdsC,sessionId})).status,400);
   assert.equal((await queue('fan.curve',{...settings,hysteresisC:0,sessionId})).status,400);
   assert.equal((await queue('fan.curve',{...settings,sessionId:'b'.repeat(32)})).status,409);
   f.store.setFanState('board-1',{...state,firmwareVersion:'v3',revision:3});
   assert.equal((await queue('fan.curve',{...settings,enabled:false,sessionId})).status,409);
+});
+
+test('curve APIs and live telemetry accept ties and small gaps while rejecting decreasing temperatures', async t => {
+  const f=await fixture(t),auth=await f.login(),sessionId=randomBytes(16).toString('hex');
+  const state={sessionId,calibrated:true,power:'off',speed:0,revision:1,firmwareVersion:'v4'};
+  f.store.setFanState('board-1',state);
+  for(const thresholdsC of [[22,24,24,28,30],[24,24,24,24,24],[22,22.1,22.1,28,30]]) {
+    const settings={enabled:true,thresholdsC,hysteresisC:1};
+    const queued=await f.request('/api/admin/devices/board-1/commands',{method:'POST',headers:{cookie:auth.cookie,'x-csrf-token':auth.csrf,'content-type':'application/json'},body:JSON.stringify({type:'fan.curve',payload:{...settings,sessionId}})});
+    assert.equal(queued.status,201);
+    assert.deepEqual(JSON.parse(f.store.command((await queued.json()).id).payload).thresholdsC,thresholdsC);
+    const response=await f.request('/api/devices/board-1/fan-state',{method:'POST',headers:f.deviceHeaders,body:JSON.stringify({...state,automatic:{...settings,status:'active',targetLevel:5,minAdjustmentSeconds:30}})});
+    assert.equal(response.status,200);
+    assert.deepEqual(f.store.fanState('board-1').automatic.thresholdsC,thresholdsC);
+  }
 });
 
 test('live automatic settings and target are persisted independently of sensor readings', async t => {

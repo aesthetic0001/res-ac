@@ -122,6 +122,18 @@ the first threshold the target is off:
 | Balanced | 22, 24, 26, 28, 30 |
 | Cooling | 20, 22, 24, 26, 28 |
 
+Edit the graph by dragging each level handle horizontally, or focus a handle
+and use Left/Right (0.5 °C), Shift+Left/Right (5 °C), or Home/End. Neighboring
+handles follow when necessary to keep thresholds nondecreasing. Number fields
+stay synchronized and also accept precise fractional temperatures. Graph edits
+remain unsaved until **Apply curve** is pressed.
+
+Equal thresholds are allowed and select the highest matching level. For example,
+`[22,24,24,24,30]` selects level 4 at 24 °C, while `[24,24,24,24,24]` jumps directly
+from off to level 5 at 24 °C. The solid line connects the control points; the
+dashed step curve shows the applied discrete levels. Cooling hysteresis still
+applies, including dropping an equal-threshold group together.
+
 The Seeeduino's Linux agent evaluates fresh DHT11 samples locally, so operation
 does not depend on a backend temperature polling job. On heating, a threshold
 applies as soon as it is reached. On cooling, its configurable hysteresis (default

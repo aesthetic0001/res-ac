@@ -1,5 +1,5 @@
 import { renderHistory } from './graphs.js';
-import { presets, renderCurve } from './fan-curve.js';
+import { presets, renderCurve, validThresholds } from './fan-curve.js';
 
 let csrf = '';
 let dashboardState = null;
@@ -155,14 +155,23 @@ for (const button of document.querySelectorAll('[data-fan-level]')) {
   });
 }
 const curveInputs = () => [...document.querySelectorAll('[data-curve-threshold]')];
-const curveValues = () => ({ enabled: el('#curve-enabled').checked, thresholdsC: curveInputs().map(input => Number(input.value)), hysteresisC: Number(el('#curve-hysteresis').value) });
+const curveValues = () => ({ enabled: el('#curve-enabled').checked, thresholdsC: curveInputs().map(input => input.value === '' ? NaN : Number(input.value)), hysteresisC: Number(el('#curve-hysteresis').value) });
+function editCurve(values) {
+  curveInputs().forEach((input, index) => input.value = values[index]);
+  curveDirty = true; curvePending = null; el('#curve-preset').value = 'custom';
+  el('#curve-message').textContent = 'Unsaved changes. Apply to save.';
+  renderRemote();
+}
+function drawCurve(disabled = false) {
+  renderCurve(el('#curve-preview'), curveValues().thresholdsC, editCurve, { disabled });
+}
 function loadCurve(settings) {
   const values = settings?.thresholdsC || presets.balanced;
   curveInputs().forEach((input, index) => input.value = values[index]);
   el('#curve-hysteresis').value = settings?.hysteresisC ?? 1;
   el('#curve-enabled').checked = settings?.enabled ?? false;
   el('#curve-preset').value = Object.keys(presets).find(name => JSON.stringify(presets[name]) === JSON.stringify(values)) || 'custom';
-  renderCurve(el('#curve-preview'), values);
+  drawCurve();
 }
 function renderAutomatic(device, fresh, calibrated, pending) {
   const automatic = device?.fanState?.automatic;
@@ -172,6 +181,7 @@ function renderAutomatic(device, fresh, calibrated, pending) {
   const available = backendAvailable && fresh && device.fanState.firmwareVersion === 'v4';
   el('#save-curve').disabled = !available || remoteSending || pending || (el('#curve-enabled').checked && !calibrated);
   for (const input of el('#curve-form').querySelectorAll('input, select')) input.disabled = remoteSending || pending;
+  drawCurve(remoteSending || pending);
   const messages = { disabled: 'Automatic mode is off.', manual_override: 'Automatic mode stopped by a manual command.', calibration_required: 'Automatic mode paused: calibration required.', waiting_for_sample: 'Waiting for a new temperature reading.', sensor_unavailable: 'Automatic mode paused: temperature reading unavailable or stale.', waiting_for_device: 'Waiting for the device command handler.', cooldown: 'Waiting for the 30-second adjustment interval.', adjusting: 'Moving to the target level using the shortest route.', active: 'Automatic mode active.', command_error: 'Automatic mode stopped after an uncertain command. Recalibrate before enabling it.', config_error: 'Saved curve could not be read. Apply a new curve.' };
   el('#automatic-status').textContent = !available ? 'Waiting for fresh device settings and firmware with cyclic-level support.' : automatic
     ? `${messages[automatic.status] || 'Waiting for automatic status'}${automatic.targetLevel === null ? '' : ` Target: ${automatic.targetLevel === 0 ? 'Off' : `level ${automatic.targetLevel}`}.`}` : 'Automatic mode is off.';
@@ -180,19 +190,19 @@ el('#curve-preset').addEventListener('change', () => {
   const values = presets[el('#curve-preset').value];
   if (values) curveInputs().forEach((input, index) => input.value = values[index]);
   curveDirty = true; curvePending = null; el('#curve-message').textContent = 'Unsaved changes. Apply to save.';
-  renderCurve(el('#curve-preview'), curveValues().thresholdsC);
+  drawCurve();
 });
 el('#curve-form').addEventListener('input', event => {
   curveDirty = true; curvePending = null; el('#curve-message').textContent = 'Unsaved changes. Apply to save.';
   if (event.target.matches('[data-curve-threshold]')) el('#curve-preset').value = 'custom';
-  renderCurve(el('#curve-preview'), curveValues().thresholdsC); renderRemote();
+  renderRemote();
 });
 el('#curve-form').addEventListener('submit', async event => {
   event.preventDefault();
   if (el('#save-curve').disabled || remoteSending) return;
   const settings = curveValues();
-  if (settings.thresholdsC.some((value, index) => index && value - settings.thresholdsC[index - 1] < 1)) {
-    el('#curve-message').textContent = 'Each threshold must be at least 1 °C above the previous one.'; return;
+  if (!validThresholds(settings.thresholdsC)) {
+    el('#curve-message').textContent = 'Temperatures must be nondecreasing, from -20 to 60 °C. Equal thresholds are allowed.'; return;
   }
   curveDirty = true; curvePending = settings;
   const queued = await queueFanCommand('fan.curve', settings);

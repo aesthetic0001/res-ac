@@ -16,12 +16,25 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(agent.curve_target(25,thresholds,1,3),2)
         self.assertEqual(agent.curve_target(24.9,thresholds,1,3),2)
         self.assertEqual(agent.curve_target(20.9,thresholds,1,5),0)
-        for payload in [dict(enabled=True,thresholdsC=[22,22,26,28,30]),
+        for payload in [dict(enabled=True,thresholdsC=[22,21,26,28,30]),
                         dict(enabled=True,thresholdsC=[22,24,26,28]),
                         dict(enabled=True,thresholdsC=[22,24,26,28,float('nan')]),
                         dict(enabled=True,thresholdsC=thresholds,hysteresisC=0),
                         dict(enabled='yes',thresholdsC=thresholds)]:
             with self.assertRaises(ValueError):agent.validate_curve(payload)
+
+    def test_equal_thresholds_select_highest_matching_level(self):
+        for thresholds,temperature,expected in [([22,24,24,28,30],24,3),
+                                                 ([24,24,24,24,24],24,5),
+                                                 ([24,24,24,24,24],23.9,0),
+                                                 ([22,22,26,28,30],22,2),
+                                                 ([22,22.1,22.1,28,30],22.1,3)]:
+            settings=agent.validate_curve(dict(enabled=True,thresholdsC=thresholds))
+            self.assertEqual(agent.curve_target(temperature,settings['thresholdsC'],1),expected)
+        for previous in range(6):
+            self.assertEqual(agent.curve_target(24,[24]*5,1,previous),5)
+        self.assertEqual(agent.curve_target(23,[24]*5,1,5),0)
+        self.assertEqual(agent.curve_target(23.5,[24]*5,1,5),5)
 
     def test_target_command_validates_level_and_matching_reply(self):
         with tempfile.TemporaryDirectory() as directory:
