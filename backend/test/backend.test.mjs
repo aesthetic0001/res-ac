@@ -159,3 +159,53 @@ test('a pending command poll does not block sensor uploads and oversized bodies 
   const oversized = await f.request('/api/devices/board-1/readings', { method: 'POST', headers: f.deviceHeaders, body: JSON.stringify({ temperatureC: 22, humidity: 50, ignored: 'x'.repeat(40_000) }) });
   assert.equal(oversized.status, 413);
 });
+
+test('reading history requires a web session, validates ranges, and handles empty or unknown devices', async t => {
+  const f = await fixture(t);
+  const path = '/api/admin/devices/board-1/readings';
+  assert.equal((await f.request(path)).status, 401);
+  assert.equal((await f.request(path, { headers: f.deviceHeaders })).status, 401);
+  const auth = await f.login(), headers = { cookie: auth.cookie };
+  const response = await f.request(path, { headers });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  const empty = await response.json();
+  assert.deepEqual(empty.readings, []);
+  assert.equal(empty.sampleCount, 0);
+  assert.equal(empty.to - empty.from, 24 * 3600_000);
+  for (const hours of ['0', '-1', '2', '169', 'NaN', '1.5', '']) {
+    assert.equal((await f.request(`${path}?hours=${hours}`, { headers })).status, 400);
+  }
+  for (const hours of [1, 6, 24, 168]) {
+    assert.equal((await f.request(`${path}?hours=${hours}`, { headers })).status, 200);
+  }
+  assert.equal((await f.request('/api/admin/devices/missing/readings', { headers })).status, 404);
+});
+
+test('reading history averages the full window into bounded chronological points and isolates devices', async t => {
+  const f = await fixture(t), now = Date.now(), from = now - 3600_000;
+  const insert = f.store.db.prepare('INSERT INTO readings(device_id,reading_id,temperature_c,humidity,recorded_at,received_at) VALUES(?,?,?,?,?,?)');
+  f.store.db.exec('BEGIN');
+  for (let i = 0; i < 3600; i++) {
+    // A bad device clock must not put otherwise valid readings outside this view.
+    insert.run('board-1', `history-${i}`, i % 30, 40 + i % 10, '2000-01-01T00:00:00Z', from + i * 1000);
+  }
+  insert.run('board-1', 'too-old', 90, 90, null, from - 1);
+  insert.run('board-1', 'future', 90, 90, null, now + 60_000);
+  insert.run('board-2', 'other-device', 90, 90, null, from + 1000);
+  f.store.db.exec('COMMIT');
+  const history = f.store.readingHistory('board-1', 1, now);
+  assert.equal(history.readings.length, 600);
+  assert.equal(history.sampleCount, 3600);
+  assert.equal(history.readings[0].sampleCount, 6);
+  assert.equal(history.readings[0].temperatureC, 2.5);
+  assert.equal(history.readings[0].humidity, 42.5);
+  assert.ok(history.readings.every((point, i, rows) => point.receivedAt >= from && point.receivedAt < now && (!i || point.receivedAt > rows[i - 1].receivedAt)));
+  const auth = await f.login();
+  const response = await f.request('/api/admin/devices/board-1/readings?hours=1', { headers: { cookie: auth.cookie } });
+  const result = await response.json();
+  assert.equal(response.status, 200);
+  assert.ok(result.readings.length <= 600);
+  assert.ok(result.sampleCount > 3500);
+  assert.ok(result.readings.every(point => point.temperatureC < 30 && point.humidity < 50));
+});

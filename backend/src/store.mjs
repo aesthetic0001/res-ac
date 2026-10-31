@@ -32,6 +32,19 @@ export class Store {
       .run(id, value.readingId || randomUUID(), value.temperatureC, value.humidity, value.recordedAt || null, Date.now());
     return { duplicate: result.changes === 0 };
   }
+  readingHistory(deviceId, hours, now = Date.now()) {
+    const from = now - hours * 3600_000;
+    // Bound the chart response without discarding older samples in the window.
+    // Receipt time is indexed and reliable even when a device clock is unset.
+    const bucketMs = Math.ceil(hours * 3600 / 600) * 1000;
+    const readings = this.db.prepare(`SELECT CAST(AVG(received_at) AS INTEGER) AS receivedAt,
+      AVG(temperature_c) AS temperatureC, AVG(humidity) AS humidity, COUNT(*) AS sampleCount
+      FROM readings WHERE device_id=? AND received_at>=? AND received_at<?
+      GROUP BY CAST((received_at - ?) / ? AS INTEGER) ORDER BY receivedAt`)
+      .all(deviceId, from, now, from, bucketMs);
+    return { from, to: now, bucketSeconds: bucketMs / 1000,
+      sampleCount: readings.reduce((sum, reading) => sum + reading.sampleCount, 0), readings };
+  }
   expire(now = Date.now()) {
     this.db.prepare("UPDATE commands SET status='expired',lease_until=NULL WHERE status IN ('pending','inflight') AND expires_at<=?").run(now);
     this.db.prepare('DELETE FROM sessions WHERE expires_at<=?').run(now);

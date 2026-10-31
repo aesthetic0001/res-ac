@@ -1,4 +1,7 @@
+import { renderHistory } from './graphs.js';
+
 let csrf = '';
+let historyRequest = null, plottedHistory = null;
 const el = selector => document.querySelector(selector);
 const node = (tag, text, className) => { const value = document.createElement(tag); if (text !== undefined) value.textContent = text; if (className) value.className = className; return value; };
 const date = value => value ? new Date(value).toLocaleString() : 'Not yet seen';
@@ -23,6 +26,10 @@ async function refresh() {
   }));
   el('#device-select').replaceChildren(...state.devices.map(device => { const option = node('option', device.id); option.value = device.id; return option; }));
   if (state.devices.some(device => device.id === selected)) el('#device-select').value = selected;
+  const historySelected = el('#history-device').value;
+  el('#history-device').replaceChildren(...state.devices.map(device => { const option = node('option', device.id); option.value = device.id; return option; }));
+  if (state.devices.some(device => device.id === historySelected)) el('#history-device').value = historySelected;
+  el('#history-device').disabled = !state.devices.length;
   el('#commands').replaceChildren(...state.commands.map(command => {
     const row = node('tr');
     const statusCell = node('td'); statusCell.append(node('span', command.status, `badge ${command.status}`));
@@ -31,7 +38,39 @@ async function refresh() {
   }));
   if (!state.commands.length) { const row = node('tr'), cell = node('td', 'No commands queued yet.'); cell.colSpan = 5; row.append(cell); el('#commands').append(row); }
   el('#logout').disabled = false; el('#send-command').disabled = !state.devices.length;
+  await refreshHistory();
 }
+async function refreshHistory(clear = false) {
+  historyRequest?.abort();
+  const request = new AbortController(); historyRequest = request;
+  const device = el('#history-device').value;
+  if (clear || !device) {
+    plottedHistory = null; el('#history-charts').hidden = true;
+    el('#history-message').textContent = device ? 'Loading reading history…' : 'No devices configured yet.';
+  }
+  if (!device) return;
+  try {
+    const history = await api(`/api/admin/devices/${encodeURIComponent(device)}/readings?hours=${el('#history-range').value}`, { signal: request.signal });
+    if (request.signal.aborted) return;
+    plottedHistory = history.readings.length ? history : null;
+    el('#history-charts').hidden = !plottedHistory;
+    el('#history-message').textContent = plottedHistory
+      ? `${history.sampleCount.toLocaleString()} readings · plotted in ${history.bucketSeconds < 60 ? `${history.bucketSeconds}-second` : `${Number((history.bucketSeconds / 60).toFixed(1))}-minute`} intervals. Updated ${new Date().toLocaleTimeString()}.`
+      : 'No readings in this time range. New readings will appear automatically.';
+    if (plottedHistory) renderHistory(plottedHistory);
+  } catch (error) {
+    if (request.signal.aborted) return;
+    plottedHistory = null; el('#history-charts').hidden = true;
+    el('#history-message').textContent = `Could not load reading history: ${error.message}. Retrying automatically.`;
+  }
+}
+el('#history-device').addEventListener('change', () => refreshHistory(true));
+el('#history-range').addEventListener('change', () => refreshHistory(true));
+let resizeTimer;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => { if (plottedHistory) renderHistory(plottedHistory); }, 150);
+});
 el('#command-form').addEventListener('submit', async event => {
   event.preventDefault(); const form = new FormData(event.target); el('#send-command').disabled = true;
   try {

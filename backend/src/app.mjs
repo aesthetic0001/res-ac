@@ -46,7 +46,8 @@ export function createApp(config, store) {
   const assets = new Map([
     ['/login', ['login.html', 'text/html']], ['/', ['index.html', 'text/html']],
     ['/assets/style.css', ['style.css', 'text/css']], ['/assets/app.js', ['app.js', 'text/javascript']],
-    ['/assets/login.js', ['login.js', 'text/javascript']]
+    ['/assets/login.js', ['login.js', 'text/javascript']],
+    ['/assets/graphs.js', ['graphs.js', 'text/javascript']]
   ].map(([route, [name, type]]) => [route, { data: readFileSync(fileURLToPath(new URL(`../public/${name}`, import.meta.url))), type }]));
   const waiters = new Map(), limits = new Map();
   const notify = deviceId => waiters.get(deviceId)?.wake();
@@ -103,7 +104,8 @@ export function createApp(config, store) {
     if (!config.httpDev) res.setHeader('strict-transport-security', 'max-age=31536000');
     res.setHeader('cache-control', 'no-store');
     try {
-      const path = new URL(req.url, 'http://local').pathname;
+      const url = new URL(req.url, 'http://local');
+      const path = url.pathname;
       if (req.method === 'GET' && path === '/healthz') {
         store.db.prepare('SELECT 1').get();
         return json(res, shuttingDown ? 503 : 200, { ok: !shuttingDown });
@@ -139,6 +141,15 @@ export function createApp(config, store) {
       if (req.method === 'GET' && path === '/api/admin/state') {
         const active = requireAdmin(req);
         return json(res, 200, { ...store.snapshot(), csrf: active.csrf, username: config.adminUsername });
+      }
+      const adminReadings = path.match(/^\/api\/admin\/devices\/([a-zA-Z0-9_-]+)\/readings$/);
+      if (req.method === 'GET' && adminReadings) {
+        requireAdmin(req);
+        const deviceId = adminReadings[1];
+        if (!store.device(deviceId)) throw new HttpError(404, 'Device not found');
+        const range = url.searchParams.get('hours') ?? '24';
+        assert(['1', '6', '24', '168'].includes(range), 'Hours must be 1, 6, 24, or 168');
+        return json(res, 200, store.readingHistory(deviceId, Number(range)));
       }
       const adminCommand = path.match(/^\/api\/admin\/devices\/([a-zA-Z0-9_-]+)\/commands$/);
       if (req.method === 'POST' && adminCommand) {

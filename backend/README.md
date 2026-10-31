@@ -219,3 +219,30 @@ For local-only HTTP development, explicitly set `HTTP_DEV=true` and provide
 `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`, `DEVICE_ID`, `DEVICE_TOKEN`, and `DATA_DIR`,
 then run `npm start`. Do not use that mode for a public deployment. The production
 wizard/Compose setup uses direct HTTPS and does not enable HTTP development mode.
+
+## Reading history graphs
+
+The authenticated dashboard includes temperature and relative humidity charts.
+Select a device and the last hour, 6 hours, 24 hours (default), or 7 days. Charts
+refresh every 5 seconds alongside the current readings. Hover/touch a chart or
+focus it and use the arrow keys (Home/End also work) to inspect a plotted value.
+Empty ranges and loading failures are shown explicitly; missing intervals break
+the line rather than implying continuous readings.
+
+History comes from the existing SQLite readings table; no device firmware or
+database migration is needed. The admin-session-only endpoint is
+`GET /api/admin/devices/:id/readings?hours=24`. It returns the time bounds,
+`bucketSeconds`, total `sampleCount`, and up to 600 chronological points with
+`receivedAt` (Unix milliseconds), `temperatureC`, `humidity`, and `sampleCount`.
+Each point averages all samples in its interval. Raw readings remain in SQLite.
+The indexed query uses server receipt time, displayed in the browser's local
+timezone, so delayed uploads appear when they arrive and device clock errors do
+not hide readings. Humidity uses a fixed 0–100% scale; temperature scales to the
+selected data.
+
+Deploy the updated backend image to see the charts; existing data volumes and
+private configuration can be reused:
+
+```sh
+docker compose up -d --build backend
+```
