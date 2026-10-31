@@ -1,4 +1,5 @@
 import { renderHistory } from './graphs.js';
+import { presets, renderCurve } from './fan-curve.js';
 
 let csrf = '';
 let dashboardState = null;
@@ -9,6 +10,7 @@ let backendAvailable = false;
 let refreshSequence = 0;
 let updateError = '';
 let calibrationUiKey = '';
+let curveDirty = false, curveOwner = '', curvePending = null;
 const fanActions = { power: 'Power toggle', speed_down: 'Speed down', speed_up: 'Speed up' };
 let historyRequest = null, plottedHistory = null;
 const el = selector => document.querySelector(selector);
@@ -62,7 +64,7 @@ async function refresh() {
 
 function renderRemote() {
   const device = dashboardState?.devices.find(device => device.id === el('#remote-device-select').value);
-  const commands = dashboardState?.commands.filter(command => command.device_id === device?.id && ['fan.command', 'fan.calibrate', 'ir.send'].includes(command.type)) || [];
+  const commands = dashboardState?.commands.filter(command => command.device_id === device?.id && ['fan.command', 'fan.calibrate', 'ir.send', 'fan.level', 'fan.curve'].includes(command.type)) || [];
   const pending = commands.some(command => ['pending', 'inflight'].includes(command.status));
   const fan = device?.fanState;
   const fresh = !!fan && Date.now() - fan.receivedAt < 30_000;
@@ -80,6 +82,11 @@ function renderRemote() {
   for (const button of document.querySelectorAll('[data-fan-button]')) {
     button.disabled = !backendAvailable || !calibrated || remoteSending || pending || (button.dataset.fanButton !== 'power' && fan.power !== 'on');
   }
+  for (const button of document.querySelectorAll('[data-fan-level]')) {
+    button.disabled = !backendAvailable || !calibrated || fan.firmwareVersion !== 'v4' || remoteSending || pending;
+    button.setAttribute('aria-pressed', String(!!calibrated && fan.speed === Number(button.dataset.fanLevel)));
+  }
+  renderAutomatic(device, fresh, calibrated, pending);
   el('#remote-connection').textContent = !device ? 'No devices available.' : Date.now() - Date.parse(device.lastSeen || '') < 90_000
     ? 'Device recently connected.' : 'Device has not checked in recently. Requests expire after 30 seconds.';
   const status = el('#remote-status');
@@ -89,14 +96,14 @@ function renderRemote() {
   if (remoteError) { status.textContent = remoteError; status.className = 'remote-error'; return; }
   if (!device) { status.textContent = 'Add a device to use the remote.'; return; }
   const command = commands[0];
-  if (!calibrated && (!command || command.type !== 'fan.calibrate' || command.payload.sessionId !== fan?.sessionId)) {
+  if (!calibrated && (!command || !['fan.calibrate', 'fan.curve'].includes(command.type) || command.payload.sessionId !== fan?.sessionId)) {
     status.textContent = fresh ? 'Remote locked. Restart the fan to factory position: off, then confirm calibration.' : 'Remote locked while waiting for current device state.';
     return;
   }
   if (!command) { status.textContent = calibrated ? 'Ready. Aim the IR emitter at the fan.' : 'Remote locked until the fan is calibrated.'; return; }
-  const action = command.type === 'fan.calibrate' ? 'Calibration' : fanActions[command.payload.button] || 'IR command';
+  const action = command.type === 'fan.calibrate' ? 'Calibration' : command.type === 'fan.curve' ? 'Temperature curve' : command.type === 'fan.level' ? `Level ${command.payload.level || 'Off'}` : fanActions[command.payload.button] || 'IR command';
   if (command.status === 'succeeded') {
-    status.textContent = command.result?.reply === 'calibrated' ? 'Calibration confirmed by device.' : command.result?.reply === 'ir_sent' ? `${action}: IR sent. Fan response unconfirmed.` : `${action}: command completed. Fan response unconfirmed.`;
+    status.textContent = command.result?.reply === 'calibrated' ? 'Calibration confirmed by device.' : command.result?.reply === 'curve_saved' ? 'Temperature curve saved on device.' : command.result?.reply === 'level_set' ? `${action}: ${command.result.presses} IR press${command.result.presses === 1 ? '' : 'es'}. Fan response unconfirmed.` : command.result?.reply === 'ir_sent' ? `${action}: IR sent. Fan response unconfirmed.` : `${action}: command completed. Fan response unconfirmed.`;
   } else if (command.status === 'failed') {
     status.textContent = `${action} failed: ${command.result?.error || 'Check Recent commands for details.'}`;
     status.className = 'remote-error';
@@ -124,6 +131,7 @@ async function queueFanCommand(type, payload) {
     });
     remotePollUntil = Date.now() + 35_000;
     await refresh();
+    return queued;
   } catch (error) {
     remoteError = `${error.message}. Check Recent commands before retrying.`;
   } finally {
@@ -141,6 +149,56 @@ for (const button of document.querySelectorAll('[data-fan-button]')) {
     await queueFanCommand('fan.command', { button: button.dataset.fanButton });
   });
 }
+for (const button of document.querySelectorAll('[data-fan-level]')) {
+  button.addEventListener('click', async () => {
+    if (!button.disabled && !remoteSending) await queueFanCommand('fan.level', { level: Number(button.dataset.fanLevel) });
+  });
+}
+const curveInputs = () => [...document.querySelectorAll('[data-curve-threshold]')];
+const curveValues = () => ({ enabled: el('#curve-enabled').checked, thresholdsC: curveInputs().map(input => Number(input.value)), hysteresisC: Number(el('#curve-hysteresis').value) });
+function loadCurve(settings) {
+  const values = settings?.thresholdsC || presets.balanced;
+  curveInputs().forEach((input, index) => input.value = values[index]);
+  el('#curve-hysteresis').value = settings?.hysteresisC ?? 1;
+  el('#curve-enabled').checked = settings?.enabled ?? false;
+  el('#curve-preset').value = Object.keys(presets).find(name => JSON.stringify(presets[name]) === JSON.stringify(values)) || 'custom';
+  renderCurve(el('#curve-preview'), values);
+}
+function renderAutomatic(device, fresh, calibrated, pending) {
+  const automatic = device?.fanState?.automatic;
+  if (curveOwner !== (device?.id || '')) { curveOwner = device?.id || ''; curveDirty = false; curvePending = null; el('#curve-message').textContent = ''; }
+  if (curvePending && automatic && JSON.stringify({ enabled: automatic.enabled, thresholdsC: automatic.thresholdsC, hysteresisC: automatic.hysteresisC }) === JSON.stringify(curvePending)) { curvePending = null; curveDirty = false; el('#curve-message').textContent = 'Curve settings confirmed by device.'; }
+  if (!curveDirty) loadCurve(automatic);
+  const available = backendAvailable && fresh && device.fanState.firmwareVersion === 'v4';
+  el('#save-curve').disabled = !available || remoteSending || pending || (el('#curve-enabled').checked && !calibrated);
+  for (const input of el('#curve-form').querySelectorAll('input, select')) input.disabled = remoteSending || pending;
+  const messages = { disabled: 'Automatic mode is off.', manual_override: 'Automatic mode stopped by a manual command.', calibration_required: 'Automatic mode paused: calibration required.', waiting_for_sample: 'Waiting for a new temperature reading.', sensor_unavailable: 'Automatic mode paused: temperature reading unavailable or stale.', waiting_for_device: 'Waiting for the device command handler.', cooldown: 'Waiting for the 30-second adjustment interval.', adjusting: 'Moving to the target level using the shortest route.', active: 'Automatic mode active.', command_error: 'Automatic mode stopped after an uncertain command. Recalibrate before enabling it.', config_error: 'Saved curve could not be read. Apply a new curve.' };
+  el('#automatic-status').textContent = !available ? 'Waiting for fresh device settings and firmware with cyclic-level support.' : automatic
+    ? `${messages[automatic.status] || 'Waiting for automatic status'}${automatic.targetLevel === null ? '' : ` Target: ${automatic.targetLevel === 0 ? 'Off' : `level ${automatic.targetLevel}`}.`}` : 'Automatic mode is off.';
+}
+el('#curve-preset').addEventListener('change', () => {
+  const values = presets[el('#curve-preset').value];
+  if (values) curveInputs().forEach((input, index) => input.value = values[index]);
+  curveDirty = true; curvePending = null; el('#curve-message').textContent = 'Unsaved changes. Apply to save.';
+  renderCurve(el('#curve-preview'), curveValues().thresholdsC);
+});
+el('#curve-form').addEventListener('input', event => {
+  curveDirty = true; curvePending = null; el('#curve-message').textContent = 'Unsaved changes. Apply to save.';
+  if (event.target.matches('[data-curve-threshold]')) el('#curve-preset').value = 'custom';
+  renderCurve(el('#curve-preview'), curveValues().thresholdsC); renderRemote();
+});
+el('#curve-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (el('#save-curve').disabled || remoteSending) return;
+  const settings = curveValues();
+  if (settings.thresholdsC.some((value, index) => index && value - settings.thresholdsC[index - 1] < 1)) {
+    el('#curve-message').textContent = 'Each threshold must be at least 1 °C above the previous one.'; return;
+  }
+  curveDirty = true; curvePending = settings;
+  const queued = await queueFanCommand('fan.curve', settings);
+  el('#curve-message').textContent = queued ? 'Curve queued. Waiting for the device to save it.' : remoteError;
+});
+loadCurve();
 async function refreshHistory(clear = false) {
   historyRequest?.abort();
   const request = new AbortController(); historyRequest = request;

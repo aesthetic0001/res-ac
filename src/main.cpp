@@ -25,6 +25,7 @@ unsigned long lastCommandCheckMs = 0;
 char lastCommandId[37] = {0};
 char lastCommandReply[128] = {0};
 FanState fan;
+const char *fanControlSource = "reset";
 char fanSession[33] = {0};
 unsigned long fanRevision = 0;
 unsigned long lastFanHeartbeatMs = 0;
@@ -35,14 +36,15 @@ bool validEpoch(const char *epoch);
 
 void publishFanState() {
   char frame[96];
-  snprintf(frame, sizeof(frame), "v1,%s,%u,%u,%u,%lu", fanSession[0] ? fanSession : "none",
-           fan.calibrated(), fan.power(), fan.speed(), fanRevision);
+  snprintf(frame, sizeof(frame), "v2,%s,%u,%u,%u,%lu,%s", fanSession[0] ? fanSession : "none",
+           fan.calibrated(), fan.power(), fan.speed(), fanRevision, fanControlSource);
   Bridge.put("resac_fan_state", frame);
   lastFanPublishMs = millis();
 }
 
 void invalidateFan() {
   fan.reset();
+  fanControlSource = "reset";
   fanSession[0] = '\0';
   ++fanRevision;
   Bridge.put("resac_fan_session", "");
@@ -79,7 +81,7 @@ bool parseNumber(const char *text, unsigned long limit, unsigned long &value, ui
   return *end == '\0' && value <= limit;
 }
 
-bool sendFanIR(uint16_t address, uint8_t command, uint8_t repeats) {
+bool sendFanIR(uint16_t address, uint8_t command, uint8_t repeats, const char *source = "manual") {
   if (!fan.calibrated()) {
     Serial.println(F("IR blocked: calibration required; restart fan to factory position: off"));
     return false;
@@ -87,10 +89,34 @@ bool sendFanIR(uint16_t address, uint8_t command, uint8_t repeats) {
   // Modern IRremote sends address/command LSB first and adds the complement byte.
   // 0xDE80 + 0x08 is speed up; do not pass ESPHome's combined 0xF708 command.
   IrSender.sendNEC(address, command, repeats);
+  fanControlSource = source;
   Serial.print(F("IR transmitted: NEC address=0x")); Serial.print(address, HEX);
   Serial.print(F(" command=0x")); Serial.println(command, HEX);
   if (!fan.afterSend(address, command, repeats)) invalidateFan();
   else { ++fanRevision; publishFanState(); }
+  return true;
+}
+
+bool setFanLevel(uint8_t target, bool automatic, uint8_t &presses) {
+  presses = 0;
+  if (!fan.calibrated() || target > 5) return false;
+  const char *source = automatic ? "automatic" : "manual";
+  if (target == 0) {
+    if (fan.power()) { if (!sendFanIR(0xDE80, 0x00, 0, source)) return false; ++presses; }
+    return true;
+  }
+  if (!fan.power()) {
+    if (!sendFanIR(0xDE80, 0x00, 0, source)) return false;
+    ++presses;
+    delay(150);
+  }
+  const int8_t route = FanState::shortestRoute(fan.speed(), target);
+  const uint8_t count = route < 0 ? -route : route;
+  for (uint8_t i = 0; i < count; ++i) {
+    if (!sendFanIR(0xDE80, route < 0 ? 0x10 : 0x08, 0, source)) return false;
+    ++presses;
+    if (i + 1 < count) delay(150);
+  }
   return true;
 }
 
@@ -110,7 +136,8 @@ void processCommand() {
   Bridge.get("resac_command", frame, sizeof(frame) - 1);
   // One atomic request; v1 ping remains compatible with the original agent.
   const bool control = strncmp(frame, "v3,", 3) == 0;
-  if (!control && strncmp(frame, "v1,", 3) != 0) return;
+  const bool levelControl = strncmp(frame, "v4,", 3) == 0;
+  if (!control && !levelControl && strncmp(frame, "v1,", 3) != 0) return;
   char *id = frame + 3;
   char *separator = strchr(id, ',');
   if (!separator) return;
@@ -118,30 +145,39 @@ void processCommand() {
   if (!validCommandId(id)) return;
   unsigned long address = 0, command = 0, repeats = 0;
   bool calibrate = false;
+  bool automatic = false;
   char *session = nullptr;
-  if (control) {
+  if (control || levelControl) {
     char *save = nullptr;
     char *kind = strtok_r(separator + 1, ",", &save);
     if (!kind) return;
     calibrate = strcmp(kind, "calibrate") == 0;
-    if (!calibrate && strcmp(kind, "nec") != 0) return;
+    automatic = strcmp(kind, "auto_level") == 0;
+    if (levelControl ? (!automatic && strcmp(kind, "level") != 0) : (!calibrate && strcmp(kind, "nec") != 0)) return;
     session = strtok_r(nullptr, ",", &save);
     if (!session || !validEpoch(session)) return;
-    if (!calibrate && (!parseNumber(strtok_r(nullptr, ",", &save), 65535, address) ||
+    if (levelControl) {
+      if (!parseNumber(strtok_r(nullptr, ",", &save), 5, command)) return;
+    } else if (!calibrate && (!parseNumber(strtok_r(nullptr, ",", &save), 65535, address) ||
         !parseNumber(strtok_r(nullptr, ",", &save), 255, command) ||
         !parseNumber(strtok_r(nullptr, ",", &save), 3, repeats))) return;
     if (strtok_r(nullptr, ",", &save)) return;
   } else if (strcmp(separator + 1, "ping") != 0) return;
   if (strcmp(id, lastCommandId) != 0) {
-    if (control) {
+    if (control || levelControl) {
       if (!fanSession[0] || strcmp(session, fanSession) != 0 ||
           !fanHeartbeat[0] || static_cast<unsigned long>(millis() - lastFanHeartbeatMs) > 10000 ||
           (!calibrate && !fan.calibrated())) {
         snprintf(lastCommandReply, sizeof(lastCommandReply), "v3,%s,rejected,%s", id, session);
       } else if (calibrate) {
-        fan.calibrateOff(); ++fanRevision; publishFanState();
+        fan.calibrateOff(); fanControlSource = "calibration"; ++fanRevision; publishFanState();
         snprintf(lastCommandReply, sizeof(lastCommandReply), "v3,%s,calibrated,%s", id, session);
         Serial.println(F("Fan calibrated: estimated off; default speed 1"));
+      } else if (levelControl) {
+        uint8_t presses;
+        if (setFanLevel(command, automatic, presses))
+          snprintf(lastCommandReply, sizeof(lastCommandReply), "v4,%s,level_set,%s,%lu,%u,%lu", id, session, command, presses, millis());
+        else snprintf(lastCommandReply, sizeof(lastCommandReply), "v3,%s,rejected,%s", id, session);
       } else {
         sendFanIR(address, command, repeats);
         snprintf(lastCommandReply, sizeof(lastCommandReply), "v3,%s,ir_sent,%s,%lu,%lu,%lu,%lu",
@@ -178,7 +214,7 @@ void processSerial() {
       char *position = strtok_r(nullptr, " ", &save);
       if (position && strcmp(position, "off") == 0 && !strtok_r(nullptr, " ", &save) && fanSession[0] &&
           fanHeartbeat[0] && static_cast<unsigned long>(millis() - lastFanHeartbeatMs) <= 10000) {
-        fan.calibrateOff(); ++fanRevision; publishFanState();
+        fan.calibrateOff(); fanControlSource = "calibration"; ++fanRevision; publishFanState();
         Serial.println(F("Fan calibrated: estimated off; default speed 1"));
       } else Serial.println(F("Confirm fan restarted and left off with: calibrate off (agent must be connected)"));
     } else if (!overflow && kind && strcmp(kind, "ir") == 0 &&
@@ -260,12 +296,14 @@ void setup() {
   Serial.println(F("Starting sensor Bridge; Linux boot may take a moment..."));
   Bridge.begin();
   Bridge.put("resac_sensor_status", "starting");
+  // AVR sequence numbers restart at zero; request a fresh reading-ID epoch.
+  Bridge.put("resac_epoch", "");
   // Discard a pre-reset mailbox: a stale toggle must not run during boot.
   Bridge.put("resac_command", "");
   Bridge.put("resac_command_result", "");
   Bridge.put("resac_fan_invalidate", "");
   invalidateFan();
-  Bridge.put("resac_command_ready", "v3");
+  Bridge.put("resac_command_ready", "v4");
   Serial.println(F("Bridge ready; DHT11 on digital pin 3"));
   Serial.println(F("IR on digital pin 9; calibration required before sending"));
   lastSampleMs = millis() - DEFAULT_INTERVAL_MS;
@@ -276,12 +314,12 @@ void loop() {
   const unsigned long now = millis();
   if (static_cast<unsigned long>(now - lastCommandCheckMs) >= 250) {
     lastCommandCheckMs = now;
+    updateInterval();
     updateFan();
     processCommand();
   }
   if (static_cast<unsigned long>(now - lastSampleMs) >= intervalMs) {
     lastSampleMs = now;
-    updateInterval();
     publishSample();
   }
 }

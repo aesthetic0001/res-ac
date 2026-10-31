@@ -106,9 +106,18 @@ class AgentTests(unittest.TestCase):
                     return 'v1,%s,1,22500,48000,1000' % values['resac_epoch']
                 return original_get(key)
             with patch.object(bridge, 'get', read):
-                agent.Collector({'interval_seconds': 10}, pending, bridge).tick()
+                collector = agent.Collector({'interval_seconds': 10}, pending, bridge)
+                collector.tick()
             self.assertEqual(values['resac_interval_ms'], '10000')
             self.assertEqual(pending.first()['temperatureC'], 22.5)
+            prior_epoch = values['resac_epoch']
+            prior_id = pending.first()['readingId']
+            values['resac_epoch'] = ''  # AVR reboot resets its sample sequence.
+            collector.next_due = 0
+            with patch.object(bridge, 'get', read):
+                collector.tick()
+            self.assertNotEqual(values['resac_epoch'], prior_epoch)
+            self.assertNotEqual(pending.queue[-1]['readingId'], prior_id)
         finally:
             server.shutdown(); server.server_close(); worker.join()
 
@@ -204,16 +213,22 @@ class AgentTests(unittest.TestCase):
         closed = []
         command_ticks = []
         class Commands:
-            def __init__(self, config):
+            def __init__(self, config, **kwargs):
                 pass
-            def tick(self):
+            def tick(self, **kwargs):
                 command_ticks.append(True)
             def close(self):
                 closed.append(True)
         class FanReporter:
-            def __init__(self, config): pass
+            def __init__(self, config, **kwargs): pass
             def tick(self): pass
             def close(self): pass
+        class AutoController:
+            busy = False
+            def __init__(self, config): pass
+            def tick(self, commands): pass
+            def manual_override(self): pass
+            def configure(self, payload): pass
         class Collector:
             def __init__(self, config, pending):
                 self.pending = pending
@@ -238,7 +253,7 @@ class AgentTests(unittest.TestCase):
                 return 201, b'{}'
             def close(self):
                 closed.append(True)
-        with patch.object(agent, 'FanReporter', FanReporter), patch.object(agent, 'Collector', Collector), patch.object(agent, 'CurlUpload', Upload), \
+        with patch.object(agent, 'AutoController', AutoController), patch.object(agent, 'FanReporter', FanReporter), patch.object(agent, 'Collector', Collector), patch.object(agent, 'CurlUpload', Upload), \
                 patch.object(agent, 'CommandProcessor', Commands), patch.object(agent.time, 'sleep'):
             with self.assertRaises(KeyboardInterrupt):
                 agent.run(dict(queue_limit=2))

@@ -15,7 +15,7 @@ unlock the controls: the AVR must accept it and report a calibrated state.
 
 The AVR owns the estimate in RAM. Calibration sets estimated power to off and
 assumes the next power-on uses speed 1 of 5. Power toggles preserve the remembered
-speed, and speed presses clamp to levels 1–5 while on. These are modeling
+speed, and speed presses wrap cyclically through levels 1–5 while on. These are modeling
 assumptions to verify on the actual fan, not measured settings. A missed IR press,
 the physical remote, or the fan's buttons can make the estimate inaccurate.
 Use **Calibrate fan** again after changing the fan externally.
@@ -99,6 +99,62 @@ behavior has no named button. Avoid sweeping unknown codes.
 accepts a 16-bit address and an 8-bit command, sends LSB first, and generates
 the command complement. Use `0x08`, not ESPHome's `0xF708`, for speed up.
 In transmission order the four speed-up bytes are `80 DE 08 F7`.
+
+## Target levels and temperature curves
+
+The remote's **Set level** controls request an absolute estimated target, 1–5,
+or 0 for off. The AVR computes `forward = (target - current + 5) % 5` and
+`backward = (current - target + 5) % 5`, then sends the shorter sequence of
+individual NEC button presses. There are at most two speed presses. For example,
+3 → 4 uses one up press, 1 → 5 uses one down press, and 5 → 2 uses two up presses.
+Power is separate: an off fan is powered on first, using its remembered speed;
+requesting off sends a power toggle only if the estimate says on. Requesting the
+current level sends no IR. Individual presses are separated by 150 ms; NEC
+short-repeat frames are not used to move multiple levels.
+
+**Automatic temperature curve** offers these editable starting presets. Each
+temperature is the threshold for levels 1, 2, 3, 4, and 5 respectively; below
+the first threshold the target is off:
+
+| Preset | Thresholds (°C) |
+| --- | --- |
+| Quiet | 24, 26, 28, 30, 32 |
+| Balanced | 22, 24, 26, 28, 30 |
+| Cooling | 20, 22, 24, 26, 28 |
+
+The Seeeduino's Linux agent evaluates fresh DHT11 samples locally, so operation
+does not depend on a backend temperature polling job. On heating, a threshold
+applies as soon as it is reached. On cooling, its configurable hysteresis (default
+1 °C) must also be crossed: with the balanced preset, level 3 begins at 26 °C
+and steps down at or below 25 °C. Automatic adjustments are at least 30 seconds
+apart. Sensor reads occur at least every 10 seconds while automatic mode is
+enabled, even if the normal reporting interval is longer.
+
+Settings are atomically persisted in `/etc/res-ac/fan-curve.json` (mode 600).
+Automatic mode is off by default. Saved enabled settings survive agent/device
+restarts, but cannot send IR until calibration and a fresh post-startup sensor
+sample are available. Read errors or samples older than 30 seconds pause
+adjustments. A command execution failure stops automatic mode. Manual target,
+power, or speed commands switch automatic mode off; USB serial IR changes are
+detected through the AVR's control-source/revision report and also stop it.
+Manual and automatic commands share one mailbox and never execute concurrently.
+Automatic physical-command journals are RAM-backed, avoiding recurring flash
+writes for temperature-driven adjustments. Restart always invalidates calibration.
+
+The API command `fan.level` accepts `{"level":4,"sessionId":"CURRENT_SESSION"}`.
+`fan.curve` accepts `{"enabled":true,"thresholdsC":[22,24,26,28,30],"hysteresisC":1,"sessionId":"CURRENT_SESSION"}`.
+Both require firmware `v4` and a fresh matching session. Enabling a curve and
+setting a level require calibration; saving a disabled curve is allowed before
+calibration. `fan.curve` success means the Linux agent saved the settings, while
+`fan.level` success requires a matching AVR acknowledgment including the number
+of IR presses. Automatic status and desired level are included in live fan state.
+
+The new level frames are `v4,<UUID>,level,<session>,<0..5>` and
+`v4,<UUID>,auto_level,<session>,<0..5>`. The response is
+`v4,<UUID>,level_set,<session>,<level>,<presses>,<uptime-ms>`. Calibration and raw
+NEC retain their `v3` frame format. The `v4` sketch publishes
+`v2,<session>,<calibrated>,<power>,<speed>,<revision>,<control-source>` with source
+`reset`, `calibration`, `manual`, or `automatic`.
 
 ## Build, install and test
 

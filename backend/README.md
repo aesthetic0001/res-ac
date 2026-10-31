@@ -59,6 +59,14 @@ A successful IR result means transmission completed, not that the fan received
 it. The command form below the remote
 remains available for other buttons, ping, and numeric NEC requests.
 
+**Set level** selects Off or levels 1–5. The AVR uses the shortest path around
+the five-level cycle. **Automatic temperature curve** provides Quiet, Balanced,
+Cooling, and Custom thresholds, an editable preview, and cooling hysteresis.
+The Seeeduino evaluates the curve locally against fresh readings, with at least
+30 seconds between automatic adjustments. Manual control disables automatic mode.
+See [target levels and temperature curves](../device/IR.md#target-levels-and-temperature-curves)
+for preset values, persistence, and the `fan.level`/`fan.curve` payloads.
+
 Check deployment:
 
 ```sh
@@ -192,6 +200,10 @@ current `sessionId` and telemetry no older than 30 seconds. `fan.calibrate`
 additionally requires `confirmOff: true`. An old revision within the same
 session is rejected. Repeated telemetry refreshes freshness without adding
 historical readings.
+New firmware reports `firmwareVersion: "v4"`, `controlSource`, and an `automatic`
+object with `enabled`, `thresholdsC`, `hysteresisC`, `status`, `targetLevel`, and
+`minAdjustmentSeconds`. The dashboard uses this device-reported state to show
+whether a saved curve is active, cooling down, or waiting for calibration/readings.
 
 `POST /api/devices/seeeduino-cloud/commands/COMMAND_ID/result`
 

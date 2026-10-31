@@ -48,6 +48,9 @@ this does not confirm the fan received them. [Woozoo IR setup](device/IR.md)
 covers the emitter wiring, button profile, and USB serial bench test. Remote
 control requires an AVR-confirmed calibration after restarting the fan to
 factory position: off; the dashboard displays the AVR's estimated power/speed.
+Target levels use the shortest route around the five-speed cycle. Editable
+temperature presets run locally on the Seeeduino, with hysteresis, fresh-sensor
+checks, and a minimum adjustment interval; manual control disables automatic mode.
 
 [Eduroam tooling](EDUROAM.md) describes the credential/checking helpers without
 including a deployed network profile or institution-specific settings.

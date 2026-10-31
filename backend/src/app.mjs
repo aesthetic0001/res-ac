@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { token, digest, equal, verifyPassword, cookieToken } from './auth.mjs';
+import { curveSettings } from './fan-curve.mjs';
 
 class HttpError extends Error { constructor(status, message) { super(message); this.status = status; } }
 const assert = (test, message) => { if (!test) throw new HttpError(400, message); };
@@ -47,7 +48,8 @@ export function createApp(config, store) {
     ['/login', ['login.html', 'text/html']], ['/', ['index.html', 'text/html']],
     ['/assets/style.css', ['style.css', 'text/css']], ['/assets/app.js', ['app.js', 'text/javascript']],
     ['/assets/login.js', ['login.js', 'text/javascript']],
-    ['/assets/graphs.js', ['graphs.js', 'text/javascript']]
+    ['/assets/graphs.js', ['graphs.js', 'text/javascript']],
+    ['/assets/fan-curve.js', ['fan-curve.js', 'text/javascript']]
   ].map(([route, [name, type]]) => [route, { data: readFileSync(fileURLToPath(new URL(`../public/${name}`, import.meta.url))), type }]));
   const waiters = new Map(), limits = new Map();
   const notify = deviceId => waiters.get(deviceId)?.wake();
@@ -159,13 +161,18 @@ export function createApp(config, store) {
         const value = await body(req);
         assert(typeof value.type === 'string' && /^[a-zA-Z][a-zA-Z0-9_.-]{0,63}$/.test(value.type), 'Invalid command type');
         assert(value.payload && typeof value.payload === 'object' && !Array.isArray(value.payload), 'Payload must be a JSON object');
-        if (['fan.command', 'ir.send', 'fan.calibrate'].includes(value.type)) {
+        if (value.type === 'fan.level') assert(Number.isInteger(value.payload.level) && value.payload.level >= 0 && value.payload.level <= 5 && Object.keys(value.payload).length === 2, 'Level must be 0 (off) to 5, with sessionId');
+        if (value.type === 'fan.curve') {
+          try { curveSettings(value.payload); } catch (error) { throw new HttpError(400, error.message); }
+        }
+        if (['fan.command', 'ir.send', 'fan.calibrate', 'fan.level', 'fan.curve'].includes(value.type)) {
           const fan = store.fanState(deviceId);
           if (!fan || Date.now() - fan.receivedAt > 30_000 || !fan.sessionId || value.payload.sessionId !== fan.sessionId)
             throw new HttpError(409, 'Fan status is missing, stale, or changed. Wait for the device and recalibrate.');
+          if (['fan.level', 'fan.curve'].includes(value.type) && fan.firmwareVersion !== 'v4') throw new HttpError(409, 'Update firmware for cyclic levels and automatic curves');
           if (value.type === 'fan.calibrate') {
             assert(value.payload.confirmOff === true && Object.keys(value.payload).length === 2, 'Confirm the fan was restarted to factory position: off');
-          } else if (!fan.calibrated) throw new HttpError(409, 'Calibration required: restart fan to factory position: off');
+          } else if (!fan.calibrated && !(value.type === 'fan.curve' && value.payload.enabled === false)) throw new HttpError(409, 'Calibration required: restart fan to factory position: off');
         }
         const ttl = value.ttlSeconds ?? 300;
         assert(Number.isInteger(ttl) && ttl >= 1 && ttl <= 86400, 'TTL must be between 1 and 86400 seconds');
@@ -186,6 +193,23 @@ export function createApp(config, store) {
             ? value.sessionId !== null && ((value.power === 'off' && value.speed === 0) || (value.power === 'on' && Number.isInteger(value.speed) && value.speed >= 1 && value.speed <= 5))
             : value.power === 'unknown' && value.speed === null, 'Inconsistent fan estimate');
           const state = { sessionId: value.sessionId, calibrated: value.calibrated, power: value.power, speed: value.speed, revision: value.revision };
+          if (value.firmwareVersion !== undefined) {
+            assert(['v3', 'v4'].includes(value.firmwareVersion), 'Invalid firmware version');
+            state.firmwareVersion = value.firmwareVersion;
+          }
+          if (value.controlSource !== undefined) {
+            assert(['reset', 'manual', 'automatic', 'calibration'].includes(value.controlSource), 'Invalid fan control source');
+            state.controlSource = value.controlSource;
+          }
+          if (value.automatic !== undefined) {
+            const automatic = value.automatic;
+            try {
+              state.automatic = curveSettings({ enabled: automatic.enabled, thresholdsC: automatic.thresholdsC, hysteresisC: automatic.hysteresisC });
+            } catch { throw new HttpError(400, 'Invalid automatic curve state'); }
+            assert(['disabled', 'waiting_for_sample', 'calibration_required', 'sensor_unavailable', 'waiting_for_device', 'cooldown', 'adjusting', 'active', 'manual_override', 'command_error', 'config_error'].includes(automatic.status), 'Invalid automatic status');
+            assert(automatic.targetLevel === null || (Number.isInteger(automatic.targetLevel) && automatic.targetLevel >= 0 && automatic.targetLevel <= 5), 'Invalid automatic target');
+            Object.assign(state.automatic, { status: automatic.status, targetLevel: automatic.targetLevel, minAdjustmentSeconds: 30 });
+          }
           if (!store.setFanState(id, state)) throw new HttpError(409, 'Outdated fan revision');
           return json(res, 200, { ok: true });
         }

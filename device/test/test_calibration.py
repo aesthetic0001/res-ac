@@ -9,7 +9,7 @@ from test_ir import Bridge, SESSION, command
 
 
 class CalibrationTests(unittest.TestCase):
-    def test_estimate_core_starts_locked_bounds_speed_and_loses_state(self):
+    def test_estimate_core_starts_locked_wraps_speed_and_loses_state(self):
         root = Path(__file__).resolve().parents[2]
         source = r'''
         #include <cassert>
@@ -20,11 +20,24 @@ class CalibrationTests(unittest.TestCase):
           f.calibrateOff(); assert(!f.power() && f.speed()==0);
           f.afterSend(0xDE80, 0, 0); assert(f.power() && f.speed()==1);
           for(int i=0;i<10;++i) f.afterSend(0xDE80, 8, 0);
-          assert(f.speed()==5);
+          assert(f.speed()==1);
+          f.afterSend(0xDE80, 16, 0); assert(f.speed()==5);
           f.afterSend(0xDE80, 0, 0); assert(!f.power());
           f.afterSend(0xDE80, 0, 0); assert(f.speed()==5);
           for(int i=0;i<10;++i) f.afterSend(0xDE80, 16, 0);
+          assert(f.speed()==5);
+          for(int i=0;i<4;++i) f.afterSend(0xDE80, 16, 0);
           assert(f.speed()==1);
+          for(int from=1;from<=5;++from) for(int to=1;to<=5;++to) {
+            int route=FanState::shortestRoute(from,to);
+            assert(route>=-2 && route<=2);
+            assert(((from-1+route+5)%5)+1==to);
+            int forward=(to-from+5)%5,backward=(from-to+5)%5;
+            assert((route<0?-route:route)==(forward<backward?forward:backward));
+          }
+          assert(FanState::shortestRoute(3,4)==1);
+          assert(FanState::shortestRoute(1,5)==-1);
+          assert(FanState::shortestRoute(5,1)==1);
           assert(f.afterSend(0xDE80, 21, 0));
           assert(!f.afterSend(0xDE80, 18, 0)); assert(!f.calibrated());
           f.calibrateOff(); assert(!f.afterSend(0xDE80, 9, 0));
