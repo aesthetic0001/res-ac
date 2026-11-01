@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Linux-side telemetry and Arduino ping agent for Python 2.7/3 and legacy Yun JSON.
+"""Linux-side telemetry and IR command agent for Python 2.7/3 and legacy Yun JSON.
 
 Private configuration: /etc/res-ac/agent.json. No deployment addresses or tokens
 are included here. --probe validates HTTPS and device authentication without
@@ -7,6 +7,7 @@ inserting a synthetic reading. Sampling and upload retries run independently.
 """
 from __future__ import print_function
 import binascii
+import errno
 import json
 import os
 import re
@@ -19,12 +20,87 @@ import time
 CONFIG_PATH = '/etc/res-ac/agent.json'
 LOG_PATH = '/tmp/res-ac-agent.log'
 COMMAND_STATE_PATH = '/etc/res-ac/command-result.json'
+CURVE_PATH = '/etc/res-ac/fan-curve.json'
+AUTO_STATE_PATH = '/tmp/res-ac-auto-command-result.json'
 COMMAND_ID = r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'
 monotonic = getattr(time, 'monotonic', lambda: os.times()[4])
 try:
     text_type = unicode
 except NameError:
     text_type = str
+try:
+    integer_types = (int, long)
+except NameError:
+    integer_types = (int,)
+
+# SC15T captures: https://randomblock1.com/blog/smartifying-dumb-fan
+# Treat as a starting profile, pending verification on PCF-SC15T-CT.
+FAN_ADDRESS = 0xDE80
+FAN_BUTTONS = dict(power=0x00, speed_up=0x08, speed_down=0x10, breeze=0x09,
+                   horizontal=0x15, vertical=0x16, timer_1h=0x12,
+                   timer_2h=0x0e, timer_4h=0x0a)
+
+
+def validate_curve(payload):
+    if (not isinstance(payload, dict) or set(payload) - set(['enabled', 'thresholdsC', 'hysteresisC', 'sessionId']) or
+            not isinstance(payload.get('enabled'), bool)):
+        raise ValueError('Invalid automatic curve settings')
+    thresholds = payload.get('thresholdsC')
+    if (not isinstance(thresholds, list) or len(thresholds) != 5 or
+            any(isinstance(v, bool) or not isinstance(v, (int, float)) or not -20 <= v <= 60 for v in thresholds) or
+            any(b < a for a, b in zip(thresholds, thresholds[1:]))):
+        raise ValueError('Use five nondecreasing temperatures from -20 to 60 C; equal thresholds are allowed')
+    hysteresis = payload.get('hysteresisC', 1)
+    if isinstance(hysteresis, bool) or not isinstance(hysteresis, (int, float)) or not 0.5 <= hysteresis <= 5:
+        raise ValueError('Hysteresis must be 0.5 to 5 C')
+    return dict(enabled=payload['enabled'], thresholdsC=thresholds, hysteresisC=hysteresis)
+
+
+def curve_target(temperature, thresholds, hysteresis, previous=None):
+    target = sum(temperature >= threshold for threshold in thresholds)
+    if previous is not None and target < previous:
+        while previous > target and temperature <= thresholds[previous - 1] - hysteresis:
+            previous -= 1
+        return previous
+    return target
+
+
+def ir_payload(command):
+    payload = command.get('payload')
+    if not isinstance(payload, dict):
+        raise ValueError('IR payload must be an object')
+    if command['type'] == 'fan.command':
+        button = payload.get('button')
+        if not isinstance(button, (str, text_type)) or button not in FAN_BUTTONS:
+            raise ValueError('Unknown fan button')
+        if set(payload) - set(['button', 'sessionId']):
+            raise ValueError('fan.command accepts button and sessionId')
+        return FAN_ADDRESS, FAN_BUTTONS[button], 0
+    if payload.get('protocol') != 'NEC' or set(payload) - set(['protocol', 'address', 'command', 'repeats', 'sessionId']):
+        raise ValueError('ir.send requires NEC protocol and numeric address/command')
+    values = (payload.get('address'), payload.get('command'), payload.get('repeats', 0))
+    for value, limit in zip(values, (65535, 255, 3)):
+        if isinstance(value, bool) or not isinstance(value, integer_types) or not 0 <= value <= limit:
+            raise ValueError('Invalid NEC address, command or repeats')
+    return values
+
+
+def command_expiry(command):
+    value = command.get('expiresAt', '')
+    if not isinstance(value, (str, text_type)) or not re.match(
+            r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z$', value):
+        raise ValueError('IR command requires UTC expiresAt')
+    # Avoid datetime/calendar/_strptime: the board has a minimal Python 2 stdlib.
+    year, month, day, hour, minute, second = [int(v) for v in re.findall(r'\d+', value)[:6]]
+    leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+    months = [31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    if not (1970 <= year <= 9999 and 1 <= month <= 12 and 1 <= day <= months[month - 1]
+            and hour < 24 and minute < 60 and second < 60):
+        raise ValueError('Invalid command expiry')
+    prior = year - 1
+    days = 365 * prior + prior // 4 - prior // 100 + prior // 400 - 719162
+    days += sum(months[:month - 1]) + day - 1
+    return days * 86400 + hour * 3600 + minute * 60 + second
 
 
 
@@ -293,14 +369,94 @@ class Collector(object):
             pass
 
 
+def parse_fan_state(frame):
+    fields = frame.split(',') if isinstance(frame, (str, text_type)) else []
+    source = None
+    if len(fields) == 7 and fields[0] == 'v2':
+        source = fields.pop()
+        if source not in ('reset', 'manual', 'automatic', 'calibration'):
+            raise ValueError('Invalid fan control source')
+        fields[0] = 'v1'
+    if (len(fields) != 6 or fields[0] != 'v1' or
+            not re.match(r'^(?:[a-f0-9]{32}|none)$', fields[1]) or
+            fields[2] not in ('0', '1') or fields[3] not in ('0', '1') or
+            not re.match(r'^[0-5]$', fields[4]) or not re.match(r'^\d{1,10}$', fields[5])):
+        raise ValueError('Invalid fan state')
+    calibrated, power, speed, revision = fields[2] == '1', fields[3] == '1', int(fields[4]), int(fields[5])
+    if (revision > 0xffffffff or (calibrated and fields[1] == 'none') or
+            (not calibrated and (power or speed)) or (power and not speed) or (not power and speed)):
+        raise ValueError('Inconsistent fan state')
+    result = dict(sessionId=None if fields[1] == 'none' else fields[1], calibrated=calibrated,
+                power=('on' if power else 'off') if calibrated else 'unknown',
+                speed=speed if calibrated else None, revision=revision)
+    if source is not None:
+        result['controlSource'] = source
+    return result
+
+
+class FanReporter(object):
+    """Live AVR estimate, independent of sensor samples and their offline buffer."""
+    def __init__(self, config, bridge=None, automation=None):
+        self.config = config
+        self.bridge = bridge or BridgeStore()
+        self.request = None
+        self.initialized = False
+        self.next_due = 0
+        self.sent_at = 0
+        self.sent_state = None
+        self.heartbeat = 0
+        self.automation = automation
+
+    def tick(self):
+        if self.request is not None and self.request.process.poll() is not None:
+            try:
+                status, body = self.request.finish()
+                if status not in (200, 201):
+                    self.sent_state = None
+            except Exception:
+                self.sent_state = None
+            finally:
+                self.request.close()
+                self.request = None
+        if monotonic() < self.next_due:
+            return
+        self.next_due = monotonic() + 1
+        try:
+            ready = self.bridge.get('resac_command_ready')
+            if ready not in ('v3', 'v4'):
+                self.initialized = False
+                return
+            if not self.initialized:
+                self.bridge.put('resac_fan_invalidate', '1')
+                self.initialized = True
+            self.heartbeat += 1
+            self.bridge.put('resac_fan_heartbeat', str(self.heartbeat))
+            session = self.bridge.get('resac_fan_session') or ''
+            if not re.match(r'^[a-f0-9]{32}$', session):
+                self.bridge.put('resac_fan_session', binascii.hexlify(os.urandom(16)).decode('ascii'))
+            state = parse_fan_state(self.bridge.get('resac_fan_state'))
+            state['firmwareVersion'] = ready
+            if self.automation is not None:
+                state['automatic'] = self.automation.snapshot()
+            if self.request is None and (state != self.sent_state or monotonic() - self.sent_at >= 5):
+                self.request = CurlUpload(self.config, state, route='fan-state')
+                self.sent_state = state
+                self.sent_at = monotonic()
+        except Exception:
+            self.initialized = False
+
+    def close(self):
+        if self.request is not None:
+            self.request.close()
+
+
 class CommandProcessor(object):
     """One 30-second poll or result request alongside the independent poster.
 
-    Only device.ping is executable. The AVR must return the matching UUID and
-    its uptime before success can be reported. Keep the last result on flash so
-    an interrupted acknowledgment can be retried with the identical payload.
+    Require a matching AVR acknowledgment. Journal an uncertain IR result before
+    dispatch so a Linux restart never automatically repeats an interrupted toggle.
     """
-    def __init__(self, config, bridge=None, state_path=COMMAND_STATE_PATH):
+    def __init__(self, config, bridge=None, state_path=COMMAND_STATE_PATH, on_manual=None, curve_handler=None, automatic=False):
         self.config = config
         self.bridge = bridge or BridgeStore()
         self.state_path = state_path
@@ -314,6 +470,15 @@ class CommandProcessor(object):
         self.backoff = 1
         self.bridge_due = 0
         self.deadline = 0
+        self.ir = None
+        self.prepared = False
+        self.expires_at = None
+        self.calibrating = False
+        self.session_id = None
+        self.target_level = None
+        self.on_manual = on_manual
+        self.curve_handler = curve_handler
+        self.automatic = automatic
         try:
             with open(state_path) as stream:
                 saved = decode_json(stream.read())
@@ -322,10 +487,12 @@ class CommandProcessor(object):
                 raise ValueError('Invalid saved result')
             self.cached = self.reply = saved
             self.persisted = True
-        except IOError:
-            pass
+        except IOError as error:
+            if error.errno != errno.ENOENT:
+                raise ValueError('Saved command result could not be read')
         except Exception:
-            log('Saved command result could not be read; ping redelivery is safe')
+            # A corrupt journal cannot establish whether a physical action ran.
+            raise ValueError('Saved command result could not be read')
 
     def _status(self, value):
         try:
@@ -338,17 +505,26 @@ class CommandProcessor(object):
         self.current = None
         self.persisted = False
 
-    def _save(self):
-        # The enclosing /etc/res-ac directory is private. Writes happen once per
-        # command, never once per sensor reading or empty long poll.
+    def _write_state(self, value):
+        # The enclosing /etc/res-ac directory is private. IR writes before and
+        # after dispatch; sensor readings and empty long polls never write here.
         path = self.state_path + '.tmp'
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, 'w') as stream:
             os.fchmod(stream.fileno(), 0o600)
-            stream.write(encode_json(self.reply))
+            stream.write(encode_json(value))
             stream.flush()
             os.fsync(stream.fileno())
         os.rename(path, self.state_path)
+        # Make the rename durable as well as the file contents.
+        directory = os.open(os.path.dirname(path) or '.', os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+    def _save(self):
+        self._write_state(self.reply)
         self.cached = self.reply
         self.persisted = True
         try:
@@ -365,16 +541,73 @@ class CommandProcessor(object):
             self.persisted = True
             return
         self.current = command
-        if command.get('type') != 'device.ping':
+        self.ir = None
+        self.prepared = False
+        self.expires_at = None
+        self.calibrating = command.get('type') == 'fan.calibrate'
+        self.session_id = None
+        self.target_level = None
+        if command.get('type') in ('fan.command', 'ir.send', 'fan.calibrate', 'fan.level', 'fan.curve'):
+            try:
+                if self.calibrating:
+                    payload = command.get('payload')
+                    if (not isinstance(payload, dict) or payload.get('confirmOff') is not True or
+                            set(payload) != set(['confirmOff', 'sessionId'])):
+                        raise ValueError('Confirm the fan was restarted and left off')
+                elif command['type'] == 'fan.level':
+                    payload = command.get('payload')
+                    if (not isinstance(payload, dict) or set(payload) != set(['level', 'sessionId']) or
+                            isinstance(payload.get('level'), bool) or not isinstance(payload.get('level'), integer_types) or
+                            not 0 <= payload['level'] <= 5):
+                        raise ValueError('Fan level must be an integer from 0 (off) to 5')
+                    self.target_level = payload['level']
+                elif command['type'] == 'fan.curve':
+                    validate_curve(command.get('payload'))
+                else:
+                    self.ir = ir_payload(command)
+                self.expires_at = command_expiry(command)
+                if time.gmtime().tm_year < 2025 or time.time() >= self.expires_at:
+                    raise ValueError('IR command expired or device clock invalid')
+                ready = self.bridge.get('resac_command_ready')
+                if ready not in ('v3', 'v4'):
+                    raise ValueError('Arduino firmware does not support calibration; upgrade sketch')
+                if command['type'] in ('fan.level', 'fan.curve') and ready != 'v4':
+                    raise ValueError('Upgrade firmware for cyclic levels and automatic curves')
+                self.session_id = command['payload'].get('sessionId')
+                state = parse_fan_state(self.bridge.get('resac_fan_state'))
+                if (not isinstance(self.session_id, (str, text_type)) or
+                        not re.match(r'^[a-f0-9]{32}$', self.session_id) or state['sessionId'] != self.session_id):
+                    raise ValueError('Fan session changed; restart fan to factory position: off and recalibrate')
+                disabling = command['type'] == 'fan.curve' and command['payload']['enabled'] is False
+                if not self.calibrating and not disabling and not state['calibrated']:
+                    raise ValueError('Calibration required: restart fan to factory position: off')
+                if command['type'] == 'fan.curve':
+                    if self.curve_handler is None:
+                        raise ValueError('Automatic controller unavailable')
+                    saved = self.curve_handler(command['payload'])
+                    self._complete('succeeded', dict(reply='curve_saved', automatic=saved))
+                    return
+                if self.on_manual is not None and not self.calibrating:
+                    self.on_manual()
+            except (ValueError, IOError, OSError) as error:
+                self._complete('failed', dict(error=str(error)))
+                return
+        elif command.get('type') != 'device.ping':
             self._complete('failed', dict(error='Unsupported command type'))
             return
         self.deadline = monotonic() + 10
         self.bridge_due = 0
-        self._status('ping received; waiting for Arduino')
+        self._status('command received; waiting for Arduino')
 
     def _arduino(self):
         if monotonic() >= self.deadline:
-            self._complete('failed', dict(error='Arduino ping timed out'))
+            if (self.ir or self.target_level is not None) and self.prepared:
+                try:
+                    self.bridge.put('resac_fan_invalidate', '1')
+                except Exception:
+                    pass
+            self._complete('failed', dict(error='Arduino IR timed out; transmission uncertain' if self.ir or self.target_level is not None else
+                                         'Arduino calibration timed out; confirm off again' if self.calibrating else 'Arduino ping timed out'))
             return
         if monotonic() < self.bridge_due:
             return
@@ -382,11 +615,49 @@ class CommandProcessor(object):
         try:
             frame = self.bridge.get('resac_command_result') or ''
             fields = frame.split(',')
-            if (len(fields) == 4 and fields[:3] == ['v1', self.current['id'], 'pong'] and
+            if (not self.ir and self.target_level is None and not self.calibrating and len(fields) == 4 and fields[:3] == ['v1', self.current['id'], 'pong'] and
                     re.match(r'^\d{1,10}$', fields[3]) and int(fields[3]) <= 0xffffffff):
                 self._complete('succeeded', dict(reply='pong', uptimeMs=int(fields[3])))
                 return
-            self.bridge.put('resac_command', 'v1,%s,ping' % self.current['id'])
+            if self.ir or self.calibrating or self.target_level is not None:
+                if fields == ['v3', self.current['id'], 'rejected', self.session_id]:
+                    self._complete('failed', dict(error='Calibration required or session changed; restart fan to factory position: off'))
+                    return
+                if self.calibrating and fields == ['v3', self.current['id'], 'calibrated', self.session_id]:
+                    self._complete('succeeded', dict(reply='calibrated', sessionId=self.session_id, fanStateConfirmed=False))
+                    return
+                if (self.target_level is not None and len(fields) == 7 and
+                        fields[:5] == ['v4', self.current['id'], 'level_set', self.session_id, str(self.target_level)] and
+                        re.match(r'^[0-3]$', fields[5]) and re.match(r'^\d{1,10}$', fields[6]) and int(fields[6]) <= 0xffffffff):
+                    self._complete('succeeded', dict(reply='level_set', level=self.target_level, presses=int(fields[5]),
+                                                   uptimeMs=int(fields[6]), fanStateConfirmed=False))
+                    return
+                expected = ['v3', self.current['id'], 'ir_sent', self.session_id] + [str(v) for v in (self.ir or ())]
+                if (self.ir and len(fields) == 8 and fields[:7] == expected and
+                        re.match(r'^\d{1,10}$', fields[7]) and int(fields[7]) <= 0xffffffff):
+                    address, command, repeats = self.ir
+                    self._complete('succeeded', dict(reply='ir_sent', protocol='NEC', address=address,
+                                                   command=command, repeats=repeats, uptimeMs=int(fields[7]),
+                                                   fanStateConfirmed=False))
+                    return
+                if not self.prepared:
+                    if time.time() >= self.expires_at:
+                        self._complete('failed', dict(error='IR command expired before dispatch'))
+                        return
+                    self._write_state(dict(id=self.current['id'], status='failed', result=dict(
+                        error='IR execution interrupted; transmission uncertain; verify fan before retrying')))
+                    self.prepared = True
+                    if self.calibrating:
+                        self.bridge.put('resac_command', 'v3,%s,calibrate,%s' % (self.current['id'], self.session_id))
+                    elif self.target_level is not None:
+                        self.bridge.put('resac_command', 'v4,%s,%s,%s,%d' % (self.current['id'],
+                                        'auto_level' if self.automatic else 'level', self.session_id, self.target_level))
+                    else:
+                        self.bridge.put('resac_command', 'v3,%s,nec,%s,%d,%d,%d' % ((self.current['id'], self.session_id) + self.ir))
+                # Do not rewrite the IR mailbox: AVR reset clears it, preventing
+                # a reboot from replaying a toggle whose acknowledgment was lost.
+            else:
+                self.bridge.put('resac_command', 'v1,%s,ping' % self.current['id'])
         except Exception:
             pass  # Wait for Bridge/AVR within the bounded execution timeout.
 
@@ -396,7 +667,7 @@ class CommandProcessor(object):
         log('Command request failed (%s); retrying in %ds' % (detail, self.backoff))
         self.backoff = min(self.backoff * 2, 60)
 
-    def tick(self):
+    def tick(self, allow_execution=True):
         if self.request is not None and self.request.process.poll() is not None:
             try:
                 status, body = self.request.finish()
@@ -426,9 +697,9 @@ class CommandProcessor(object):
             finally:
                 self.request.close()
                 self.request = None
-        if self.current is not None:
+        if self.current is not None and allow_execution:
             self._arduino()
-        if self.request is not None or self.current is not None or monotonic() < self.retry_at:
+        if self.request is not None or self.current is not None or monotonic() < self.retry_at or not allow_execution:
             return
         try:
             if self.reply is not None:
@@ -439,7 +710,7 @@ class CommandProcessor(object):
                                           route='commands/%s/result' % self.reply['id'])
                 self.request_kind = 'result'
             else:
-                if self.bridge.get('resac_command_ready') != 'v1':
+                if self.bridge.get('resac_command_ready') not in ('v1', 'v2', 'v3', 'v4'):
                     self.retry_at = monotonic() + 2
                     return
                 # Server waits 30 seconds; leave 5 seconds for transport overhead.
@@ -453,10 +724,137 @@ class CommandProcessor(object):
             self.request.close()
 
 
+class AutoController(object):
+    """Local step curve; fresh samples, 30-second dwell and one physical mailbox."""
+    def __init__(self, config, bridge=None, path=CURVE_PATH, state_path=AUTO_STATE_PATH):
+        self.config = config
+        self.bridge = bridge or BridgeStore()
+        self.path, self.state_path = path, state_path
+        self.settings = dict(enabled=False, thresholdsC=[22, 24, 26, 28, 30], hysteresisC=1)
+        self.status = 'disabled'
+        self.target = None
+        self.runner = None
+        self.next_due = 0
+        self.last_adjusted = None
+        self.last_frame = None
+        self.sample_at = None
+        self.temperature = None
+        self.last_revision = None
+        self.interval_auto = None
+        try:
+            with open(path) as stream:
+                self.settings = validate_curve(decode_json(stream.read()))
+            self.status = 'waiting_for_sample' if self.settings['enabled'] else 'disabled'
+        except IOError as error:
+            if error.errno != errno.ENOENT:
+                self.status = 'config_error'
+        except Exception:
+            self.status = 'config_error'
+
+    @property
+    def busy(self):
+        return self.runner is not None
+
+    def snapshot(self):
+        return dict(self.settings, status=self.status, targetLevel=self.target, minAdjustmentSeconds=30)
+
+    def configure(self, payload):
+        settings = validate_curve(payload)
+        fd = os.open(self.path + '.tmp', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(encode_json(settings)); stream.flush(); os.fsync(stream.fileno())
+        os.rename(self.path + '.tmp', self.path)
+        directory = os.open(os.path.dirname(self.path) or '.', os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        self.settings = settings
+        self.target = None
+        self.last_adjusted = None
+        self.status = 'waiting_for_sample' if settings['enabled'] else 'disabled'
+        try:
+            state = parse_fan_state(self.bridge.get('resac_fan_state'))
+            self.last_revision = (state['sessionId'], state['revision'])
+        except Exception:
+            pass
+        return dict(settings)
+
+    def manual_override(self):
+        if self.settings['enabled']:
+            self.configure(dict(self.settings, enabled=False))
+            self.status = 'manual_override'
+
+    def tick(self, commands):
+        if self.runner is not None:
+            if self.runner.current is not None:
+                self.runner._arduino()
+            if self.runner.current is None:
+                self.runner._save()
+                failed = self.runner.reply['status'] != 'succeeded'
+                self.runner = None
+                self.last_adjusted = monotonic()
+                if failed:
+                    self.configure(dict(self.settings, enabled=False))
+                    self.status = 'command_error'
+                elif self.settings['enabled']:
+                    self.status = 'active'
+            return
+        if monotonic() < self.next_due:
+            return
+        self.next_due = monotonic() + 1
+        try:
+            state = parse_fan_state(self.bridge.get('resac_fan_state'))
+            revision = (state['sessionId'], state['revision'])
+            if self.last_revision is not None and revision != self.last_revision and state.get('controlSource') == 'manual':
+                self.manual_override()
+            self.last_revision = revision
+            if self.interval_auto != self.settings['enabled']:
+                interval = self.config.get('interval_seconds', 10)
+                self.bridge.put('resac_interval_ms', str(int((min(interval, 10) if self.settings['enabled'] else interval) * 1000)))
+                self.interval_auto = self.settings['enabled']
+            frame = self.bridge.get('resac_sample')
+            sensor_ok = self.bridge.get('resac_sensor_status') == 'ok'
+            if frame and frame != self.last_frame:
+                sample = parse_sample(frame)
+                # A retained frame on startup is not evidence of a fresh sample.
+                if self.last_frame is not None and sensor_ok:
+                    self.temperature = sample['temperatureC']; self.sample_at = monotonic()
+                self.last_frame = frame
+            if not self.settings['enabled']:
+                return
+            if not state['calibrated']:
+                self.target = None; self.status = 'calibration_required'; return
+            if not sensor_ok or self.sample_at is None or monotonic() - self.sample_at > 30:
+                self.status = 'sensor_unavailable' if self.sample_at is not None else 'waiting_for_sample'; return
+            self.target = curve_target(self.temperature, self.settings['thresholdsC'], self.settings['hysteresisC'], self.target)
+            if commands.current is not None or (commands.reply is not None and not getattr(commands, 'persisted', True)):
+                self.status = 'waiting_for_device'; return
+            if state['speed'] == self.target:
+                self.status = 'active'; return
+            if self.last_adjusted is not None and monotonic() - self.last_adjusted < 30:
+                self.status = 'cooldown'; return
+            if self.bridge.get('resac_command_ready') != 'v4':
+                self.status = 'waiting_for_device'; return
+            raw = binascii.hexlify(os.urandom(16)).decode('ascii')
+            command_id = '%s-%s-%s-%s-%s' % (raw[:8], raw[8:12], raw[12:16], raw[16:20], raw[20:])
+            runner = CommandProcessor(self.config, self.bridge, self.state_path, automatic=True)
+            runner._accept(dict(id=command_id, type='fan.level', payload=dict(level=self.target, sessionId=state['sessionId']),
+                                expiresAt=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time()+30))))
+            self.runner = runner
+            self.status = 'adjusting'
+        except Exception:
+            if self.settings['enabled']:
+                self.status = 'waiting_for_device'
+
+
 def run(config):
     pending = Buffer(config.get('queue_limit', 100))
     collector = Collector(config, pending)
-    commands = CommandProcessor(config)
+    automation = AutoController(config)
+    commands = CommandProcessor(config, on_manual=automation.manual_override, curve_handler=automation.configure)
+    fan_reporter = FanReporter(config, automation=automation)
     backoff = 1
     retry_at = 0
     upload = None
@@ -464,7 +862,9 @@ def run(config):
     try:
         while True:
             collector.tick()
-            commands.tick()
+            commands.tick(allow_execution=not automation.busy)
+            automation.tick(commands)
+            fan_reporter.tick()
             if upload is not None and upload.process.poll() is not None:
                 try:
                     status, response = upload.finish()
@@ -489,6 +889,7 @@ def run(config):
             time.sleep(0.1)
     finally:
         commands.close()
+        fan_reporter.close()
         if upload is not None:
             upload.close()
 

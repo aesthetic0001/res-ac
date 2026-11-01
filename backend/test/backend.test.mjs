@@ -77,6 +77,58 @@ test('device tokens are scoped and readings are validated and deduplicated', asy
   assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM readings').get().n, 1);
 });
 
+test('fan remote buttons queue short-lived commands and expose transmission results without inferred state', async t => {
+  const f = await fixture(t), auth = await f.login();
+  const sessionId = randomBytes(16).toString('hex');
+  f.store.setFanState('board-1', { sessionId, calibrated: true, power: 'off', speed: 0, revision: 1 });
+  for (const button of ['power', 'speed_down', 'speed_up']) {
+    const response = await f.request('/api/admin/devices/board-1/commands', {
+      method: 'POST', headers: { cookie: auth.cookie, 'x-csrf-token': auth.csrf, 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'fan.command', payload: { button, sessionId }, ttlSeconds: 30 })
+    });
+    assert.equal(response.status, 201);
+    const queued = await response.json();
+    const stored = f.store.command(queued.id);
+    assert.equal(stored.expires_at - stored.created_at, 30_000);
+    const delivered = await (await f.request('/api/devices/board-1/commands', { headers: f.deviceHeaders })).json();
+    assert.deepEqual(delivered.commands[0].payload, { button, sessionId });
+    assert.equal(delivered.commands[0].type, 'fan.command');
+    const result = { reply: 'ir_sent', fanStateConfirmed: false };
+    assert.equal((await f.request(`/api/devices/board-1/commands/${queued.id}/result`, {
+      method: 'POST', headers: f.deviceHeaders, body: JSON.stringify({ status: 'succeeded', result })
+    })).status, 200);
+    const state = await (await f.request('/api/admin/state', { headers: { cookie: auth.cookie } })).json();
+    assert.deepEqual(state.commands.find(command => command.id === queued.id).result, result);
+  }
+});
+
+test('calibration gates remote requests, is session-bound, and stale telemetry cannot unlock controls', async t => {
+  const f = await fixture(t), auth = await f.login();
+  const sessionId = randomBytes(16).toString('hex');
+  const queue = (type, payload) => f.request('/api/admin/devices/board-1/commands', { method: 'POST',
+    headers: { cookie: auth.cookie, 'x-csrf-token': auth.csrf, 'content-type': 'application/json' }, body: JSON.stringify({ type, payload }) });
+  const report = state => f.request('/api/devices/board-1/fan-state', { method: 'POST', headers: f.deviceHeaders, body: JSON.stringify(state) });
+  assert.equal((await queue('fan.command', { button: 'power', sessionId })).status, 409);
+  const state = { sessionId, calibrated: false, power: 'unknown', speed: null, revision: 1 };
+  assert.equal((await report(state)).status, 200);
+  assert.equal((await queue('fan.command', { button: 'power', sessionId })).status, 409);
+  assert.equal((await queue('ir.send', { protocol: 'NEC', address: 56960, command: 0, sessionId })).status, 409);
+  assert.equal((await queue('fan.calibrate', { confirmOff: false, sessionId })).status, 400);
+  assert.equal((await queue('fan.calibrate', { confirmOff: true, sessionId: 'b'.repeat(32) })).status, 409);
+  assert.equal((await queue('fan.calibrate', { confirmOff: true, sessionId })).status, 201);
+  // Merely enqueuing confirmation is not calibration: only device telemetry unlocks.
+  assert.equal((await queue('fan.command', { button: 'power', sessionId })).status, 409);
+  assert.equal((await report({ ...state, calibrated: true, power: 'off', speed: 0, revision: 2 })).status, 200);
+  assert.equal((await report(state)).status, 409);
+  assert.equal((await queue('fan.command', { button: 'power', sessionId })).status, 201);
+  f.store.db.prepare('UPDATE fan_states SET received_at=?').run(Date.now()-31000);
+  assert.equal((await queue('fan.command', { button: 'power', sessionId })).status, 409);
+  assert.equal((await report({ ...state, sessionId: 'c'.repeat(32) })).status, 200);
+  assert.equal((await queue('fan.calibrate', { confirmOff: true, sessionId })).status, 409);
+  assert.equal((await report({ ...state, calibrated: true, power: 'off', speed: 3 })).status, 400);
+  assert.equal((await f.request('/api/devices/board-2/fan-state', { method: 'POST', headers: f.deviceHeaders, body: JSON.stringify(state) })).status, 401);
+});
+
 test('long polling returns 204 when empty and wakes immediately for new commands', async t => {
   const f = await fixture(t, { pollWaitMs: 1600 });
   const auth = await f.login();
@@ -91,6 +143,56 @@ test('long polling returns 204 when empty and wakes immediately for new commands
   const response = await waiting;
   assert.equal(response.status, 200);
   assert.equal((await response.json()).commands[0].id, queued.id);
+});
+
+test('cyclic target levels and temperature curves validate inputs and remain calibration/session gated', async t => {
+  const f=await fixture(t),auth=await f.login(),sessionId=randomBytes(16).toString('hex');
+  const settings={enabled:true,thresholdsC:[22,24,26,28,30],hysteresisC:1};
+  const queue=(type,payload)=>f.request('/api/admin/devices/board-1/commands',{method:'POST',headers:{cookie:auth.cookie,'x-csrf-token':auth.csrf,'content-type':'application/json'},body:JSON.stringify({type,payload})});
+  const state={sessionId,calibrated:false,power:'unknown',speed:null,revision:1,firmwareVersion:'v4'};
+  f.store.setFanState('board-1',state);
+  assert.equal((await queue('fan.level',{level:3,sessionId})).status,409);
+  assert.equal((await queue('fan.curve',{...settings,sessionId})).status,409);
+  assert.equal((await queue('fan.curve',{...settings,enabled:false,sessionId})).status,201);
+  f.store.setFanState('board-1',{...state,calibrated:true,power:'off',speed:0,revision:2});
+  for(const level of [0,1,2,3,4,5]) assert.equal((await queue('fan.level',{level,sessionId})).status,201);
+  for(const level of [-1,6,2.5,true]) assert.equal((await queue('fan.level',{level,sessionId})).status,400);
+  assert.equal((await queue('fan.curve',{...settings,sessionId})).status,201);
+  for(const thresholdsC of [[22,21,26,28,30],[22,24,26,28],[22,24,26,28,61]])
+    assert.equal((await queue('fan.curve',{...settings,thresholdsC,sessionId})).status,400);
+  assert.equal((await queue('fan.curve',{...settings,hysteresisC:0,sessionId})).status,400);
+  assert.equal((await queue('fan.curve',{...settings,sessionId:'b'.repeat(32)})).status,409);
+  f.store.setFanState('board-1',{...state,firmwareVersion:'v3',revision:3});
+  assert.equal((await queue('fan.curve',{...settings,enabled:false,sessionId})).status,409);
+});
+
+test('curve APIs and live telemetry accept ties and small gaps while rejecting decreasing temperatures', async t => {
+  const f=await fixture(t),auth=await f.login(),sessionId=randomBytes(16).toString('hex');
+  const state={sessionId,calibrated:true,power:'off',speed:0,revision:1,firmwareVersion:'v4'};
+  f.store.setFanState('board-1',state);
+  for(const thresholdsC of [[22,24,24,28,30],[24,24,24,24,24],[22,22.1,22.1,28,30]]) {
+    const settings={enabled:true,thresholdsC,hysteresisC:1};
+    const queued=await f.request('/api/admin/devices/board-1/commands',{method:'POST',headers:{cookie:auth.cookie,'x-csrf-token':auth.csrf,'content-type':'application/json'},body:JSON.stringify({type:'fan.curve',payload:{...settings,sessionId}})});
+    assert.equal(queued.status,201);
+    assert.deepEqual(JSON.parse(f.store.command((await queued.json()).id).payload).thresholdsC,thresholdsC);
+    const response=await f.request('/api/devices/board-1/fan-state',{method:'POST',headers:f.deviceHeaders,body:JSON.stringify({...state,automatic:{...settings,status:'active',targetLevel:5,minAdjustmentSeconds:30}})});
+    assert.equal(response.status,200);
+    assert.deepEqual(f.store.fanState('board-1').automatic.thresholdsC,thresholdsC);
+  }
+});
+
+test('live automatic settings and target are persisted independently of sensor readings', async t => {
+  const f=await fixture(t),auth=await f.login();
+  const value={sessionId:randomBytes(16).toString('hex'),calibrated:true,power:'on',speed:3,revision:1,firmwareVersion:'v4',controlSource:'automatic',
+    automatic:{enabled:true,thresholdsC:[22,24,26,28,30],hysteresisC:1,status:'active',targetLevel:3,minAdjustmentSeconds:30}};
+  const report=body=>f.request('/api/devices/board-1/fan-state',{method:'POST',headers:f.deviceHeaders,body:JSON.stringify(body)});
+  assert.equal((await report(value)).status,200);
+  const state=await (await f.request('/api/admin/state',{headers:{cookie:auth.cookie}})).json();
+  assert.deepEqual(state.devices[0].fanState.automatic,value.automatic);
+  assert.equal(state.devices[0].fanState.controlSource,'automatic');
+  assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM readings').get().n,0);
+  assert.equal((await report({...value,automatic:{...value.automatic,targetLevel:6}})).status,400);
+  assert.equal((await report({...value,automatic:{...value.automatic,status:'made_up'}})).status,400);
 });
 
 test('a command is leased, redelivered after lease expiry, and results are idempotent', async t => {

@@ -1,4 +1,7 @@
-# Seeeduino Cloud telemetry and ping
+# Seeeduino Cloud telemetry and fan control
+
+[Woozoo IR setup](IR.md) covers digital pin 9, emitter wiring, named fan buttons,
+raw NEC commands, and local serial testing. The DHT11 stays on digital pin 3.
 
 For Linux OS upgrades, see the [firmware compatibility assessment](../FIRMWARE.md).
 
@@ -66,7 +69,7 @@ gateway, replaces another route, or resets Wi-Fi to recover from this bug.
 The default reporting interval is 10 seconds and can be changed in the private
 configuration (`interval_seconds`, from 2 to 3600). The agent passes that interval
 to the AVR through Bridge. A `millis()` timer keeps the AVR loop available for
-future command handling. No network calls run on the AVR.
+command handling. No network calls run on the AVR.
 
 Each sample has a stable `readingId` composed of its Bridge epoch and sequence.
 Upload retries reuse that ID so the backend can deduplicate a request whose
@@ -93,8 +96,10 @@ it writes `v1,<command-UUID>,ping` to the Bridge `resac_command` key. The AVR
 checks this key every 250 ms and returns `v1,<command-UUID>,pong,<uptime-ms>` in
 `resac_command_result`. Linux requires a matching UUID and Arduino response;
 it does not answer ping on the Arduino's behalf.
-Polling starts only after the Arduino advertises its ping handler through Bridge,
-so an older sketch cannot start the command poller.
+Polling starts only after the Arduino advertises its handler through Bridge.
+The cyclic-level sketch advertises `v4`; `v3` supports calibrated raw IR,
+while old `v1`/`v2` sketches support ping only
+with the updated agent. IR requires a current session and calibrated estimate.
 
 The agent posts the result to
 `POST /api/devices/<device-id>/commands/<command-UUID>/result`:
@@ -104,16 +109,20 @@ The agent posts the result to
 ```
 
 Missing Arduino responses fail after 10 seconds. Unsupported command types
-report `failed`; IR execution is not implemented. Network failures use bounded
+report `failed`; `fan.command`, `ir.send`, and `fan.calibrate` require `v3` or
+`v4`, while `fan.level` and `fan.curve` require `v4`.
+Network failures use bounded
 exponential retries. The agent waits for result acceptance before polling the
 next command. Expired or removed commands (HTTP 409/404) are abandoned.
 
-The AVR caches its last ping reply, and the agent saves its latest completed
+The AVR caches its last command reply, and the agent saves its latest completed
 result atomically in `/etc/res-ac/command-result.json` (mode 600). A lost result
 acknowledgment or agent restart retries that same result without repeating the
 Arduino request. Ping itself is harmless to repeat if power is lost before the
-result is saved; this is not an exactly-once guarantee for future IR actions.
-Only completed commands write this small journal to flash, not empty polls.
+result is saved. For IR, the agent also saves an uncertain failure before dispatch;
+after interruption it reports that uncertainty instead of automatically repeating
+the action. See [IR delivery behavior](IR.md#delivery-behavior). Commands write
+this small journal to flash; empty polls and sensor samples do not.
 
 To upgrade an existing device through USB, upload the recovery project first,
 run the installer above (the existing TLS binary is reused), then upload the
@@ -147,3 +156,8 @@ responses, epoch initialization, bounded buffering, in-flight sampling, retry
 IDs, HTTPS trust verification, and private request-file cleanup. Ping tests cover
 the HTTPS poll/result exchange with a simulated Arduino, stale acknowledgments,
 execution timeout, unsupported commands, retry identity, and restart recovery.
+IR tests cover button codes, payload validation, expiry, matching AVR responses,
+and preventing replay after interrupted transmission or AVR reset.
+Curve tests cover all 25 cyclic routes, threshold/hysteresis behavior, fresh
+sensor requirements, adjustment dwell, manual override, settings persistence,
+and sharing the command mailbox. Native estimate tests require a host C++ compiler.

@@ -22,11 +22,23 @@ export class Store {
         attempts INTEGER NOT NULL DEFAULT 0,result TEXT,completed_at INTEGER);
       CREATE INDEX IF NOT EXISTS command_device_time ON commands(device_id,created_at);
       CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,csrf TEXT NOT NULL,expires_at INTEGER NOT NULL,auth_version TEXT NOT NULL);`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS fan_states(device_id TEXT PRIMARY KEY REFERENCES devices(id), state TEXT NOT NULL, received_at INTEGER NOT NULL);`);
     for (const device of devices) this.db.prepare('INSERT INTO devices(id,token_hash) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET token_hash=excluded.token_hash').run(device.id, digest(device.token));
   }
   close() { this.db.close(); }
   device(id) { return this.db.prepare('SELECT * FROM devices WHERE id=?').get(id); }
   seen(id) { this.db.prepare('UPDATE devices SET last_seen=? WHERE id=?').run(Date.now(), id); }
+  fanState(id) {
+    const row = this.db.prepare('SELECT state,received_at FROM fan_states WHERE device_id=?').get(id);
+    return row ? { ...JSON.parse(row.state), receivedAt: row.received_at } : null;
+  }
+  setFanState(id, state) {
+    const previous = this.fanState(id);
+    if (previous?.sessionId === state.sessionId && previous.revision > state.revision) return false;
+    this.db.prepare('INSERT INTO fan_states(device_id,state,received_at) VALUES(?,?,?) ON CONFLICT(device_id) DO UPDATE SET state=excluded.state,received_at=excluded.received_at')
+      .run(id, canonical(state), Date.now());
+    return true;
+  }
   reading(id, value) {
     const result = this.db.prepare('INSERT OR IGNORE INTO readings(device_id,reading_id,temperature_c,humidity,recorded_at,received_at) VALUES(?,?,?,?,?,?)')
       .run(id, value.readingId || randomUUID(), value.temperatureC, value.humidity, value.recordedAt || null, Date.now());
@@ -86,7 +98,7 @@ export class Store {
   snapshot() {
     this.expire();
     const devices = this.db.prepare('SELECT id,last_seen FROM devices ORDER BY id').all().map(device => ({
-      id: device.id, lastSeen: device.last_seen ? new Date(device.last_seen).toISOString() : null,
+      id: device.id, lastSeen: device.last_seen ? new Date(device.last_seen).toISOString() : null, fanState: this.fanState(device.id),
       latest: this.db.prepare('SELECT temperature_c AS temperatureC,humidity,recorded_at AS recordedAt,received_at AS receivedAt FROM readings WHERE device_id=? ORDER BY id DESC LIMIT 1').get(device.id) || null
     }));
     const commands = this.db.prepare('SELECT * FROM commands ORDER BY created_at DESC,rowid DESC LIMIT 100').all().map(({ lease_until, ...c }) => ({ ...c, payload: JSON.parse(c.payload), result: c.result === null ? null : JSON.parse(c.result) }));
