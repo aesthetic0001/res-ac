@@ -212,6 +212,9 @@ class AgentTests(unittest.TestCase):
         ticks = []
         closed = []
         command_ticks = []
+        class Events:
+            def poll(self, timeout=0): pass
+            def close(self): closed.append(True)
         class Commands:
             def __init__(self, config, **kwargs):
                 pass
@@ -256,7 +259,7 @@ class AgentTests(unittest.TestCase):
         with patch.object(agent, 'AutoController', AutoController), patch.object(agent, 'FanReporter', FanReporter), patch.object(agent, 'Collector', Collector), patch.object(agent, 'CurlUpload', Upload), \
                 patch.object(agent, 'CommandProcessor', Commands), patch.object(agent.time, 'sleep'):
             with self.assertRaises(KeyboardInterrupt):
-                agent.run(dict(queue_limit=2))
+                agent.run(dict(queue_limit=2, _bridge=Events()))
         self.assertEqual(len(ticks), 7)
         self.assertEqual(len(command_ticks), 6)
         self.assertTrue(closed)

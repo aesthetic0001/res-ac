@@ -29,6 +29,15 @@ Read diagnostics, Bridge collection, buffer wait, upload attempts, and database
 insertion share it. Retries preserve the reading ID and trace context. Failed
 reads and Bridge failures also generate diagnostics without requiring a valid
 sample. AVR durations use millis() subtraction, safe across timer rollover.
+
+With event-capable firmware, `bridge.collect` measures local time from decoding
+the pushed sample event (or recovery snapshot) to processing that sample. It
+includes time waiting in the agent's event queue, but does not measure AVR-to-Linux
+transport time before reception. This replaces timing several synchronous
+datastore reads, so its duration is not directly comparable to the old collector.
+The event queue retains the sensor diagnostic paired with each sample. Sensor
+execution still has its own `sensor.read` duration. Reads by all agent components
+use one shared Bridge cache populated by an initial snapshot and Mailbox events.
 Span resource identities are `res-ac-backend`, `res-ac-agent`, and `res-ac-avr`.
 Three fixed tracer providers share one bounded processor/exporter. Device IDs
 and agent sessions remain attributes rather than creating a provider per device.

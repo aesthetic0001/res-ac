@@ -10,10 +10,15 @@ internal Arduino Bridge to publish a single sample containing temperature,
 humidity, a sequence number, and a Linux-provided boot/session epoch. Invalid
 sensor reads are reported as errors rather than uploaded as zero or stale data.
 
-`res_ac_agent.py` runs on the Linux processor. A small event loop collects Bridge
-samples while a curl subprocess handles HTTPS asynchronously. This works with
+`res_ac_agent.py` runs on the Linux processor. A small event loop receives pushed
+Bridge Mailbox events while curl subprocesses handle HTTPS asynchronously. This works with
 the board's minimal Python 2.7 without installing threading or other packages.
 Both legacy JSON APIs used by Yun firmware are supported.
+
+The agent and AVR firmware must be updated together: the new agent requires the
+`resac_events=v1` capability and waits with reconnect backoff if it is absent.
+When staging a later deployment, use the installer's `--no-start` option and
+start the agent only after the matching reporting firmware is installed.
 
 ## Configure and install
 
@@ -90,6 +95,38 @@ oldest samples are discarded and a counter is logged. The queue is RAM-only,
 which avoids writes to the board's small flash but means buffered samples are
 lost when the agent or Linux restarts. A retained latest Bridge frame keeps its
 original ID and is safe to retry after an agent restart.
+
+### Event-driven Bridge collection
+
+The AVR retains its latest values with `Bridge.put()` and sends
+`Mailbox.writeMessage()` notifications as `v1,<key>,<value>`. Notifications carry
+sample frames, sensor status/diagnostics, fan-state changes, and command
+acknowledgments/diagnostics. Fan state is published on changes; an unchanged
+command acknowledgment is not rebroadcast on every AVR mailbox check.
+
+Python maintains one nonblocking TCP connection to the existing local Bridge
+service at `127.0.0.1:5700`. It requests one datastore snapshot after connecting,
+then waits with `select()` for pushed changes. Collector, automation, command
+handling, and fan reporting share the same cache; their reads make no repeated
+TCP requests. Events bypass the former half-second collection/acknowledgment
+waits and one-second fan-state/automation waits. Timers still service subprocess
+completion, upload retries, safety deadlines, fan heartbeat writes, and periodic
+backend state refreshes. AVR sampling and its 250 ms input-mailbox checks remain.
+
+Bridge broadcasts both messages and request replies to all clients. The receiver
+separates those envelopes and handles fragmented/concatenated JSON, including the
+firmware's legacy JSON implementations. It ignores unrelated replies after the
+initial snapshot. Incoming sample events are bounded to 128 entries before they
+move into the normal upload buffer; overflow contributes to dropped-reading
+counts. Each queued sample retains its matching sensor diagnostic.
+
+Disconnects invalidate cached control state and discard unsent writes so an
+uncertain physical command is never replayed by the transport. Already received
+samples remain available for upload. Reconnection fetches a new snapshot and
+recovers the latest retained reading; events missed while disconnected are not
+replayed. Automatic control requires a live sample event after reconnect, since
+the retained snapshot has no trustworthy sample age. AVR boot notifications also
+invalidate the cache and trigger snapshot/epoch initialization.
 
 The POST route is `/api/devices/<device-id>/readings` with a device bearer token.
 Curl reads the URL/token from a private temporary config rather than command-line
@@ -169,7 +206,8 @@ python3 -m unittest discover -s device/test -v
 ```
 
 Tests cover sensor frame validation, legacy JSON variants, fragmented Bridge
-responses, epoch initialization, bounded buffering, in-flight sampling, retry
+responses/events, shared-connection snapshot recovery, event ordering, immediate
+sample/state/acknowledgment handling, epoch initialization, bounded buffering, in-flight sampling, retry
 IDs, HTTPS trust verification, and private request-file cleanup. Ping tests cover
 the HTTPS poll/result exchange with a simulated Arduino, stale acknowledgments,
 execution timeout, unsupported commands, retry identity, and restart recovery.

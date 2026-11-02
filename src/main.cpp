@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Bridge.h>
+#include <Mailbox.h>
 #include <DHT.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,17 +32,24 @@ const char *fanControlSource = "reset";
 char fanSession[33] = {0};
 unsigned long fanRevision = 0;
 unsigned long lastFanHeartbeatMs = 0;
-unsigned long lastFanPublishMs = 0;
 char fanHeartbeat[16] = {0};
 
 bool validEpoch(const char *epoch);
+
+void publishValue(const char *key, const char *value) {
+  // Retain a snapshot for reconnects, then notify connected Linux clients.
+  Bridge.put(key, value);
+  char event[176];
+  const int length = snprintf(event, sizeof(event), "v1,%s,%s", key, value);
+  if (length > 0 && static_cast<size_t>(length) < sizeof(event))
+    Mailbox.writeMessage(reinterpret_cast<const uint8_t *>(event), length);
+}
 
 void publishFanState() {
   char frame[96];
   snprintf(frame, sizeof(frame), "v2,%s,%u,%u,%u,%lu,%s", fanSession[0] ? fanSession : "none",
            fan.calibrated(), fan.power(), fan.speed(), fanRevision, fanControlSource);
-  Bridge.put("resac_fan_state", frame);
-  lastFanPublishMs = millis();
+  publishValue("resac_fan_state", frame);
 }
 
 void invalidateFan() {
@@ -49,7 +57,7 @@ void invalidateFan() {
   fanControlSource = "reset";
   fanSession[0] = '\0';
   ++fanRevision;
-  Bridge.put("resac_fan_session", "");
+  publishValue("resac_fan_session", "");
   publishFanState();
   Serial.println(F("Calibration required: set fan speed to 1, turn it off; confirm with calibrate off"));
 }
@@ -73,7 +81,6 @@ void updateFan() {
     Bridge.get("resac_fan_session", session, sizeof(session) - 1);
     if (validEpoch(session)) { strcpy(fanSession, session); ++fanRevision; publishFanState(); }
   }
-  if (static_cast<unsigned long>(millis() - lastFanPublishMs) >= 1000) publishFanState();
 }
 
 bool parseNumber(const char *text, unsigned long limit, unsigned long &value, uint8_t base = 10) {
@@ -201,10 +208,11 @@ void processCommand() {
              static_cast<unsigned long>(millis() - executionStarted),
              strstr(lastCommandReply, ",rejected,") ? "failed" : "ok");
     // Publish diagnostics before the acknowledgment; retries retain both.
-    Bridge.put("resac_command_diagnostic", diagnostic);
+    publishValue("resac_command_diagnostic", diagnostic);
+    publishValue("resac_command_result", lastCommandReply);
   }
-  // A repeated delivery returns the original response without executing again.
-  Bridge.put("resac_command_result", lastCommandReply);
+  // Repeated deliveries keep the original retained response without executing
+  // again or broadcasting the same acknowledgment on every mailbox check.
 }
 
 void processSerial() {
@@ -266,7 +274,7 @@ void publishSensorDiagnostic(const char *epoch, unsigned long duration, bool ok)
   char frame[112];
   snprintf(frame, sizeof(frame), "v1,%s,%lu,%lu,%lu,%s,%lu,%lu", epoch, sequence,
            sensorAttempts, duration, ok ? "ok" : "failed", millis(), sensorErrors);
-  Bridge.put("resac_sensor_diagnostic", frame);
+  publishValue("resac_sensor_diagnostic", frame);
 }
 
 void publishSample() {
@@ -281,14 +289,14 @@ void publishSample() {
       temperature < -80 || temperature > 150) {
     ++sensorErrors;
     publishSensorDiagnostic(epoch, duration, false);
-    Bridge.put("resac_sensor_status", "read_error");
+    publishValue("resac_sensor_status", "read_error");
     Serial.println(F("DHT11 read failed; no sample published"));
     return;
   }
   Serial.print(F("Temperature: ")); Serial.print(temperature, 1);
   Serial.print(F(" C; humidity: ")); Serial.print(humidity, 1); Serial.println(F(" %"));
   if (!validEpoch(epoch)) {
-    Bridge.put("resac_sensor_status", "waiting_for_agent");
+    publishValue("resac_sensor_status", "waiting_for_agent");
     return;
   }
   char frame[112];
@@ -300,8 +308,8 @@ void publishSample() {
   snprintf(frame, sizeof(frame), "v1,%s,%lu,%ld,%ld,%lu", epoch, sequence,
            temperatureMilli, humidityMilli, millis());
   publishSensorDiagnostic(epoch, duration, true);
-  Bridge.put("resac_sample", frame);
-  Bridge.put("resac_sensor_status", "ok");
+  publishValue("resac_sensor_status", "ok");
+  publishValue("resac_sample", frame);
   char uploadStatus[48] = {0};
   Bridge.get("resac_upload_status", uploadStatus, sizeof(uploadStatus) - 1);
   if (uploadStatus[0]) {
@@ -323,17 +331,21 @@ void setup() {
   IrSender.begin();
   Serial.println(F("Starting sensor Bridge; Linux boot may take a moment..."));
   Bridge.begin();
-  Bridge.put("resac_sensor_status", "starting");
+  Mailbox.begin();
+  publishValue("resac_events", "");
+  publishValue("resac_sensor_status", "starting");
   // AVR sequence numbers restart at zero; request a fresh reading-ID epoch.
-  Bridge.put("resac_epoch", "");
+  publishValue("resac_epoch", "");
   // Discard a pre-reset mailbox: a stale toggle must not run during boot.
   Bridge.put("resac_command", "");
-  Bridge.put("resac_command_result", "");
-  Bridge.put("resac_command_diagnostic", "");
-  Bridge.put("resac_sensor_diagnostic", "");
+  publishValue("resac_sample", "");
+  publishValue("resac_command_result", "");
+  publishValue("resac_command_diagnostic", "");
+  publishValue("resac_sensor_diagnostic", "");
   Bridge.put("resac_fan_invalidate", "");
   invalidateFan();
-  Bridge.put("resac_command_ready", "v4");
+  publishValue("resac_command_ready", "v4");
+  publishValue("resac_events", "v1");
   Serial.println(F("Bridge ready; DHT11 on digital pin 3"));
   Serial.println(F("IR on digital pin 9; calibration required before sending"));
   lastSampleMs = millis() - DEFAULT_INTERVAL_MS;

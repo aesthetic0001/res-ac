@@ -11,6 +11,7 @@ import errno
 import json
 import os
 import re
+import select
 import signal
 import socket
 import subprocess
@@ -252,6 +253,231 @@ class BridgeStore(object):
         return self.request('put', key, value)
 
 
+class BridgeEvents(object):
+    """One nonblocking Mailbox stream; reads use a snapshot plus pushed changes.
+
+    The Yun server broadcasts replies to all clients, so only the initial get-all
+    response populates the snapshot. Later replies cannot overwrite newer events.
+    Pending writes are discarded on disconnect, especially physical commands.
+    """
+    keys = frozenset(['resac_events', 'resac_epoch', 'resac_interval_ms', 'resac_sample',
+                      'resac_sensor_status', 'resac_sensor_diagnostic', 'resac_command_ready',
+                      'resac_command_result', 'resac_command_diagnostic', 'resac_fan_state',
+                      'resac_fan_session', 'resac_fan_heartbeat', 'resac_fan_invalidate',
+                      'resac_command', 'resac_command_status', 'resac_upload_status'])
+
+    def __init__(self, host='127.0.0.1', port=5700):
+        self.host, self.port = host, port
+        self.connection = None
+        self.connecting = False
+        self.ready = False
+        self.snapshot_pending = False
+        self.deadline = 0
+        self.retry_at = 0
+        self.backoff = 1
+        self.generation = 0
+        self.revisions = {}
+        self.values = {}
+        self.samples = []
+        self.dropped = 0
+        self.sample_live = False
+        self.sample_received = None
+        self.firmware_warning = False
+        self.outgoing = b''
+        self.incoming = bytearray()
+        self.depth = 0
+        self.quoted = False
+        self.escaped = False
+
+    def version(self, *keys):
+        return (self.generation,) + tuple(self.revisions.get(key, 0) for key in keys)
+
+    def get(self, key):
+        if not self.ready:
+            raise IOError('Bridge event stream is not ready')
+        return self.values.get(key)
+
+    def put(self, key, value):
+        if not self.ready:
+            raise IOError('Bridge event stream is not ready')
+        self._queue(dict(command='put', key=key, value=value))
+        self._update(key, value)
+
+    def _queue(self, value):
+        encoded = encode_json(value).encode('utf-8')
+        if len(self.outgoing) + len(encoded) > 8192:
+            self._disconnect()
+            raise IOError('Bridge write queue is full')
+        self.outgoing += encoded
+
+    def _update(self, key, value):
+        if key not in self.keys or not isinstance(value, (str, text_type)):
+            return
+        if self.values.get(key) != value:
+            self.values[key] = value
+            self.revisions[key] = self.revisions.get(key, 0) + 1
+
+    def _sample(self, live):
+        frame = self.values.get('resac_sample')
+        if not frame:
+            return
+        self.sample_live = live
+        self.sample_received = monotonic()
+        if len(self.samples) >= 128:
+            self.samples.pop(0)
+            self.dropped += 1
+        self.samples.append((frame, self.values.get('resac_sensor_diagnostic'), self.sample_received))
+
+    def drain_samples(self):
+        samples, self.samples = self.samples, []
+        return samples
+
+    def _snapshot(self):
+        self.ready = False
+        self.snapshot_pending = True
+        self.deadline = monotonic() + 2
+        self._queue(dict(command='get'))
+
+    def _message(self, message):
+        if not isinstance(message, dict):
+            return
+        if message.get('response') == 'get' and 'key' not in message and self.snapshot_pending:
+            values = message.get('value')
+            if not isinstance(values, dict) or values.get('resac_events') != 'v1':
+                if not self.firmware_warning:
+                    log('Bridge event firmware is required; waiting for matching firmware')
+                    self.firmware_warning = True
+                raise ValueError('Matching event firmware is required')
+            self.values = {}
+            for key, value in values.items():
+                self._update(key, value)
+            self.snapshot_pending = False
+            self.ready = True
+            self.backoff = 1
+            self.firmware_warning = False
+            self.generation += 1
+            self.sample_live = False
+            self._sample(False)
+            return
+        if message.get('request') != 'raw':
+            return
+        data = message.get('data')
+        if not isinstance(data, (str, text_type)):
+            return
+        fields = data.split(',', 2)
+        if len(fields) != 3 or fields[0] != 'v1' or fields[1] not in self.keys:
+            return
+        key, value = fields[1:]
+        if key == 'resac_events':
+            if value == '':
+                # AVR restart: discard old state and unsent actions immediately.
+                self.ready = False
+                self.snapshot_pending = False
+                self.values = {}
+                self.outgoing = b''
+                self.sample_live = False
+                self.generation += 1
+                self.deadline = monotonic() + 2
+            elif value == 'v1':
+                self._snapshot()
+            return
+        if self.ready:
+            self._update(key, value)
+            if key == 'resac_sample':
+                self._sample(True)
+
+    def _receive(self, block):
+        # Frame concatenated JSON objects without relying on JSONDecoder, which
+        # is missing from the board's legacy JSON module. Decode only full UTF-8.
+        for char in block:
+            number = char if isinstance(char, int) else ord(char)
+            if not self.incoming and number in (9, 10, 13, 32):
+                continue
+            if not self.incoming and number != 123:
+                raise ValueError('Expected a Bridge JSON object')
+            self.incoming.append(number)
+            if len(self.incoming) > 16384:
+                raise ValueError('Bridge message too large')
+            if self.quoted:
+                if self.escaped:
+                    self.escaped = False
+                elif number == 92:
+                    self.escaped = True
+                elif number == 34:
+                    self.quoted = False
+            elif number == 34:
+                self.quoted = True
+            elif number in (123, 91):
+                self.depth += 1
+            elif number in (125, 93):
+                self.depth -= 1
+            if self.depth == 0:
+                message = decode_json(self.incoming.decode('utf-8'))
+                self.incoming = bytearray()
+                self._message(message)
+
+    def _disconnect(self):
+        if self.connection is not None:
+            self.connection.close()
+        self.connection = None
+        self.connecting = False
+        self.ready = False
+        self.snapshot_pending = False
+        self.values = {}
+        self.sample_live = False
+        self.outgoing = b''
+        self.incoming = bytearray()
+        self.depth = 0
+        self.quoted = self.escaped = False
+        self.generation += 1
+        self.retry_at = monotonic() + self.backoff
+        self.backoff = min(self.backoff * 2, 30)
+
+    def poll(self, timeout=0):
+        try:
+            if self.connection is None:
+                if monotonic() < self.retry_at:
+                    if timeout:
+                        select.select([], [], [], max(0, min(timeout, self.retry_at - monotonic())))
+                    return
+                self.connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.connection.setblocking(False)
+                code = self.connection.connect_ex((self.host, self.port))
+                if code not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
+                    raise IOError('Bridge connection failed')
+                self.connecting = True
+                self.deadline = monotonic() + 2
+            if not self.ready and monotonic() >= self.deadline:
+                raise IOError('Bridge handshake timed out')
+            writable = [self.connection] if self.connecting or self.outgoing else []
+            reads, writes, errors = select.select([self.connection], writable, [self.connection], timeout)
+            if errors:
+                raise IOError('Bridge connection failed')
+            if self.connection in writes:
+                if self.connecting:
+                    if self.connection.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR):
+                        raise IOError('Bridge connection failed')
+                    self.connecting = False
+                    self._snapshot()
+                if self.outgoing:
+                    sent = self.connection.send(self.outgoing)
+                    if sent == 0:
+                        raise IOError('Bridge closed while sending')
+                    self.outgoing = self.outgoing[sent:]
+            if self.connection in reads:
+                block = self.connection.recv(4096)
+                if not block:
+                    raise IOError('Bridge closed')
+                self._receive(block)
+        except (IOError, OSError, ValueError, select.error) as error:
+            if getattr(error, 'errno', None) in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+                return
+            self._disconnect()
+
+    def close(self):
+        self._disconnect()
+
+
 class UploadError(Exception):
     def __init__(self, status=0, curl_code=0):
         self.status = status
@@ -281,7 +507,7 @@ class Telemetry(object):
     """Bounded, RAM-only diagnostics; never waits for HTTP in tick()."""
     def __init__(self, config, bridge=None):
         self.config = config
-        self.bridge = bridge or BridgeStore()
+        self.bridge = bridge or config.get('_bridge') or BridgeStore()
         self.session = binascii.hexlify(os.urandom(16)).decode('ascii')
         self.events = []
         self.dropped = 0
@@ -330,9 +556,9 @@ class Telemetry(object):
             pass
         return values
 
-    def sensor(self, parent=None, sample_id=None):
+    def sensor(self, parent=None, sample_id=None, diagnostic=None):
         try:
-            fields = (self.bridge.get('resac_sensor_diagnostic') or '').split(',')
+            fields = (diagnostic if diagnostic is not None else self.bridge.get('resac_sensor_diagnostic') or '').split(',')
             if (len(fields) != 8 or fields[0] != 'v1' or not re.match(r'^[a-f0-9]{32}$', fields[1]) or
                     any(not re.match(r'^\d{1,10}$', fields[i]) for i in (2, 3, 4, 6, 7)) or fields[5] not in ('ok', 'failed')):
                 return
@@ -642,17 +868,50 @@ class Collector(object):
     def __init__(self, config, pending, bridge=None):
         self.config = config
         self.pending = pending
-        self.bridge = bridge or BridgeStore()
+        self.bridge = bridge or config.get('_bridge') or BridgeStore()
         self.initialized = False
         self.last_status = None
         self.next_due = 0
+        self.bridge_version = None
+
+    def _collect(self, frame, started, diagnostic=None):
+        sample = parse_sample(frame)
+        if sample['readingId'] != self.pending.last_id:
+            sample['traceparent'] = traceparent()
+            telemetry = self.config.get('_telemetry')
+            if telemetry:
+                telemetry.last_sample_at = monotonic()
+                telemetry.event('reading.collect', sample['traceparent'], attributes={'outcome': 'ok', 'reading.id': sample['readingId']})
+                telemetry.sensor(sample['traceparent'], sample['readingId'], diagnostic)
+                telemetry.event('bridge.collect', sample['traceparent'], monotonic() - started,
+                                attributes={'outcome': 'ok', 'reading.id': sample['readingId']})
+        if time.gmtime().tm_year >= 2025:
+            sample['recordedAt'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        self.pending.add(sample)
 
     def tick(self):
-        if monotonic() < self.next_due:
-            return
-        self.next_due = monotonic() + 0.5
+        streaming = isinstance(self.bridge, BridgeEvents)
+        if streaming:
+            version = self.bridge.version('resac_epoch', 'resac_sensor_status', 'resac_sensor_diagnostic', 'resac_sample')
+            if version == self.bridge_version and not self.bridge.samples:
+                return
+            self.bridge_version = version
+        else:
+            if monotonic() < self.next_due:
+                return
+            self.next_due = monotonic() + 0.5
         started = monotonic()
         try:
+            if streaming:
+                # Completed events stay useful even if the socket subsequently
+                # closes. Move them to the upload buffer before checking health.
+                self.pending.dropped += self.bridge.dropped
+                self.bridge.dropped = 0
+                for frame, diagnostic, received in self.bridge.drain_samples():
+                    try:
+                        self._collect(frame, received, diagnostic)
+                    except ValueError:
+                        continue
             if not self.initialized or not self.bridge.get('resac_epoch'):
                 self.bridge.put('resac_epoch', binascii.hexlify(os.urandom(16)).decode('ascii'))
                 self.bridge.put('resac_interval_ms', str(int(self.config.get('interval_seconds', 10) * 1000)))
@@ -663,20 +922,10 @@ class Collector(object):
                 if status == 'read_error':
                     log('DHT11 read failed; invalid samples are not uploaded')
                 self.last_status = status
-            frame = self.bridge.get('resac_sample')
-            if frame:
-                sample = parse_sample(frame)
-                if sample['readingId'] != self.pending.last_id:
-                    sample['traceparent'] = traceparent()
-                    telemetry = self.config.get('_telemetry')
-                    if telemetry:
-                        telemetry.last_sample_at = monotonic()
-                        telemetry.event('reading.collect', sample['traceparent'], attributes={'outcome': 'ok', 'reading.id': sample['readingId']})
-                        telemetry.sensor(sample['traceparent'], sample['readingId'])
-                        telemetry.event('bridge.collect', sample['traceparent'], monotonic() - started, attributes={'outcome': 'ok', 'reading.id': sample['readingId']})
-                if time.gmtime().tm_year >= 2025:
-                    sample['recordedAt'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-                self.pending.add(sample)
+            if not streaming:
+                frame = self.bridge.get('resac_sample')
+                if frame:
+                    self._collect(frame, started)
             if self.config.get('_telemetry'):
                 self.config['_telemetry'].sensor()
         except Exception:
@@ -725,7 +974,7 @@ class FanReporter(object):
     """Live AVR estimate, independent of sensor samples and their offline buffer."""
     def __init__(self, config, bridge=None, automation=None):
         self.config = config
-        self.bridge = bridge or BridgeStore()
+        self.bridge = bridge or config.get('_bridge') or BridgeStore()
         self.request = None
         self.initialized = False
         self.next_due = 0
@@ -733,6 +982,7 @@ class FanReporter(object):
         self.sent_state = None
         self.heartbeat = 0
         self.automation = automation
+        self.bridge_version = None
 
     def tick(self):
         if self.request is not None and self.request.process.poll() is not None:
@@ -745,9 +995,18 @@ class FanReporter(object):
             finally:
                 self.request.close()
                 self.request = None
-        if monotonic() < self.next_due:
+        heartbeat_due = monotonic() >= self.next_due
+        if isinstance(self.bridge, BridgeEvents):
+            version = (self.bridge.version('resac_command_ready', 'resac_fan_session', 'resac_fan_state'),
+                       encode_json(self.automation.snapshot()) if self.automation else None)
+            changed = version != self.bridge_version
+            self.bridge_version = version
+        else:
+            changed = False
+        if not heartbeat_due and not changed:
             return
-        self.next_due = monotonic() + 1
+        if heartbeat_due:
+            self.next_due = monotonic() + 1
         try:
             ready = self.bridge.get('resac_command_ready')
             if ready not in ('v3', 'v4'):
@@ -756,8 +1015,9 @@ class FanReporter(object):
             if not self.initialized:
                 self.bridge.put('resac_fan_invalidate', '1')
                 self.initialized = True
-            self.heartbeat += 1
-            self.bridge.put('resac_fan_heartbeat', str(self.heartbeat))
+            if heartbeat_due:
+                self.heartbeat += 1
+                self.bridge.put('resac_fan_heartbeat', str(self.heartbeat))
             session = self.bridge.get('resac_fan_session') or ''
             if not re.match(r'^[a-f0-9]{32}$', session):
                 self.bridge.put('resac_fan_session', binascii.hexlify(os.urandom(16)).decode('ascii'))
@@ -771,6 +1031,7 @@ class FanReporter(object):
                 self.sent_at = monotonic()
         except Exception:
             self.initialized = False
+            self.sent_state = None
 
     def close(self):
         if self.request is not None:
@@ -785,7 +1046,7 @@ class CommandProcessor(object):
     """
     def __init__(self, config, bridge=None, state_path=COMMAND_STATE_PATH, on_manual=None, curve_handler=None, automatic=False):
         self.config = config
-        self.bridge = bridge or BridgeStore()
+        self.bridge = bridge or config.get('_bridge') or BridgeStore()
         self.state_path = state_path
         self.request = None
         self.request_kind = None
@@ -796,6 +1057,7 @@ class CommandProcessor(object):
         self.retry_at = 0
         self.backoff = 1
         self.bridge_due = 0
+        self.ping_dispatched = False
         self.deadline = 0
         self.ir = None
         self.prepared = False
@@ -957,6 +1219,7 @@ class CommandProcessor(object):
             return
         self.deadline = monotonic() + 10
         self.bridge_due = 0
+        self.ping_dispatched = False
         self._status('command received; waiting for Arduino')
 
     def _dispatch(self, frame):
@@ -977,7 +1240,8 @@ class CommandProcessor(object):
             self._complete('failed', dict(error='Arduino IR timed out; transmission uncertain' if self.ir or self.target_level is not None else
                                          'Arduino calibration timed out; confirm off again' if self.calibrating else 'Arduino ping timed out'))
             return
-        if monotonic() < self.bridge_due:
+        streaming = isinstance(self.bridge, BridgeEvents)
+        if not streaming and monotonic() < self.bridge_due:
             return
         self.bridge_due = monotonic() + 0.5
         try:
@@ -1024,8 +1288,9 @@ class CommandProcessor(object):
                         self._dispatch('v3,%s,nec,%s,%d,%d,%d' % ((self.current['id'], self.session_id) + self.ir))
                 # Do not rewrite the IR mailbox: AVR reset clears it, preventing
                 # a reboot from replaying a toggle whose acknowledgment was lost.
-            else:
+            elif not streaming or not self.ping_dispatched:
                 self._dispatch('v1,%s,ping' % self.current['id'])
+                self.ping_dispatched = True
         except Exception as error:
             telemetry = self.config.get('_telemetry')
             if telemetry and self.current and not self.bridge_failed_reported:
@@ -1101,7 +1366,7 @@ class AutoController(object):
     """Local step curve; fresh samples, 30-second dwell and one physical mailbox."""
     def __init__(self, config, bridge=None, path=CURVE_PATH, state_path=AUTO_STATE_PATH):
         self.config = config
-        self.bridge = bridge or BridgeStore()
+        self.bridge = bridge or config.get('_bridge') or BridgeStore()
         self.path, self.state_path = path, state_path
         self.settings = dict(enabled=False, thresholdsC=[22, 24, 26, 28, 30], hysteresisC=1)
         self.status = 'disabled'
@@ -1114,6 +1379,7 @@ class AutoController(object):
         self.temperature = None
         self.last_revision = None
         self.interval_auto = None
+        self.bridge_version = None
         try:
             with open(path) as stream:
                 self.settings = validate_curve(decode_json(stream.read()))
@@ -1174,7 +1440,17 @@ class AutoController(object):
                 elif self.settings['enabled']:
                     self.status = 'active'
             return
-        if monotonic() < self.next_due:
+        streaming = isinstance(self.bridge, BridgeEvents)
+        if streaming:
+            version = self.bridge.version('resac_fan_state', 'resac_sample', 'resac_sensor_status')
+            changed = version != self.bridge_version
+            if self.bridge_version is not None and version[0] != self.bridge_version[0]:
+                self.sample_at = self.temperature = None
+                self.interval_auto = None
+            self.bridge_version = version
+        else:
+            changed = False
+        if not changed and monotonic() < self.next_due:
             return
         self.next_due = monotonic() + 1
         try:
@@ -1192,8 +1468,10 @@ class AutoController(object):
             if frame and frame != self.last_frame:
                 sample = parse_sample(frame)
                 # A retained frame on startup is not evidence of a fresh sample.
-                if self.last_frame is not None and sensor_ok:
-                    self.temperature = sample['temperatureC']; self.sample_at = monotonic()
+                fresh = self.bridge.sample_live if streaming else self.last_frame is not None
+                if fresh and sensor_ok:
+                    self.temperature = sample['temperatureC']
+                    self.sample_at = self.bridge.sample_received if streaming else monotonic()
                 self.last_frame = frame
             if not self.settings['enabled']:
                 return
@@ -1223,6 +1501,8 @@ class AutoController(object):
 
 
 def run(config):
+    bridge = config.get('_bridge') or BridgeEvents()
+    config['_bridge'] = bridge
     telemetry = Telemetry(config)
     config['_telemetry'] = telemetry
     pending = Buffer(config.get('queue_limit', 100), telemetry)
@@ -1236,6 +1516,7 @@ def run(config):
     sample = None
     try:
         while True:
+            bridge.poll()
             collector.tick()
             telemetry.tick(pending)
             commands.tick(allow_execution=not automation.busy)
@@ -1266,13 +1547,16 @@ def run(config):
                         telemetry.event('reading.buffer', sample.get('traceparent'), monotonic() - queued_at,
                                         {'reading.id': sample['readingId'], 'outcome': 'ok'})
                     upload = CurlUpload(config, sample)
-            time.sleep(0.1)
+            # Socket readability wakes collection immediately; the timeout only
+            # services HTTP subprocess completion, heartbeats and retry timers.
+            bridge.poll(0.1)
     finally:
         telemetry.close()
         commands.close()
         fan_reporter.close()
         if upload is not None:
             upload.close()
+        bridge.close()
 
 
 def main():
