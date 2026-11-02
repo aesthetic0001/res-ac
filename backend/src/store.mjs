@@ -9,7 +9,8 @@ export function canonical(value) {
   return JSON.stringify(value);
 }
 export class Store {
-  constructor(path, devices = []) {
+  constructor(path, devices = [], observability) {
+    this.observability = observability;
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
@@ -23,6 +24,14 @@ export class Store {
       CREATE INDEX IF NOT EXISTS command_device_time ON commands(device_id,created_at);
       CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,csrf TEXT NOT NULL,expires_at INTEGER NOT NULL,auth_version TEXT NOT NULL);`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS fan_states(device_id TEXT PRIMARY KEY REFERENCES devices(id), state TEXT NOT NULL, received_at INTEGER NOT NULL);`);
+    if (!this.db.prepare('PRAGMA table_info(commands)').all().some(column => column.name === 'traceparent'))
+      this.db.exec('ALTER TABLE commands ADD COLUMN traceparent TEXT');
+    if (observability) {
+      for (const name of ['device', 'seen', 'fanState', 'setFanState', 'reading', 'readingHistory', 'enqueue', 'command', 'claim', 'result', 'expire', 'createSession', 'session', 'logout', 'snapshot']) {
+        const original = this[name].bind(this);
+        this[name] = (...args) => observability.run(`db.${name}`, { 'db.system.name': 'sqlite' }, () => original(...args));
+      }
+    }
     for (const device of devices) this.db.prepare('INSERT INTO devices(id,token_hash) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET token_hash=excluded.token_hash').run(device.id, digest(device.token));
   }
   close() { this.db.close(); }
@@ -63,8 +72,8 @@ export class Store {
   }
   enqueue(deviceId, type, payload, ttlSeconds) {
     const now = Date.now(), id = randomUUID();
-    this.db.prepare('INSERT INTO commands(id,device_id,type,payload,created_at,expires_at) VALUES(?,?,?,?,?,?)')
-      .run(id, deviceId, type, canonical(payload), now, now + ttlSeconds * 1000);
+    this.db.prepare('INSERT INTO commands(id,device_id,type,payload,created_at,expires_at,traceparent) VALUES(?,?,?,?,?,?,?)')
+      .run(id, deviceId, type, canonical(payload), now, now + ttlSeconds * 1000, this.observability?.currentTraceparent() || null);
     return this.command(id);
   }
   command(id) { return this.db.prepare('SELECT * FROM commands WHERE id=?').get(id); }
@@ -74,9 +83,21 @@ export class Store {
     // Preserve device command order until the first command completes or expires.
     const command = this.db.prepare("SELECT * FROM commands WHERE device_id=? AND status IN ('pending','inflight') ORDER BY created_at,rowid LIMIT 1").get(deviceId);
     if (!command || (command.status === 'inflight' && command.lease_until > now)) return null;
+    if (!command.traceparent && this.observability) {
+      command.traceparent = this.observability.currentTraceparent();
+      this.db.prepare('UPDATE commands SET traceparent=? WHERE id=?').run(command.traceparent, command.id);
+    }
     this.db.prepare("UPDATE commands SET status='inflight',attempts=attempts+1,lease_until=? WHERE id=?")
       .run(Math.min(now + leaseMs, command.expires_at), command.id);
-    return { id: command.id, type: command.type, payload: JSON.parse(command.payload),
+    if (command.traceparent && this.observability) {
+      if (!command.attempts) {
+        this.observability.record('command.queue_wait', command.traceparent, command.created_at, now - command.created_at, { 'command.id': command.id, outcome: 'ok' });
+        this.observability.queueTime.observe({ device: deviceId }, (now - command.created_at) / 1000);
+      }
+      this.observability.record('command.delivery', command.traceparent, now, 0,
+        { 'command.id': command.id, 'delivery.attempt': command.attempts + 1, 'command.age_ms': now - command.created_at, outcome: 'ok' });
+    }
+    return { ...(command.traceparent ? { traceparent: command.traceparent } : {}), id: command.id, type: command.type, payload: JSON.parse(command.payload),
       createdAt: new Date(command.created_at).toISOString(), expiresAt: new Date(command.expires_at).toISOString() };
   }
   result(deviceId, id, status, value) {

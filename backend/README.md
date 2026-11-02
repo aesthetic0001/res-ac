@@ -6,8 +6,8 @@ reverse proxy. A Certbot companion container owns public port 80 only for ACME
 HTTP-01 validation and automatically renews the public-IP certificate.
 
 Requires Docker Engine with Docker Compose v2.24+ on a reachable Linux server.
-The application image uses Node 24 and its built-in SQLite module, with no npm
-runtime dependencies. The Seeeduino runs neither Docker nor this Node server.
+The application image uses Node 24 and its built-in SQLite module, with OpenTelemetry and Prometheus
+instrumentation dependencies. The Seeeduino runs neither Docker nor this Node server.
 
 ## Automatic setup and deployment
 
@@ -288,3 +288,14 @@ private configuration can be reused:
 ```sh
 docker compose up -d --build backend
 ```
+
+## Observability
+
+The [design](../observability.md) and [deployment guide](observability/README.md)
+describe the optional Compose overlay for Grafana, Prometheus, Tempo, Loki, and
+the OpenTelemetry Collector. It instruments request/SQLite operations, persists
+command trace context, and accepts bounded authenticated device diagnostics at
+`POST /api/devices/:id/telemetry`. No monitoring service port is public. The
+separate metrics listener is enabled only when `METRICS_PORT` is configured.
+
+Use Node.js 22.15+ for local development. Run `npm ci` before tests/start.

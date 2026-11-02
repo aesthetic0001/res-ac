@@ -190,7 +190,7 @@ class AgentTests(unittest.TestCase):
                     self.assertIn(('/api/devices/test-board/commands', 'Bearer ' + config['device_token'], None), received)
                     self.assertIn(('/api/devices/test-board/commands/%s/result' % ping_id,
                                    'Bearer ' + config['device_token'],
-                                   dict(status='succeeded', result=dict(reply='pong', uptimeMs=4321))), received)
+                                   dict(status='succeeded', result=dict(reply='pong', uptimeMs=4321), traceparent=processor.cached['traceparent'])), received)
                 finally:
                     processor.close()
                 self.assertTrue(all(not Path(path).exists() for path in files))
@@ -315,7 +315,8 @@ class AgentTests(unittest.TestCase):
             clock[0] += 0.5
             processor.tick()
             result = calls[-1]
-            expected = dict(status='succeeded', result=dict(reply='pong', uptimeMs=12345))
+            self.assertRegex(result.payload['traceparent'], agent.TRACEPARENT)
+            expected = dict(status='succeeded', result=dict(reply='pong', uptimeMs=12345), traceparent=result.payload['traceparent'])
             self.assertEqual(result.payload, expected)
             self.assertEqual(result.options['route'], 'commands/%s/result' % command_id)
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)

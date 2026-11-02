@@ -1,0 +1,1139 @@
+{
+  "uid": "res-ac-observability",
+  "title": "Res-AC Observability",
+  "schemaVersion": 41,
+  "version": 3,
+  "refresh": "15s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Backend request success (all received requests)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * (sum(rate(resac_http_requests_total{status=~\"2..|3..\"}[5m])) or 0 * sum(rate(resac_http_requests_total[5m]))) / sum(rate(resac_http_requests_total[5m]))",
+          "legendFormat": "Backend request success"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Percentage of requests received by the backend that finished with HTTP 2xx or 3xx, over the last 5 minutes. HTTP 4xx, 5xx and aborted requests count as unsuccessful, including Grafana and unknown routes. No traffic produces no percentage."
+    },
+    {
+      "id": 2,
+      "title": "Device request success (includes network failures)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * (sum by(device,kind)(rate(resac_device_requests_total{outcome=\"ok\"}[5m])) or 0 * sum by(device,kind)(rate(resac_device_requests_total[5m]))) / sum by(device,kind)(rate(resac_device_requests_total[5m]))",
+          "legendFormat": "{{device}} — {{kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Percentage of device HTTP attempts ending with HTTP 2xx, by request kind, over the last 5 minutes. Includes DNS, connection, TLS and timeout failures reported after reconnection. commands = long polls; readings = sensor uploads; result = command results; fan-state = fan estimates. Lost diagnostics can undercount failures."
+    },
+    {
+      "id": 3,
+      "title": "API latency p95 (excluding command polls)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by(le,route)(rate(resac_http_duration_seconds_bucket{route!=\"/api/devices/:id/commands\"}[5m])))",
+          "legendFormat": "{{route}} — p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Estimated 95th-percentile backend response time by route over the last 5 minutes: about 95% of completed requests were at or below this duration. Includes response streaming and Grafana proxy traffic, but excludes device command long polls. Route IDs are normalized."
+    },
+    {
+      "id": 4,
+      "title": "Command poll latency p95",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by(le)(rate(resac_http_duration_seconds_bucket{route=\"/api/devices/:id/commands\"}[5m])))",
+          "legendFormat": "Command poll — p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Estimated duration at or below which 95% of device command polls completed in the last 5 minutes. An idle poll normally waits about 30 seconds by design; this is not command execution time. Histogram estimates from before the bucket-resolution fix may read near 60 seconds."
+    },
+    {
+      "id": 5,
+      "title": "Seconds since device contact / diagnostic upload",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - resac_device_contact_timestamp_seconds",
+          "legendFormat": "{{device}} — Last authenticated contact"
+        },
+        {
+          "refId": "B",
+          "expr": "time() - resac_device_telemetry_timestamp_seconds",
+          "legendFormat": "{{device}} — Last diagnostic upload"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Last authenticated contact: seconds since any authenticated device API request, checked once per minute. Last diagnostic upload: seconds since the backend accepted a diagnostic batch. Both increase during an outage; command polling can continue while sensor readings fail."
+    },
+    {
+      "id": 6,
+      "title": "Sensor sample age when diagnostics were sent",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "resac_device_value{metric=\"sensor_sample_age_seconds\"}",
+          "legendFormat": "{{device}} — Sample age at report"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "At the last diagnostic upload, seconds since the Linux agent collected a new sensor sample from Bridge. Usually below the 10-second sampling interval. This is a reported snapshot, not a continuously advancing age; check diagnostic-upload age if it appears frozen."
+    },
+    {
+      "id": 7,
+      "title": "Device Linux CPU usage",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * resac_device_value{metric=\"cpu_ratio\"}",
+          "legendFormat": "{{device}} — Linux CPU busy"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Percentage of Linux CPU time spent busy between diagnostic reports, normally about 15 seconds apart. Includes all Linux processes and excludes idle/I/O-wait time. This describes the board’s Linux processor, not the AVR."
+    },
+    {
+      "id": 8,
+      "title": "Device memory: total, available, agent RSS",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "resac_device_value{metric=\"memory_total_bytes\"}",
+          "legendFormat": "{{device}} — Total RAM"
+        },
+        {
+          "refId": "B",
+          "expr": "resac_device_value{metric=\"memory_available_bytes\"}",
+          "legendFormat": "{{device}} — Available RAM"
+        },
+        {
+          "refId": "C",
+          "expr": "resac_device_value{metric=\"agent_rss_bytes\"}",
+          "legendFormat": "{{device}} — Agent RSS"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Linux RAM: total physical memory, estimated available memory, and resident memory used by the Python agent (RSS). On legacy firmware, available RAM is approximated as free + buffers + cache. These overlap and should not be added together; they do not describe AVR RAM."
+    },
+    {
+      "id": 9,
+      "title": "Backend CPU usage (100% = one core)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * rate(resac_process_cpu_seconds_total[5m])",
+          "legendFormat": "Backend process — CPU usage"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Backend Node.js process CPU consumption averaged over the last 5 minutes. 100% means one fully occupied CPU core; multiple active threads can exceed 100%. This measures the application process, not every process on the server."
+    },
+    {
+      "id": 27,
+      "title": "Backend event-loop delay",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1000 * resac_nodejs_eventloop_lag_seconds",
+          "legendFormat": "Backend event-loop delay"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Delay before Node.js can run scheduled event-loop work, measured in milliseconds at metrics collection. Higher values indicate that the backend is blocked or overloaded. This is a delay, separate from CPU utilization."
+    },
+    {
+      "id": 10,
+      "title": "Backend process memory",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "resac_process_resident_memory_bytes",
+          "legendFormat": "Backend process — RSS"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Resident memory (RSS) used by the backend Node.js process, including JavaScript heap, native allocations and loaded code. This is physical process memory, not total server RAM or the configured heap limit."
+    },
+    {
+      "id": 11,
+      "title": "SQLite main / WAL storage",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "resac_db_bytes{file=\"main\"}",
+          "legendFormat": "SQLite database"
+        },
+        {
+          "refId": "B",
+          "expr": "resac_db_bytes{file=\"wal\"}",
+          "legendFormat": "SQLite write-ahead log (WAL)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "On-disk sizes of the SQLite database and its write-ahead log (WAL), checked once per minute. The WAL holds changes awaiting checkpointing and can shrink independently of the main database."
+    },
+    {
+      "id": 12,
+      "title": "SQLite entries",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "resac_db_rows",
+          "legendFormat": "{{table}} — rows"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Number of stored rows in each SQLite table, counted once per minute. Readings and commands include retained history; sessions are stored browser logins. These are current row counts, not insertion rates."
+    },
+    {
+      "id": 13,
+      "title": "SQLite latency p95",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 48,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by(le,operation)(rate(resac_db_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{operation}} — p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Estimated duration at or below which 95% of each named SQLite-backed store operation completed over the last 5 minutes. Includes lock waits and nested work. An operation may execute several SQL statements."
+    },
+    {
+      "id": 14,
+      "title": "SQLite failures",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 56,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by(operation)(increase(resac_db_duration_seconds_count{outcome=\"error\"}[5m]))",
+          "legendFormat": "{{operation}} — failures (5m)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Estimated number of SQLite-backed store operations that threw an error during the last 5 minutes, grouped by operation. Includes read/write failures and lock errors. Prometheus extrapolation can produce fractional counts."
+    },
+    {
+      "id": 15,
+      "title": "Commands by state",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 56,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "resac_commands",
+          "legendFormat": "{{status}} — commands"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Stored commands by state, checked once per minute: pending = queued; inflight = delivered and awaiting a final result; succeeded/failed = completed; expired = deadline passed. Terminal states include retained history, not just recent commands."
+    },
+    {
+      "id": 16,
+      "title": "Device failures by operation",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 64,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by(device,operation)(increase(resac_device_events_total{outcome!~\"ok|succeeded\"}[5m]))",
+          "legendFormat": "{{device}} — {{operation}} failures/drops (5m)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Estimated failures or drops reported for each device operation over the last 5 minutes. Reports arrive after reconnection, so failures can appear late; dropped diagnostics can make counts incomplete. These are event counts, not failure percentages."
+    },
+    {
+      "id": 17,
+      "title": "Device buffer / diagnostic queues",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 64,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "resac_device_value{metric=\"buffer_depth\"}",
+          "legendFormat": "{{device}} — Buffered readings"
+        },
+        {
+          "refId": "B",
+          "expr": "resac_device_value{metric=\"telemetry_queue_depth\"}",
+          "legendFormat": "{{device}} — Waiting diagnostics"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Buffered readings are waiting for upload. Waiting diagnostics are queued trace/error records, excluding up to 32 records in the current upload batch. Counts are snapshots from the latest device report; queues are RAM-only and can overflow during outages."
+    },
+    {
+      "id": 18,
+      "title": "Device drops / sensor read errors (since restart)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 72,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "resac_device_value{metric=\"readings_dropped_total\"}",
+          "legendFormat": "{{device}} — Dropped readings"
+        },
+        {
+          "refId": "B",
+          "expr": "resac_device_value{metric=\"telemetry_dropped_total\"}",
+          "legendFormat": "{{device}} — Dropped diagnostics"
+        },
+        {
+          "refId": "C",
+          "expr": "resac_device_value{metric=\"sensor_errors_total\"}",
+          "legendFormat": "{{device}} — DHT11 read errors"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Cumulative discarded readings and diagnostic records since the Linux agent started, plus failed DHT11 reads since the AVR reset. Values reset with their originating process/processor. Sensor read errors are distinct from network upload failures."
+    },
+    {
+      "id": 19,
+      "title": "Available storage",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 72,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "resac_device_value{metric=\"disk_free_bytes\"}",
+          "legendFormat": "{{device}} — Free root storage"
+        },
+        {
+          "refId": "B",
+          "expr": "resac_backend_disk_available_bytes",
+          "legendFormat": "Backend — Free database filesystem storage"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Device: available bytes on the Linux root filesystem at the latest report. Backend: available bytes on the filesystem containing SQLite, checked once per minute. These are separate machines/filesystems; this does not measure free RAM."
+    },
+    {
+      "id": 20,
+      "title": "TLS certificate remaining lifetime",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 80,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "resac_tls_expiry_timestamp_seconds-time()",
+          "legendFormat": "Backend HTTPS certificate — remaining lifetime"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Time remaining until the backend TLS certificate expires, checked once per minute. Negative values mean expiry. Certificate renewal normally increases this value; the configured alert fires below 24 hours."
+    },
+    {
+      "id": 21,
+      "title": "Observability export errors / dropped logs",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 80,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "increase(resac_trace_export_errors_total[5m])",
+          "legendFormat": "Failed trace-export batches"
+        },
+        {
+          "refId": "B",
+          "expr": "increase(resac_log_export_errors_total[5m])",
+          "legendFormat": "Failed log-export batches"
+        },
+        {
+          "refId": "C",
+          "expr": "increase(resac_trace_dropped_total[5m])",
+          "legendFormat": "Dropped trace spans"
+        },
+        {
+          "refId": "D",
+          "expr": "increase(resac_log_dropped_total[5m])",
+          "legendFormat": "Dropped log records"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Estimated counts over the last 5 minutes: failed trace-export batches, failed Loki log batches, dropped trace spans and dropped log records. These measure observability delivery, not sensor/API failures. Dropped records cannot be recovered from this telemetry pipeline."
+    },
+    {
+      "id": 22,
+      "title": "Firing alerts (delivery requires configured notifications)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 88,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "ALERTS{alertstate=\"firing\",device!=\"\"}",
+          "legendFormat": "{{alertname}} — {{device}}"
+        },
+        {
+          "refId": "B",
+          "expr": "ALERTS{alertstate=\"firing\",device=\"\"}",
+          "legendFormat": "{{alertname}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "description": "Each series is 1 while that Prometheus alert is firing. An empty result means no currently firing alerts, provided Prometheus is reachable. Rules are evaluated automatically; external notifications require separately configured destinations."
+    },
+    {
+      "id": 23,
+      "title": "Recent traces — open to inspect individual stages",
+      "type": "table",
+      "datasource": {
+        "type": "tempo",
+        "uid": "tempo"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 88,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{ resource.service.name =~ \"res-ac-(backend|agent|avr)\" }",
+          "queryType": "traceql"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "description": "Recent traces across res-ac-backend, res-ac-agent and res-ac-avr. Open a trace to inspect stages and outcomes by service. Reconstructed device timings are approximate; historical spans keep their original service names. IR completion does not prove that the fan received it."
+    },
+    {
+      "id": 24,
+      "title": "Correlated operation logs — expand to open TraceID",
+      "type": "logs",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 96,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=\"res-ac\"} | json"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "description": "Structured backend and device operation logs received by Loki. Expand a log’s TraceID to open its trace. Device diagnostics can arrive after an outage, so log receipt time may differ from execution time."
+    },
+    {
+      "id": 25,
+      "title": "Command queue wait p95",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 96,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by(le,device)(rate(resac_command_queue_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{device}} — First-delivery wait p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "Estimated time at or below which 95% of commands waited between enqueue and first delivery, over the last 5 minutes. Excludes redelivery waits and commands that have not yet been delivered; an empty chart does not prove the queue is empty.",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      }
+    },
+    {
+      "id": 26,
+      "title": "Device operation duration p95",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 104,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by(le,device,operation)(rate(resac_device_operation_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{device}} — {{operation}} p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "Estimated 95th-percentile duration of each device operation over the last 5 minutes. Depending on the operation, this measures sensor/AVR work, Bridge access, buffer wait or client HTTP time. Stages can overlap, so their durations should not be added together.",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      }
+    }
+  ]
+}

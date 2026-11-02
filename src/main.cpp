@@ -21,6 +21,8 @@ const unsigned long DEFAULT_INTERVAL_MS = 10000;
 unsigned long intervalMs = DEFAULT_INTERVAL_MS;
 unsigned long lastSampleMs = 0;
 unsigned long sequence = 0;
+unsigned long sensorAttempts = 0;
+unsigned long sensorErrors = 0;
 unsigned long lastCommandCheckMs = 0;
 char lastCommandId[37] = {0};
 char lastCommandReply[128] = {0};
@@ -164,6 +166,7 @@ void processCommand() {
     if (strtok_r(nullptr, ",", &save)) return;
   } else if (strcmp(separator + 1, "ping") != 0) return;
   if (strcmp(id, lastCommandId) != 0) {
+    const unsigned long executionStarted = millis();
     if (control || levelControl) {
       if (!fanSession[0] || strcmp(session, fanSession) != 0 ||
           !fanHeartbeat[0] || static_cast<unsigned long>(millis() - lastFanHeartbeatMs) > 10000 ||
@@ -188,6 +191,12 @@ void processCommand() {
       Serial.println(F("Ping handled by Arduino; replying pong"));
     }
     strcpy(lastCommandId, id);
+    char diagnostic[72];
+    snprintf(diagnostic, sizeof(diagnostic), "v1,%s,%lu,%s", id,
+             static_cast<unsigned long>(millis() - executionStarted),
+             strstr(lastCommandReply, ",rejected,") ? "failed" : "ok");
+    // Publish diagnostics before the acknowledgment; retries retain both.
+    Bridge.put("resac_command_diagnostic", diagnostic);
   }
   // A repeated delivery returns the original response without executing again.
   Bridge.put("resac_command_result", lastCommandReply);
@@ -247,19 +256,32 @@ void updateInterval() {
   }
 }
 
+void publishSensorDiagnostic(const char *epoch, unsigned long duration, bool ok) {
+  if (!validEpoch(epoch)) return;
+  char frame[112];
+  snprintf(frame, sizeof(frame), "v1,%s,%lu,%lu,%lu,%s,%lu,%lu", epoch, sequence,
+           sensorAttempts, duration, ok ? "ok" : "failed", millis(), sensorErrors);
+  Bridge.put("resac_sensor_diagnostic", frame);
+}
+
 void publishSample() {
+  char epoch[33] = {0};
+  Bridge.get("resac_epoch", epoch, sizeof(epoch) - 1);
+  const unsigned long started = millis();
+  ++sensorAttempts;
   const float humidity = dht.readHumidity();
   const float temperature = dht.readTemperature();
+  const unsigned long duration = static_cast<unsigned long>(millis() - started);
   if (isnan(humidity) || isnan(temperature) || humidity < 0 || humidity > 100 ||
       temperature < -80 || temperature > 150) {
+    ++sensorErrors;
+    publishSensorDiagnostic(epoch, duration, false);
     Bridge.put("resac_sensor_status", "read_error");
     Serial.println(F("DHT11 read failed; no sample published"));
     return;
   }
   Serial.print(F("Temperature: ")); Serial.print(temperature, 1);
   Serial.print(F(" C; humidity: ")); Serial.print(humidity, 1); Serial.println(F(" %"));
-  char epoch[33] = {0};
-  Bridge.get("resac_epoch", epoch, sizeof(epoch) - 1);
   if (!validEpoch(epoch)) {
     Bridge.put("resac_sensor_status", "waiting_for_agent");
     return;
@@ -272,6 +294,7 @@ void publishSample() {
   ++sequence;
   snprintf(frame, sizeof(frame), "v1,%s,%lu,%ld,%ld,%lu", epoch, sequence,
            temperatureMilli, humidityMilli, millis());
+  publishSensorDiagnostic(epoch, duration, true);
   Bridge.put("resac_sample", frame);
   Bridge.put("resac_sensor_status", "ok");
   char uploadStatus[48] = {0};
@@ -301,6 +324,8 @@ void setup() {
   // Discard a pre-reset mailbox: a stale toggle must not run during boot.
   Bridge.put("resac_command", "");
   Bridge.put("resac_command_result", "");
+  Bridge.put("resac_command_diagnostic", "");
+  Bridge.put("resac_sensor_diagnostic", "");
   Bridge.put("resac_fan_invalidate", "");
   invalidateFan();
   Bridge.put("resac_command_ready", "v4");

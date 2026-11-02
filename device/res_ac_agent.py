@@ -237,11 +237,164 @@ def temporary(prefix):
     raise IOError('Could not create private request file')
 
 
+TRACEPARENT = r'^00-(?!0{32})[a-f0-9]{32}-(?!0{16})[a-f0-9]{16}-01$'
+
+
+def traceparent(parent=None):
+    return '00-%s-%s-01' % (parent[3:35] if parent and re.match(TRACEPARENT, parent) else binascii.hexlify(os.urandom(16)).decode('ascii'),
+                             binascii.hexlify(os.urandom(8)).decode('ascii'))
+
+
+class Telemetry(object):
+    """Bounded, RAM-only diagnostics; never waits for HTTP in tick()."""
+    def __init__(self, config, bridge=None):
+        self.config = config
+        self.bridge = bridge or BridgeStore()
+        self.session = binascii.hexlify(os.urandom(16)).decode('ascii')
+        self.events = []
+        self.dropped = 0
+        self.request = None
+        self.batch = None
+        self.next_due = 0
+        self.backoff = 5
+        self.previous_cpu = None
+        self.sensor_attempt = None
+        self.last_sample_at = None
+        self.sensor_errors = 0
+
+    def event(self, name, parent=None, duration=0, attributes=None, span_id=None):
+        try:
+            if len(self.events) >= 128:
+                self.events.pop(0)
+                self.dropped += 1
+            self.events.append(dict(name=name, traceparent=parent if parent and re.match(TRACEPARENT, parent) else traceparent(),
+                                    durationMs=max(0, min(duration * 1000, 86400000)),
+                                    attributes=attributes or dict(outcome='ok'), ended=monotonic()))
+            if span_id is not None:
+                self.events[-1]['spanId'] = span_id
+        except Exception:
+            self.dropped += 1
+
+    def resources(self):
+        values = {}
+        try:
+            with open('/proc/stat') as stream:
+                fields = [int(v) for v in stream.readline().split()[1:9]]
+            total, idle = sum(fields), fields[3] + fields[4]
+            if self.previous_cpu and total > self.previous_cpu[0]:
+                values['cpu_ratio'] = max(0, min(1, 1 - float(idle - self.previous_cpu[1]) / (total - self.previous_cpu[0])))
+            self.previous_cpu = (total, idle)
+            with open('/proc/meminfo') as stream:
+                memory = dict((line.split(':')[0], int(line.split()[1]) * 1024) for line in stream if ':' in line)
+            values['memory_total_bytes'] = memory['MemTotal']
+            values['memory_available_bytes'] = memory.get('MemAvailable', memory.get('MemFree', 0) + memory.get('Buffers', 0) + memory.get('Cached', 0))
+            with open('/proc/self/statm') as stream:
+                values['agent_rss_bytes'] = int(stream.read().split()[1]) * (os.sysconf('SC_PAGE_SIZE') if hasattr(os, 'sysconf') else 4096)
+            with open('/proc/uptime') as stream:
+                values['uptime_seconds'] = float(stream.read().split()[0])
+            storage = os.statvfs('/')
+            values['disk_free_bytes'] = storage.f_bavail * storage.f_frsize
+        except (IOError, OSError, ValueError, KeyError, AttributeError):
+            pass
+        return values
+
+    def sensor(self, parent=None, sample_id=None):
+        try:
+            fields = (self.bridge.get('resac_sensor_diagnostic') or '').split(',')
+            if (len(fields) != 8 or fields[0] != 'v1' or not re.match(r'^[a-f0-9]{32}$', fields[1]) or
+                    any(not re.match(r'^\d{1,10}$', fields[i]) for i in (2, 3, 4, 6, 7)) or fields[5] not in ('ok', 'failed')):
+                return
+            identity = (fields[1], fields[3])
+            if identity == self.sensor_attempt:
+                return
+            reading_id = fields[1] + '-' + fields[2]
+            # A successful diagnostic can precede publication of its sample.
+            # Wait for the matching sample instead of consuming it under an old ID.
+            if fields[5] == 'ok' and sample_id != reading_id:
+                return
+            self.sensor_attempt = identity
+            self.sensor_errors = int(fields[7])
+            attributes = dict(outcome=fields[5])
+            attributes['avr.uptime_ms'] = int(fields[6])
+            if fields[5] == 'ok':
+                attributes['reading.id'] = reading_id
+            if fields[5] == 'failed':
+                parent = traceparent()
+                self.event('reading.collect', parent, attributes={'outcome': 'failed'})
+            self.event('sensor.read', parent if sample_id == reading_id or fields[5] == 'failed' else None,
+                       int(fields[4]) / 1000.0, attributes)
+        except Exception:
+            pass
+
+    def tick(self, pending):
+        try:
+            self._tick(pending)
+        except Exception:
+            # Diagnostics must never terminate the agent or delay control retries.
+            if self.request is not None:
+                self.request.close()
+            self.request = None
+            self.next_due = monotonic() + self.backoff
+            self.backoff = min(self.backoff * 2, 60)
+
+    def _tick(self, pending):
+        if self.request is not None:
+            if self.request.process.poll() is None:
+                return
+            try:
+                status, unused = self.request.finish()
+                if status != 200:
+                    raise UploadError(status=status)
+                self.batch = None
+                self.backoff = 5
+                self.next_due = monotonic() + 15
+            finally:
+                self.request.close()
+                self.request = None
+        if monotonic() < self.next_due:
+            return
+        if self.batch is None:
+            self.sensor()
+            events, self.events = self.events[:32], self.events[32:]
+            self.batch = dict(session=self.session, batchId=binascii.hexlify(os.urandom(16)).decode('ascii'),
+                              metrics={}, events=events)
+        now = monotonic()
+        # Keep batch identity for retry deduplication, but advance elapsed ages.
+        events = [dict((key, value) for key, value in event.items() if key != 'ended') for event in self.batch['events']]
+        for event, original in zip(events, self.batch['events']):
+            event['ageMs'] = max(0, (now - original['ended']) * 1000)
+        # Diagnostics older than the receiver's seven-day window are discarded.
+        retained = [event for event in self.batch['events'] if max(0, (now - event['ended']) * 1000) <= 604800000]
+        self.dropped += len(self.batch['events']) - len(retained)
+        self.batch['events'] = retained
+        metrics = self.resources()
+        metrics.update(buffer_depth=len(pending.queue), readings_dropped_total=pending.dropped,
+                       telemetry_dropped_total=self.dropped, telemetry_queue_depth=len(self.events), sensor_errors_total=self.sensor_errors)
+        if self.last_sample_at is not None:
+            metrics['sensor_sample_age_seconds'] = max(0, now - self.last_sample_at)
+        payload = dict(self.batch, metrics=metrics, events=[event for event in events if event['ageMs'] <= 604800000])
+        self.request = CurlUpload(self.config, payload, route='telemetry', timeout=10)
+
+    def close(self):
+        if self.request is not None:
+            self.request.close()
+
+
 class CurlUpload(object):
     """A bounded curl subprocess; polling completion never waits for the network."""
     def __init__(self, config, payload=None, route='readings', method='POST', timeout=25):
         self.process = None
         self.files = []
+        self.telemetry = config.get('_telemetry') if route != 'telemetry' else None
+        self.started = monotonic()
+        self.reported = False
+        self.kind = 'result' if route.endswith('/result') else route
+        supplied = (payload or {}).get('traceparent')
+        self.root_request = not (isinstance(supplied, (str, text_type)) and re.match(TRACEPARENT, supplied))
+        self.parent = traceparent() if self.root_request else supplied
+        # Allocate a fresh CLIENT span for each attempt, before writing headers.
+        # Keep the collection/command context as its parent across retries.
+        self.request_traceparent = self.parent if self.root_request else traceparent(self.parent)
         try:
             header_fd, header_path = temporary('res-ac-curl-')
             self.files.append(header_path)
@@ -254,31 +407,47 @@ class CurlUpload(object):
             with os.fdopen(header_fd, 'w') as stream:
                 stream.write('url = "%s"\n' % quote(url))
                 stream.write('header = "Authorization: Bearer %s"\n' % quote(config['device_token']))
+                stream.write('header = "traceparent: %s"\n' % self.request_traceparent)
             arguments = [config.get('curl_binary', 'curl'), '--config', header_path, '--cacert', config['ca_file'],
                          '--silent', '--show-error', '--connect-timeout', '10', '--max-time', str(timeout),
                          '--max-filesize', '32768', '--request', method, '--header', 'Content-Type: application/json',
                          '--output', self.response_path, '--write-out', '%{http_code}']
             if payload is not None:
-                arguments += ['--data-binary', '@-']
+                payload_fd, payload_path = temporary('res-ac-payload-')
+                self.files.append(payload_path)
+                with os.fdopen(payload_fd, 'w') as stream:
+                    stream.write(encode_json(payload))
+                arguments += ['--data-binary', '@' + payload_path]
             self.process = subprocess.Popen(arguments,
                                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            # Sample bodies are small, well below the pipe buffer size.
-            if payload is not None:
-                self.process.stdin.write(encode_json(payload).encode('utf-8'))
+            # Read request bodies from private RAM files: a large diagnostic batch
+            # must not block the control loop while writing a subprocess pipe.
             self.process.stdin.close()
             self.process.stdin = None
         except BaseException:
+            self._report(0, 0)
             self.close()
             raise
+
+    def _report(self, status, code):
+        if self.reported or self.telemetry is None:
+            return
+        self.reported = True
+        outcome = ('ok' if 200 <= status < 300 else 'failed') if not code else {6: 'dns', 7: 'connect', 28: 'timeout', 35: 'tls', 60: 'tls'}.get(code, 'other')
+        self.telemetry.event('http.request' if self.root_request else 'http.device', self.parent, monotonic() - self.started,
+                             {'outcome': outcome, 'curl.code': code, 'http.status_code': status, 'request.kind': self.kind}, span_id=self.request_traceparent[36:52])
 
     def finish(self):
         output, errors = self.process.communicate()
         if self.process.returncode:
+            self._report(0, self.process.returncode)
             raise UploadError(curl_code=self.process.returncode)
         try:
             status = int(output.strip())
         except ValueError:
+            self._report(0, 0)
             raise UploadError()
+        self._report(status, 0)
         with open(self.response_path, 'rb') as stream:
             return status, stream.read(32768)
 
@@ -300,7 +469,8 @@ def post(config, payload):
 
 
 class Buffer(object):
-    def __init__(self, limit):
+    def __init__(self, limit, telemetry=None):
+        self.telemetry = telemetry
         self.queue = []
         self.limit = limit
         self.last_id = None
@@ -311,8 +481,12 @@ class Buffer(object):
             return False
         self.last_id = sample['readingId']
         if len(self.queue) >= self.limit:
-            self.queue.pop(0)
+            removed = self.queue.pop(0)
             self.dropped += 1
+            if self.telemetry:
+                self.telemetry.event('reading.drop', removed.get('traceparent'), attributes={'outcome': 'dropped', 'reading.id': removed['readingId']})
+        if self.telemetry:
+            sample['_queued_at'] = monotonic()
         self.queue.append(sample)
         return True
 
@@ -337,6 +511,7 @@ class Collector(object):
         if monotonic() < self.next_due:
             return
         self.next_due = monotonic() + 0.5
+        started = monotonic()
         try:
             if not self.initialized or not self.bridge.get('resac_epoch'):
                 self.bridge.put('resac_epoch', binascii.hexlify(os.urandom(16)).decode('ascii'))
@@ -351,12 +526,24 @@ class Collector(object):
             frame = self.bridge.get('resac_sample')
             if frame:
                 sample = parse_sample(frame)
+                if sample['readingId'] != self.pending.last_id:
+                    sample['traceparent'] = traceparent()
+                    telemetry = self.config.get('_telemetry')
+                    if telemetry:
+                        telemetry.last_sample_at = monotonic()
+                        telemetry.event('reading.collect', sample['traceparent'], attributes={'outcome': 'ok', 'reading.id': sample['readingId']})
+                        telemetry.sensor(sample['traceparent'], sample['readingId'])
+                        telemetry.event('bridge.collect', sample['traceparent'], monotonic() - started, attributes={'outcome': 'ok', 'reading.id': sample['readingId']})
                 if time.gmtime().tm_year >= 2025:
                     sample['recordedAt'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
                 self.pending.add(sample)
+            if self.config.get('_telemetry'):
+                self.config['_telemetry'].sensor()
         except Exception:
             if self.initialized:
                 log('Sensor Bridge unavailable; waiting for reconnect')
+                if self.config.get('_telemetry'):
+                    self.config['_telemetry'].event('bridge.error', attributes={'outcome': 'failed'})
             self.initialized = False
             self.next_due = monotonic() + 2
 
@@ -501,7 +688,21 @@ class CommandProcessor(object):
             pass
 
     def _complete(self, status, result):
-        self.reply = dict(id=self.current['id'], status=status, result=result)
+        parent = self.current.get('traceparent') or traceparent()
+        telemetry = self.config.get('_telemetry')
+        if telemetry:
+            telemetry.event('command.execute', parent, monotonic() - self.execution_started,
+                            {'command.id': self.current['id'], 'outcome': status,
+                             'error.kind': 'avr_timeout' if 'timed out' in result.get('error', '') else 'command_rejected' if status == 'failed' else 'none'})
+            try:
+                fields = (self.bridge.get('resac_command_diagnostic') or '').split(',')
+                if (len(fields) == 4 and fields[:2] == ['v1', self.current['id']] and
+                        re.match(r'^\d{1,10}$', fields[2]) and fields[3] in ('ok', 'failed')):
+                    telemetry.event('avr.execute', parent, int(fields[2]) / 1000.0,
+                                    {'command.id': self.current['id'], 'outcome': fields[3]})
+            except Exception:
+                pass
+        self.reply = dict(id=self.current['id'], status=status, result=result, traceparent=parent)
         self.current = None
         self.persisted = False
 
@@ -541,6 +742,12 @@ class CommandProcessor(object):
             self.persisted = True
             return
         self.current = command
+        self.execution_started = monotonic()
+        self.bridge_failed_reported = False
+        if not re.match(TRACEPARENT, command.get('traceparent', '')):
+            command['traceparent'] = traceparent()
+            if self.config.get('_telemetry'):
+                self.config['_telemetry'].event('command.local', command['traceparent'], attributes={'command.id': command['id'], 'outcome': 'ok'})
         self.ir = None
         self.prepared = False
         self.expires_at = None
@@ -599,6 +806,14 @@ class CommandProcessor(object):
         self.bridge_due = 0
         self._status('command received; waiting for Arduino')
 
+    def _dispatch(self, frame):
+        started = monotonic()
+        self.bridge.put('resac_command', frame)
+        telemetry = self.config.get('_telemetry')
+        if telemetry:
+            telemetry.event('bridge.dispatch', self.current.get('traceparent'), monotonic() - started,
+                            {'command.id': self.current['id'], 'outcome': 'ok'})
+
     def _arduino(self):
         if monotonic() >= self.deadline:
             if (self.ir or self.target_level is not None) and self.prepared:
@@ -644,22 +859,27 @@ class CommandProcessor(object):
                     if time.time() >= self.expires_at:
                         self._complete('failed', dict(error='IR command expired before dispatch'))
                         return
-                    self._write_state(dict(id=self.current['id'], status='failed', result=dict(
+                    self._write_state(dict(id=self.current['id'], traceparent=self.current.get('traceparent'), status='failed', result=dict(
                         error='IR execution interrupted; transmission uncertain; verify fan before retrying')))
                     self.prepared = True
                     if self.calibrating:
-                        self.bridge.put('resac_command', 'v3,%s,calibrate,%s' % (self.current['id'], self.session_id))
+                        self._dispatch('v3,%s,calibrate,%s' % (self.current['id'], self.session_id))
                     elif self.target_level is not None:
-                        self.bridge.put('resac_command', 'v4,%s,%s,%s,%d' % (self.current['id'],
+                        self._dispatch('v4,%s,%s,%s,%d' % (self.current['id'],
                                         'auto_level' if self.automatic else 'level', self.session_id, self.target_level))
                     else:
-                        self.bridge.put('resac_command', 'v3,%s,nec,%s,%d,%d,%d' % ((self.current['id'], self.session_id) + self.ir))
+                        self._dispatch('v3,%s,nec,%s,%d,%d,%d' % ((self.current['id'], self.session_id) + self.ir))
                 # Do not rewrite the IR mailbox: AVR reset clears it, preventing
                 # a reboot from replaying a toggle whose acknowledgment was lost.
             else:
-                self.bridge.put('resac_command', 'v1,%s,ping' % self.current['id'])
-        except Exception:
-            pass  # Wait for Bridge/AVR within the bounded execution timeout.
+                self._dispatch('v1,%s,ping' % self.current['id'])
+        except Exception as error:
+            telemetry = self.config.get('_telemetry')
+            if telemetry and self.current and not self.bridge_failed_reported:
+                telemetry.event('bridge.error', self.current.get('traceparent'), attributes={
+                    'command.id': self.current['id'], 'outcome': 'failed', 'error.kind': type(error).__name__})
+                self.bridge_failed_reported = True
+            # Wait for Bridge/AVR within the bounded execution timeout.
 
     def _failed_request(self, error):
         self.retry_at = monotonic() + self.backoff
@@ -705,7 +925,7 @@ class CommandProcessor(object):
             if self.reply is not None:
                 if not self.persisted:
                     self._save()
-                payload = dict(status=self.reply['status'], result=self.reply['result'])
+                payload = dict(status=self.reply['status'], result=self.reply['result'], traceparent=self.reply.get('traceparent') or traceparent())
                 self.request = CurlUpload(self.config, payload,
                                           route='commands/%s/result' % self.reply['id'])
                 self.request_kind = 'result'
@@ -850,7 +1070,9 @@ class AutoController(object):
 
 
 def run(config):
-    pending = Buffer(config.get('queue_limit', 100))
+    telemetry = Telemetry(config)
+    config['_telemetry'] = telemetry
+    pending = Buffer(config.get('queue_limit', 100), telemetry)
     collector = Collector(config, pending)
     automation = AutoController(config)
     commands = CommandProcessor(config, on_manual=automation.manual_override, curve_handler=automation.configure)
@@ -862,6 +1084,7 @@ def run(config):
     try:
         while True:
             collector.tick()
+            telemetry.tick(pending)
             commands.tick(allow_execution=not automation.busy)
             automation.tick(commands)
             fan_reporter.tick()
@@ -885,9 +1108,14 @@ def run(config):
             if upload is None and monotonic() >= retry_at:
                 sample = pending.first()
                 if sample is not None:
+                    queued_at = sample.pop('_queued_at', None)
+                    if queued_at is not None:
+                        telemetry.event('reading.buffer', sample.get('traceparent'), monotonic() - queued_at,
+                                        {'reading.id': sample['readingId'], 'outcome': 'ok'})
                     upload = CurlUpload(config, sample)
             time.sleep(0.1)
     finally:
+        telemetry.close()
         commands.close()
         fan_reporter.close()
         if upload is not None:

@@ -1,3 +1,4 @@
+import { validateTelemetry, validTraceparent } from './observability.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { token, digest, equal, verifyPassword, cookieToken } from './auth.mjs';
@@ -43,7 +44,7 @@ function sameOrigin(req, config) {
   const expected = `${config.httpDev ? 'http' : 'https'}://${req.headers.host}`;
   if (req.headers.origin !== expected) throw new HttpError(403, 'Origin does not match this server');
 }
-export function createApp(config, store) {
+export function createApp(config, store, observability) {
   const assets = new Map([
     ['/login', ['login.html', 'text/html']], ['/', ['index.html', 'text/html']],
     ['/assets/style.css', ['style.css', 'text/css']], ['/assets/app.js', ['app.js', 'text/javascript']],
@@ -180,10 +181,16 @@ export function createApp(config, store) {
         notify(deviceId);
         return json(res, 201, { id: command.id, status: command.status, expiresAt: new Date(command.expires_at).toISOString() });
       }
-      const deviceRoute = path.match(/^\/api\/devices\/([a-zA-Z0-9_-]+)\/(readings|commands|fan-state)(?:\/([a-f0-9-]+)\/result)?$/);
+      const deviceRoute = path.match(/^\/api\/devices\/([a-zA-Z0-9_-]+)\/(readings|commands|fan-state|telemetry)(?:\/([a-f0-9-]+)\/result)?$/);
       if (deviceRoute) {
         const [, id, route, commandId] = deviceRoute;
         requireDevice(req, id);
+        if (req.method === 'POST' && route === 'telemetry' && !commandId) {
+          const value = await body(req);
+          assert(validateTelemetry(value), 'Invalid telemetry');
+          observability?.ingest(id, value);
+          return json(res, 200, { ok: true });
+        }
         if (req.method === 'POST' && route === 'fan-state' && !commandId) {
           const value = await body(req);
           assert(value.sessionId === null || (typeof value.sessionId === 'string' && /^[a-f0-9]{32}$/.test(value.sessionId)), 'Invalid fan session');
@@ -226,7 +233,12 @@ export function createApp(config, store) {
         if (req.method === 'POST' && route === 'commands' && commandId) {
           const value = await body(req);
           assert(['succeeded', 'failed'].includes(value.status), 'Status must be succeeded or failed');
-          const result = store.result(id, commandId, value.status, value.result ?? null);
+          const saved = store.command(commandId);
+          const persist = () => store.result(id, commandId, value.status, value.result ?? null);
+          const result = observability && saved?.device_id === id && validTraceparent(saved.traceparent)
+            ? observability.run('command.result', { 'command.id': commandId, outcome: value.status }, persist,
+              validTraceparent(req.headers.traceparent) && req.headers.traceparent.slice(3, 35) === saved.traceparent.slice(3, 35)
+                ? undefined : saved.traceparent) : persist();
           if (result.code === 200) notify(id);
           return json(res, result.code, result.error ? { error: result.error } : { ok: true, duplicate: result.duplicate });
         }
@@ -243,5 +255,5 @@ export function createApp(config, store) {
       json(res, error.status || 500, { error: error.status ? error.message : 'Internal server error' });
     }
   };
-  return { handler, close() { shuttingDown = true; for (const waiter of [...waiters.values()]) waiter.close(); } };
+  return { handler: observability ? (req, res) => observability.request(req, res, () => handler(req, res)) : handler, close() { shuttingDown = true; for (const waiter of [...waiters.values()]) waiter.close(); } };
 }
