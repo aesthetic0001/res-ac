@@ -40,6 +40,47 @@ Device spans are reconstructed by the backend but retain distinct resource
 identities: `res-ac-agent` for the Linux agent, `res-ac-avr` for firmware work,
 and `res-ac-backend` for API/database work. All share trace IDs across boundaries.
 
+Command spans and their JSON logs include `command.type` (for example,
+`fan.level`, `fan.command`, or `device.ping`) and `command.source`: `manual`
+for backend-queued commands, `automatic` for fan adjustments created by the
+device's temperature controller. This includes `command.local`,
+`bridge.dispatch`, `bridge.error`, `command.execute`, and `avr.execute` events;
+backend queue/delivery and result spans also identify manual commands.
+For supported command types, `command.payload` contains the command parameters:
+fan button, target level (0 means off), calibration confirmation, curve settings,
+or NEC protocol/address/code/repeats, including the supplied fan session ID.
+Logs expose a JSON object; spans carry the same object encoded as JSON text,
+because span attributes cannot contain nested objects. Only known command fields
+with bounded values are recorded; unsupported types and invalid values are omitted.
+Automatic adjustments execute on the device and do not appear in the backend's
+Recent commands table. Find their execution logs in Explore → Loki:
+
+```logql
+{service_name="res-ac"} | json | operation="command.execute" | command_source="automatic"
+```
+
+Loki's JSON parser turns dotted keys into underscores, so add
+`| command_type="fan.level"` to filter by type, or `| command_id="COMMAND_UUID"`
+to follow an execution. In Tempo, use
+`{ span.command.type = "fan.level" && span.command.source = "automatic" }`.
+Expand a log's TraceID to open the corresponding trace.
+For automatic requests to set speed 3, add `| command_payload_level=3` to the
+Loki query above. For power button commands, use:
+
+```logql
+{service_name="res-ac"} | json | operation="command.execute" | command_type="fan.command" | command_payload_button="power"
+```
+
+Payloads describe requested actions. An execution outcome of `succeeded` confirms
+that transmission completed; the physical fan response remains unconfirmed.
+
+Structured logs emit an explicit `level`: successful events use `info`, failed
+events use `error`, and dropped events or HTTP 4xx responses use `warn`. This
+prevents Loki from classifying successful logs as errors merely because they
+contain `error.kind="none"`. Deploy the backend before the updated agent so the
+telemetry validator accepts the new fields. Older agents remain supported;
+historical logs/traces retain their original fields and detected levels.
+
 Prometheus evaluates the provisioned alerts; the dashboard shows firing alerts.
 Notifications are not sent until you configure contact points/rules in Grafana
 (or an Alertmanager integration). Set those destinations privately. The supplied

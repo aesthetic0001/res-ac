@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { digest } from './auth.mjs';
+import { commandPayloadAttributes } from './observability.mjs';
 export function canonical(value) {
   if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
   if (value && typeof value === 'object') return '{' + Object.keys(value).sort().map(k => JSON.stringify(k) + ':' + canonical(value[k])).join(',') + '}';
@@ -90,12 +91,14 @@ export class Store {
     this.db.prepare("UPDATE commands SET status='inflight',attempts=attempts+1,lease_until=? WHERE id=?")
       .run(Math.min(now + leaseMs, command.expires_at), command.id);
     if (command.traceparent && this.observability) {
+      const attributes = { 'command.id': command.id, 'command.type': command.type, 'command.source': 'manual',
+        ...commandPayloadAttributes(command.type, JSON.parse(command.payload)), outcome: 'ok' };
       if (!command.attempts) {
-        this.observability.record('command.queue_wait', command.traceparent, command.created_at, now - command.created_at, { 'command.id': command.id, outcome: 'ok' });
+        this.observability.record('command.queue_wait', command.traceparent, command.created_at, now - command.created_at, attributes);
         this.observability.queueTime.observe({ device: deviceId }, (now - command.created_at) / 1000);
       }
       this.observability.record('command.delivery', command.traceparent, now, 0,
-        { 'command.id': command.id, 'delivery.attempt': command.attempts + 1, 'command.age_ms': now - command.created_at, outcome: 'ok' });
+        { ...attributes, 'delivery.attempt': command.attempts + 1, 'command.age_ms': now - command.created_at });
     }
     return { ...(command.traceparent ? { traceparent: command.traceparent } : {}), id: command.id, type: command.type, payload: JSON.parse(command.payload),
       createdAt: new Date(command.created_at).toISOString(), expiresAt: new Date(command.expires_at).toISOString() };

@@ -60,7 +60,13 @@ test('isolated stack ingests device/backend traces, metrics, logs and provisions
     { name: 'reading.collect', traceparent: parent, durationMs: 0, ageMs: 100, attributes: { outcome: 'ok', 'reading.id': 'smoke-reading' } },
     { name: 'sensor.read', traceparent: parent, durationMs: 7, ageMs: 100, attributes: { outcome: 'ok', 'reading.id': 'smoke-reading' } },
     { name: 'http.device', traceparent: parent, spanId: client.slice(36, 52), durationMs: 10, ageMs: 100, attributes: { outcome: 'ok', 'request.kind': 'readings' } },
-    { name: 'http.device', traceparent: parent, durationMs: 10, ageMs: 100, attributes: { outcome: 'ok', 'request.kind': 'commands' } }
+    { name: 'http.device', traceparent: parent, durationMs: 10, ageMs: 100, attributes: { outcome: 'ok', 'request.kind': 'commands' } },
+    { name: 'command.execute', traceparent: parent, durationMs: 12, ageMs: 100, attributes: {
+      'command.id': 'smoke-automatic', 'command.type': 'fan.level', 'command.source': 'automatic',
+      'command.payload': JSON.stringify({ level: 3, sessionId: 'a'.repeat(32) }), outcome: 'succeeded', 'error.kind': 'none' } },
+    { name: 'command.execute', traceparent: parent, durationMs: 12, ageMs: 100, attributes: {
+      'command.id': 'smoke-manual', 'command.type': 'fan.command', 'command.source': 'manual',
+      'command.payload': JSON.stringify({ button: 'power', sessionId: 'a'.repeat(32) }), outcome: 'failed', 'error.kind': 'avr_timeout' } }
   ] };
   assert.equal((await fetch(backend + '/api/devices/test-board/telemetry', { method: 'POST', headers, body: JSON.stringify(value) })).status, 200);
   // Exercise real command enqueue, delivery and final-result persistence.
@@ -83,6 +89,14 @@ test('isolated stack ingests device/backend traces, metrics, logs and provisions
   const traceSpans = resourceSpans.flatMap(group => (group.scopeSpans || group.instrumentationLibrarySpans).flatMap(scope => scope.spans));
   const httpClient = traceSpans.find(span => span.name === 'http.device' && span.spanId === traceSpans.find(item => item.name === 'http.server').parentSpanId);
   assert.ok(httpClient, 'Tempo server span must nest under the reconstructed device HTTP client');
+  for (const source of ['manual', 'automatic']) {
+    assert.ok(traceSpans.some(span => span.name === 'command.execute' &&
+      span.attributes.some(attribute => attribute.key === 'command.source' && attribute.value.stringValue === source) &&
+      span.attributes.some(attribute => attribute.key === 'command.type' && attribute.value.stringValue === (source === 'automatic' ? 'fan.level' : 'fan.command')) &&
+      span.attributes.some(attribute => attribute.key === 'command.payload' &&
+        JSON.parse(attribute.value.stringValue)[source === 'automatic' ? 'level' : 'button'] === (source === 'automatic' ? 3 : 'power'))),
+    `Tempo must retain command type and ${source} source`);
+  }
   await until(async () => {
     const response = await fetch(prometheus + '/api/v1/query?' + new URLSearchParams({ query: 'resac_http_requests_total' }));
     return response.ok && (await response.json()).data?.result?.length;
@@ -91,6 +105,15 @@ test('isolated stack ingests device/backend traces, metrics, logs and provisions
     const response = await fetch(loki + '/loki/api/v1/query_range?' + new URLSearchParams({ query: `{service_name="res-ac"} | json | trace_id="${traceId}"` }));
     return response.ok && (await response.json()).data?.result?.length;
   }, 'correlated logs did not reach Loki');
+  // Check Loki's actual ingestion-time classification, not just our JSON level.
+  for (const [source, type, level] of [['automatic', 'fan.level', 'info'], ['manual', 'fan.command', 'error']]) {
+    await until(async () => {
+      const query = `{service_name="res-ac"} | detected_level="${level}" | json | operation="command.execute" | command_source="${source}" | command_type="${type}" | trace_id="${traceId}"`;
+      const payloadFilter = source === 'automatic' ? ' | command_payload_level=3' : ' | command_payload_button="power"';
+      const response = await fetch(loki + '/loki/api/v1/query_range?' + new URLSearchParams({ query: query + payloadFilter }));
+      return response.ok && (await response.json()).data?.result?.length;
+    }, `Loki must detect ${level} for ${source} commands`);
+  }
   await until(async () => {
     const response = await fetch(grafana + '/api/dashboards/uid/res-ac-observability', { headers: { authorization: 'Basic ' + Buffer.from('admin:admin').toString('base64') } });
     return response.ok && (await response.json()).dashboard.panels.length >= 20;

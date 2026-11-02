@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { InMemorySpanExporter } from '@opentelemetry/sdk-trace';
-import { Observability, newTraceparent, validateTelemetry } from '../src/observability.mjs';
+import { Observability, commandPayloadAttributes, newTraceparent, validateTelemetry } from '../src/observability.mjs';
 import { Store } from '../src/store.mjs';
 import { createApp } from '../src/app.mjs';
 import { hashPassword } from '../src/auth.mjs';
@@ -49,6 +49,78 @@ test('authenticated diagnostics validate atomically, deduplicate retries, and co
   assert.ok(f.logs.some(log => log.trace_id === value.events[0].traceparent.slice(3, 35)));
 });
 
+test('command type and source reach spans and logs without inferring errors from error.kind', async t => {
+  const f = await fixture(t), value = batch();
+  const payload = { level: 3, sessionId: 'a'.repeat(32) };
+  value.events = ['manual', 'automatic'].flatMap(source => ['succeeded', 'failed'].map(outcome => ({
+    name: 'command.execute', traceparent: newTraceparent(), durationMs: 12, ageMs: 0,
+    attributes: { 'command.id': `${source}-${outcome}`, 'command.type': 'fan.level', 'command.source': source,
+      ...commandPayloadAttributes('fan.level', payload), outcome, 'error.kind': outcome === 'succeeded' ? 'none' : 'avr_timeout' }
+  })));
+  assert.equal((await f.request('/api/devices/board/telemetry', value)).status, 200);
+  await f.obs.provider.forceFlush();
+  const spans = f.exporter.getFinishedSpans().filter(span => span.name === 'command.execute');
+  assert.equal(spans.length, 4);
+  for (const event of value.events) {
+    const span = spans.find(span => span.attributes['command.id'] === event.attributes['command.id']);
+    const log = f.logs.find(log => log['command.id'] === event.attributes['command.id']);
+    for (const key of ['command.type', 'command.source', 'outcome']) {
+      assert.equal(span.attributes[key], event.attributes[key]);
+      assert.equal(log[key], event.attributes[key]);
+    }
+    assert.equal(log.level, event.attributes.outcome === 'succeeded' ? 'info' : 'error');
+    assert.equal(log.trace_id, span.spanContext().traceId);
+    assert.equal(log.span_id, span.spanContext().spanId);
+    assert.deepEqual(JSON.parse(span.attributes['command.payload']), payload);
+    assert.deepEqual(log['command.payload'], payload);
+  }
+});
+
+test('command payloads retain supported contents and exclude unrelated fields', () => {
+  const sessionId = 'a'.repeat(32);
+  for (const [type, payload] of [
+    ['device.ping', {}], ['fan.command', { button: 'power', sessionId }],
+    ['fan.level', { level: 0, sessionId }], ['fan.calibrate', { confirmOff: true, sessionId }],
+    ['fan.curve', { enabled: true, thresholdsC: [-1, 20, 24, 24, 30], hysteresisC: .5, sessionId }],
+    ['ir.send', { protocol: 'NEC', address: 56960, command: 22, repeats: 3, sessionId }]
+  ]) {
+    const attributes = { 'command.type': type, ...commandPayloadAttributes(type, { ...payload, token: 'private' }) };
+    assert.deepEqual(JSON.parse(attributes['command.payload']), payload);
+    const value = batch(); value.events[0].attributes = attributes;
+    assert.equal(validateTelemetry(value), true);
+  }
+  assert.deepEqual(commandPayloadAttributes('unknown', { token: 'private' }), {});
+  assert.deepEqual(JSON.parse(commandPayloadAttributes('fan.level', { level: true, sessionId: 'private' })['command.payload']), {});
+  const value = batch();
+  for (const payload of ['not json', 'x'.repeat(1025), 'null', '[]', '{"level":true}', '{"level":6}', '{"level":3,"token":"private"}']) {
+    value.events[0].attributes = { 'command.type': 'fan.level', 'command.payload': payload };
+    assert.equal(validateTelemetry(value), false);
+  }
+});
+
+test('HTTP log levels distinguish successful requests, client errors, and server errors', async t => {
+  const f = await fixture(t);
+  assert.equal((await f.request('/healthz')).status, 200);
+  assert.equal((await f.request('/api/devices/board/readings', { temperatureC: 22, humidity: 50 }, false)).status, 401);
+  f.store.db.exec('DROP TABLE readings');
+  assert.equal((await f.request('/api/devices/board/readings', { temperatureC: 22, humidity: 50 })).status, 500);
+  const levels = Object.fromEntries(f.logs.filter(log => log.operation === 'http.server').map(log => [log.status, log.level]));
+  assert.deepEqual(levels, { 200: 'info', 401: 'warn', 500: 'error' });
+});
+
+test('command metadata is optional for older agents and bounded for newer agents', () => {
+  const value = batch(), event = value.events[0];
+  assert.equal(validateTelemetry(value), true);
+  for (const attributes of [
+    { 'command.type': 'fan.level', 'command.source': 'automatic' },
+    { 'command.type': 'device.ping', 'command.source': 'manual' }
+  ]) assert.equal(validateTelemetry({ ...value, events: [{ ...event, attributes }] }), true);
+  for (const attributes of [
+    { 'command.type': 1 }, { 'command.type': 'x'.repeat(65) }, { 'command.type': 'payload with spaces' },
+    { 'command.source': 'untrusted' }, { 'command.source': 1 }, { payload: 'private' }
+  ]) assert.equal(validateTelemetry({ ...value, events: [{ ...event, attributes }] }), false);
+});
+
 test('command context survives reopening SQLite and redelivery, and result spans join it', async t => {
   const f = await fixture(t);
   const command = f.obs.run('command.request', {}, () => f.store.enqueue('board', 'device.ping', {}, 60));
@@ -63,6 +135,8 @@ test('command context survives reopening SQLite and redelivery, and result spans
   await f.obs.provider.forceFlush();
   const resultSpan = f.exporter.getFinishedSpans().find(span => span.name === 'command.result');
   assert.equal(resultSpan.spanContext().traceId, command.traceparent.slice(3, 35));
+  assert.equal(resultSpan.attributes['command.type'], 'device.ping');
+  assert.equal(resultSpan.attributes['command.source'], 'manual');
   assert.equal(f.store.command(command.id).status, 'failed');
 });
 
@@ -119,6 +193,16 @@ test('legacy pending commands receive context on first delivery and retain it on
   assert.ok(delivered.traceparent);
   f.store.db.prepare('UPDATE commands SET lease_until=0 WHERE id=?').run(command.id);
   assert.equal(f.store.claim('board', 1000).traceparent, delivered.traceparent);
+  await f.obs.provider.forceFlush();
+  const spans = f.exporter.getFinishedSpans().filter(span => ['command.queue_wait', 'command.delivery'].includes(span.name));
+  assert.equal(spans.length, 3);
+  for (const span of spans) {
+    assert.equal(span.attributes['command.type'], 'device.ping');
+    assert.equal(span.attributes['command.source'], 'manual');
+  }
+  const logs = f.logs.filter(log => log['command.id'] === command.id);
+  assert.equal(logs.length, 3);
+  assert.ok(logs.every(log => log['command.type'] === 'device.ping' && log['command.source'] === 'manual' && log.level === 'info'));
 });
 
 test('device, AVR and backend spans share one trace with server requests nested under the propagated client', async t => {
@@ -152,7 +236,8 @@ test('device, AVR and backend spans share one trace with server requests nested 
 
 test('command result persistence remains beneath the result-upload server span', async t => {
   const f = await fixture(t);
-  const command = f.store.enqueue('board', 'device.ping', {}, 60);
+  const payload = { button: 'power', sessionId: 'a'.repeat(32) };
+  const command = f.store.enqueue('board', 'fan.command', payload, 60);
   f.store.claim('board', 10000);
   const client = command.traceparent.slice(0, 36) + randomBytes(8).toString('hex') + '-01';
   assert.equal((await f.request(`/api/devices/board/commands/${command.id}/result`, { status: 'succeeded', result: { reply: 'pong' } }, true, client)).status, 200);
@@ -164,6 +249,12 @@ test('command result persistence remains beneath the result-upload server span',
   assert.equal(server.parentSpanContext.spanId, client.slice(36, 52));
   assert.equal(result.parentSpanContext.spanId, server.spanContext().spanId);
   assert.equal(db.parentSpanContext.spanId, result.spanContext().spanId);
+  for (const span of spans.filter(span => ['command.queue_wait', 'command.delivery', 'command.result'].includes(span.name))) {
+    assert.deepEqual(JSON.parse(span.attributes['command.payload']), payload);
+  }
+  for (const log of f.logs.filter(log => log['command.id'] === command.id)) {
+    assert.deepEqual(log['command.payload'], payload);
+  }
 });
 
 test('reject malformed explicit IDs and self-parent cycles while supporting legacy events', () => {

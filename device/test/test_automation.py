@@ -39,15 +39,25 @@ class AutomationTests(unittest.TestCase):
     def test_target_command_validates_level_and_matching_reply(self):
         with tempfile.TemporaryDirectory() as directory:
             bridge=Bridge();bridge.values['resac_command_ready']='v4'
-            processor=agent.CommandProcessor({},bridge,str(Path(directory)/'result.json'),automatic=True)
+            telemetry=agent.Telemetry({},bridge)
+            processor=agent.CommandProcessor({'_telemetry':telemetry},bridge,str(Path(directory)/'result.json'),automatic=True)
             request=command(type='fan.level',payload=dict(level=5,sessionId=SESSION))
             processor._accept(request);processor._arduino()
             self.assertEqual(bridge.sent,['v4,%s,auto_level,%s,5' % (request['id'],SESSION)])
             bridge.values['resac_command_result']='v4,%s,level_set,%s,4,1,123' % (request['id'],SESSION)
             processor.bridge_due=0;processor._arduino();self.assertIsNone(processor.reply)
             bridge.values['resac_command_result']='v4,%s,level_set,%s,5,5,123' % (request['id'],SESSION)
+            bridge.values['resac_command_diagnostic']='v1,%s,12,ok' % request['id']
             processor.bridge_due=0;processor._arduino()
             self.assertEqual(processor.reply['result']['presses'],5)
+            events=telemetry.events[:]
+            self.assertEqual([event['name'] for event in events],['command.local','bridge.dispatch','command.execute','avr.execute'])
+            for event in events:
+                self.assertEqual(event['attributes']['command.type'],'fan.level')
+                self.assertEqual(event['attributes']['command.source'],'automatic')
+                self.assertEqual(event['attributes']['command.id'],request['id'])
+                self.assertEqual(event['traceparent'],request['traceparent'])
+                self.assertEqual(agent.decode_json(event['attributes']['command.payload']),request['payload'])
             for level in [-1,6,True,2.5]:
                 processor._accept(command(type='fan.level',payload=dict(level=level,sessionId=SESSION)))
                 self.assertEqual(processor.reply['status'],'failed')
@@ -61,7 +71,8 @@ class AutomationTests(unittest.TestCase):
             path=str(Path(directory)/'curve.json');state_path=str(Path(directory)/'auto.json')
             commands=SimpleNamespace(current=None,reply=None)
             with patch.object(agent,'monotonic',lambda:clock[0]):
-                auto=agent.AutoController({},bridge,path,state_path)
+                telemetry=agent.Telemetry({},bridge)
+                auto=agent.AutoController({'_telemetry':telemetry},bridge,path,state_path)
                 settings=dict(enabled=True,thresholdsC=[22,24,26,28,30],hysteresisC=1)
                 auto.configure(settings);auto.tick(commands)
                 self.assertFalse(auto.busy,'Retained startup sample must not trigger IR')
@@ -75,6 +86,11 @@ class AutomationTests(unittest.TestCase):
                 bridge.values['resac_fan_state']='v2,%s,1,1,2,2,automatic' % SESSION
                 clock[0]+=1;auto.tick(commands)
                 self.assertFalse(auto.busy)
+                execution=next(event for event in telemetry.events if event['name']=='command.execute')
+                self.assertEqual(execution['attributes']['command.type'],'fan.level')
+                self.assertEqual(execution['attributes']['command.source'],'automatic')
+                self.assertEqual(execution['attributes']['command.id'],request_id)
+                self.assertEqual(agent.decode_json(execution['attributes']['command.payload']),dict(level=2,sessionId=SESSION))
                 clock[0]+=1;bridge.values['resac_sample']='v1,%s,3,30000,40000,3' % SESSION
                 auto.tick(commands);self.assertEqual(auto.target,5);self.assertEqual(auto.status,'cooldown')
                 clock[0]+=29;bridge.values['resac_sample']='v1,%s,4,30000,40000,4' % SESSION
