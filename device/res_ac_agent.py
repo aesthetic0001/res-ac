@@ -403,15 +403,112 @@ class Telemetry(object):
             self.request.close()
 
 
+def network_snapshot():
+    """Small local reads only: no probes, subprocesses, addresses or credentials."""
+    result = {'ipv4_default_route': 'unknown', 'interface_state': 'unknown'}
+    interface = None
+    try:
+        with open('/proc/net/route') as stream:
+            lines = stream.read(16384).splitlines()
+        if lines and lines[0].split()[:2] == ['Iface', 'Destination']:
+            result['ipv4_default_route'] = 'absent'
+            for line in lines[1:]:
+                fields = line.split()
+                if len(fields) >= 4 and fields[1] == '00000000' and int(fields[3], 16) & 1:
+                    interface = fields[0]
+                    result['ipv4_default_route'] = 'present'
+                    break
+    except (IOError, OSError, ValueError):
+        result['ipv4_default_route'] = 'unknown'
+    try:
+        with open('/proc/net/wireless') as stream:
+            lines = stream.read(4096).splitlines()[2:]
+        wireless = [line.split(':', 1) for line in lines if ':' in line]
+        selected = [fields for fields in wireless if fields[0].strip() == interface]
+        if not selected and interface is None and len(wireless) == 1:
+            selected = wireless
+            interface = selected[0][0].strip()
+        if selected:
+            fields = selected[0][1].split()
+            quality, signal_dbm = float(fields[1]), float(fields[2])
+            if 0 <= quality <= 255:
+                result['wifi_quality'] = quality
+            # Some drivers report unsigned/relative values; do not call those dBm.
+            if -130 <= signal_dbm < 0:
+                result['wifi_signal_dbm'] = signal_dbm
+    except (IOError, OSError, ValueError, IndexError):
+        pass
+    if interface and re.match(r'^[A-Za-z0-9_.:-]{1,15}$', interface):
+        try:
+            with open('/sys/class/net/' + interface + '/operstate') as stream:
+                state = stream.read(32).strip()
+            if state in ('up', 'down', 'dormant', 'notpresent', 'lowerlayerdown', 'testing', 'unknown'):
+                result['interface_state'] = state
+        except (IOError, OSError):
+            pass
+    return result
+
+
+def curl_diagnostics(output, errors, code):
+    """Export only fixed categories and validated numbers, never curl's raw text."""
+    attributes = {}
+    try:
+        fields = output.decode('ascii', 'replace').strip().split()
+        status = int(fields[0])
+        if not 0 <= status <= 599:
+            status = 0
+    except (ValueError, IndexError, AttributeError):
+        fields, status = [], 0
+    timings = ['dns', 'connect', 'tls', 'first_byte', 'total']
+    if len(fields) == 6:
+        for name, field in zip(timings, fields[1:]):
+            try:
+                seconds = float(field)
+                if 0 <= seconds <= 86400:
+                    attributes['http.timing.' + name + '_ms'] = seconds * 1000
+            except ValueError:
+                pass
+    if code or not status or status >= 400:
+        message = errors[:4096].decode('utf-8', 'replace').lower()
+        # Only transport errors use these phrases: HTTP response text is never read.
+        reason = {6: 'dns_resolution', 7: 'connect_failed', 28: 'timeout',
+                  35: 'tls_handshake', 60: 'tls_certificate'}.get(code, 'transport_other') if code else ('http_error' if status else 'invalid_response')
+        if code:
+            for phrase, category in [('connection refused', 'connection_refused'),
+                                     ('network is unreachable', 'network_unreachable'),
+                                     ('no route to host', 'host_unreachable'),
+                                     ('connection reset', 'connection_reset'),
+                                     ('broken pipe', 'broken_pipe')]:
+                if phrase in message:
+                    reason = category
+                    break
+        stage = {6: 'dns', 7: 'connect', 35: 'tls', 60: 'tls'}.get(code, 'unknown')
+        if not code:
+            stage = 'http' if status else 'local'
+        elif code == 28:
+            # Completed phase times are evidence; a zero does not distinguish
+            # an unfinished DNS lookup from an unfinished TCP connection.
+            stage = 'response' if attributes.get('http.timing.tls_ms', 0) > 0 else (
+                'tls' if attributes.get('http.timing.connect_ms', 0) > 0 else 'connect_or_dns')
+        attributes.update({'error.reason': reason, 'error.stage': stage})
+    return status, attributes
+
+
 class CurlUpload(object):
     """A bounded curl subprocess; polling completion never waits for the network."""
     def __init__(self, config, payload=None, route='readings', method='POST', timeout=25):
         self.process = None
         self.files = []
-        self.telemetry = config.get('_telemetry') if route != 'telemetry' else None
+        self.telemetry = config.get('_telemetry')
         self.started = monotonic()
         self.reported = False
         self.kind = 'result' if route.endswith('/result') else route
+        self.network_start = {}
+        if self.telemetry is not None:
+            try:
+                self.network_start = network_snapshot()
+            except Exception:
+                pass
         supplied = (payload or {}).get('traceparent')
         self.root_request = not (isinstance(supplied, (str, text_type)) and re.match(TRACEPARENT, supplied))
         self.parent = traceparent() if self.root_request else supplied
@@ -434,7 +531,8 @@ class CurlUpload(object):
             arguments = [config.get('curl_binary', 'curl'), '--config', header_path, '--cacert', config['ca_file'],
                          '--silent', '--show-error', '--connect-timeout', '10', '--max-time', str(timeout),
                          '--max-filesize', '32768', '--request', method, '--header', 'Content-Type: application/json',
-                         '--output', self.response_path, '--write-out', '%{http_code}']
+                         '--output', self.response_path, '--write-out',
+                         '%{http_code} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total}']
             if payload is not None:
                 payload_fd, payload_path = temporary('res-ac-payload-')
                 self.files.append(payload_path)
@@ -448,29 +546,39 @@ class CurlUpload(object):
             self.process.stdin.close()
             self.process.stdin = None
         except BaseException:
-            self._report(0, 0)
+            self._report(0, 0, {'error.reason': 'request_setup', 'error.stage': 'local'})
             self.close()
             raise
 
-    def _report(self, status, code):
+    def _report(self, status, code, diagnostics=None):
         if self.reported or self.telemetry is None:
             return
         self.reported = True
+        # Telemetry attempts join the next ordinary scheduled batch. Reporting
+        # an event never starts an upload or changes the heartbeat/backoff.
         outcome = ('ok' if 200 <= status < 300 else 'failed') if not code else {6: 'dns', 7: 'connect', 28: 'timeout', 35: 'tls', 60: 'tls'}.get(code, 'other')
+        attributes = {'outcome': outcome, 'curl.code': code, 'http.status_code': status, 'request.kind': self.kind}
+        attributes.update(diagnostics or {})
+        if outcome != 'ok':
+            try:
+                attributes.update(('network.start.' + key, value) for key, value in getattr(self, 'network_start', {}).items())
+                attributes.update(('network.' + key, value) for key, value in network_snapshot().items())
+            except Exception:
+                # Losing optional context must not mask the request failure.
+                pass
         self.telemetry.event('http.request' if self.root_request else 'http.device', self.parent, monotonic() - self.started,
-                             {'outcome': outcome, 'curl.code': code, 'http.status_code': status, 'request.kind': self.kind}, span_id=self.request_traceparent[36:52])
+                             attributes, span_id=self.request_traceparent[36:52])
 
     def finish(self):
         output, errors = self.process.communicate()
+        status, diagnostics = curl_diagnostics(output, errors, self.process.returncode)
         if self.process.returncode:
-            self._report(0, self.process.returncode)
+            self._report(status, self.process.returncode, diagnostics)
             raise UploadError(curl_code=self.process.returncode)
-        try:
-            status = int(output.strip())
-        except ValueError:
-            self._report(0, 0)
+        if not status:
+            self._report(0, 0, diagnostics)
             raise UploadError()
-        self._report(status, 0)
+        self._report(status, 0, diagnostics)
         with open(self.response_path, 'rb') as stream:
             return status, stream.read(32768)
 

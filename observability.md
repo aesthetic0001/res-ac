@@ -89,6 +89,45 @@ Telemetry is best effort, not a forensic guarantee; report drops and heartbeat
 loss. Start with full tracing at this deployment's small volume. Limit history to
 7 days for traces/logs and 15 days for metrics; adjust disk budgets as needed.
 
+### Diagnosing device HTTP failures
+
+Each HTTP attempt retains curl's cumulative DNS, TCP-connect, TLS, first-byte,
+and total times as `http.timing.*_ms`. These are milestones from request start,
+not independent durations to add together. Failed attempts also include
+`error.stage` and an allowlisted `error.reason` extracted from curl's error
+output (for example `connection_refused`, `network_unreachable`,
+`host_unreachable`, or `tls_certificate`). Raw stderr, URLs, headers and response
+bodies are never exported. A generic curl message remains `connect_failed`;
+missing detail is not replaced with an inferred cause.
+
+Failures include `network.start.*` and `network.*` snapshots at request start and
+completion: IPv4 default-route presence, interface operational state, and wireless
+quality/signal when available. They use bounded local procfs/sysfs reads without
+network probes or subprocesses. Missing or unreadable state is unknown, not proof
+that a route/interface was down. IPv4 route presence is contextual evidence, not
+a check of the selected route or IPv6 reachability. Snapshots cannot capture every
+brief state change, and an interface reported up does not prove upstream access.
+
+Diagnostic upload attempts report themselves into the same bounded queue and
+appear in a subsequent scheduled batch. These events never trigger additional
+uploads or change the heartbeat/backoff. Request metrics identify these as kind
+`telemetry`, including successes so its success percentage has a denominator.
+Device event/request counters are initialized
+at zero so the first isolated failure can be measured against an earlier scrape.
+Failures before that first scrape still require logs for an exact count.
+
+Inspect failed HTTP events in Loki, expand their fields, and follow TraceID:
+
+```logql
+{service_name="res-ac"} | json | operation=~"http.request|http.device" | outcome!="ok"
+```
+
+Deploy the backend first so validation accepts these optional fields, then the
+agent. Older agents remain compatible. Historical events cannot gain evidence
+that was never captured. These changes improve device transport diagnostics;
+VPS disk latency, filesystem stalls, and external network failures still need
+host or network-side evidence for attribution.
+
 ## Deployment and access
 
 See backend/observability/README.md for the optional Compose overlay, Grafana

@@ -30,6 +30,56 @@ const batch = (parent = newTraceparent()) => ({ session: randomBytes(16).toStrin
   { name: 'http.device', traceparent: parent, durationMs: 25, ageMs: 100, attributes: { outcome: 'tls', 'curl.code': 60, 'request.kind': 'readings' } }
 ] });
 
+test('connection evidence survives validation, logs and traces without widening arbitrary attributes', async t => {
+  const f = await fixture(t), value = batch();
+  const attributes = { outcome: 'connect', 'curl.code': 7, 'http.status_code': 0, 'request.kind': 'telemetry',
+    'error.reason': 'network_unreachable', 'error.stage': 'connect',
+    'http.timing.dns_ms': 1, 'http.timing.connect_ms': 0, 'http.timing.tls_ms': 0,
+    'http.timing.first_byte_ms': 0, 'http.timing.total_ms': 1360,
+    'network.start.ipv4_default_route': 'present', 'network.start.interface_state': 'up',
+    'network.start.wifi_quality': 70, 'network.start.wifi_signal_dbm': -42,
+    'network.ipv4_default_route': 'absent', 'network.interface_state': 'down',
+    'network.wifi_quality': 0, 'network.wifi_signal_dbm': -90 };
+  value.events[0].attributes = attributes;
+  assert.equal((await f.request('/api/devices/board/telemetry', value)).status, 200);
+  await f.obs.provider.forceFlush();
+  const span = f.exporter.getFinishedSpans().find(span => span.name === 'http.device');
+  const log = f.logs.find(log => log.operation === 'http.device');
+  for (const [key, val] of Object.entries(attributes)) {
+    assert.equal(span.attributes[key], val);
+    assert.equal(log[key], val);
+  }
+  assert.match(await f.obs.registry.metrics(), /resac_device_requests_total\{device="board",kind="telemetry",outcome="connect"\} 1/);
+  for (const invalid of [
+    { 'error.reason': 'Connection refused at private.example TOKEN' }, { 'error.stage': 'arbitrary' },
+    { 'network.ipv4_default_route': true }, { 'network.interface_state': 'wlan0: private' },
+    { 'network.wifi_signal_dbm': -131 }, { 'network.wifi_signal_dbm': 'private' },
+    { 'network.wifi_quality': 256 }, { 'http.timing.total_ms': NaN },
+    { 'http.timing.connect_ms': -1 }, { 'http.timing.total_ms': 86400_001 },
+    { 'network.raw': 'private' }, { 'error.message': 'private' }
+  ]) assert.equal(validateTelemetry({ ...value, events: [{ ...value.events[0], attributes: invalid }] }), false);
+  assert.equal(validateTelemetry({ ...value, events: [{ ...value.events[0], name: 'sensor.read' }] }), false);
+});
+
+test('configured devices expose zero failure counters before their first failure', async t => {
+  const f = await fixture(t);
+  f.obs.collect(f.store, f.config);
+  const requestCounter = /resac_device_requests_total\{device="board",kind="fan-state",outcome="connect"\} (\d+)/;
+  const eventCounter = /resac_device_events_total\{device="board",operation="http.request",outcome="connect"\} (\d+)/;
+  const before = await f.obs.registry.metrics();
+  assert.equal(before.match(requestCounter)[1], '0');
+  assert.equal(before.match(eventCounter)[1], '0');
+  const value = batch();
+  value.events[0].name = 'http.request';
+  value.events[0].attributes = { outcome: 'connect', 'request.kind': 'fan-state', 'curl.code': 7 };
+  f.obs.ingest('board', value);
+  f.obs.collect(f.store, f.config); // Collection must not reset accumulated events.
+  f.obs.ingest('board', value); // Nor may a retried batch duplicate the first failure.
+  const after = await f.obs.registry.metrics();
+  assert.equal(after.match(requestCounter)[1], '1');
+  assert.equal(after.match(eventCounter)[1], '1');
+});
+
 test('authenticated diagnostics validate atomically, deduplicate retries, and correlate network failures', async t => {
   const f = await fixture(t), value = batch();
   assert.equal((await f.request('/api/devices/board/telemetry', value, false)).status, 401);
