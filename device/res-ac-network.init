@@ -1,0 +1,10 @@
+#!/bin/sh /etc/rc.common
+START=96
+STOP=9
+
+start() {
+    start-stop-daemon -S -b -m -p /var/run/res-ac-network.pid -x /usr/bin/python -- /usr/lib/res-ac/network_watchdog.py
+}
+stop() {
+    start-stop-daemon -K -p /var/run/res-ac-network.pid
+}

@@ -64,6 +64,17 @@ honors `defaultroute=0`. It adds only a missing route, using netifd's static-rou
 protocol so normal lease cleanup can remove it. It never embeds or pins a campus
 gateway, replaces another route, or resets Wi-Fi to recover from this bug.
 
+An independent `/etc/init.d/res-ac-network` watchdog checks the local eduroam
+uplink every 30 seconds. If it stays without an IPv4 lease/default route for
+two minutes, it restarts the configured Wi-Fi radio. It first repairs a missing
+route from netifd's current lease when possible. Repeated radio recovery attempts
+wait 5, 10, 20, then 30 minutes; five minutes of a healthy uplink resets that
+backoff. Short outages and backend/HTTPS failures alone do not restart Wi-Fi.
+The watchdog respects disabled eduroam/radio settings, `ifdown wwan`, and
+`auto=0`/`defaultroute=0`. It changes no credentials or persistent network settings
+and never reboots the board. The radio restart affects every interface on that
+radio. State changes/recovery attempts are logged with the `res-ac-network` tag.
+
 ## Reporting and retries
 
 The default reporting interval is 10 seconds and can be changed in the private
@@ -136,7 +147,13 @@ In the Linux console (via SSH, or after restoring the recovery sketch):
 python /usr/lib/res-ac/res_ac_agent.py --probe
 /etc/init.d/res-ac-agent restart
 tail -n 20 /tmp/res-ac-agent.log
+python /usr/lib/res-ac/network_watchdog.py --check
+logread | grep res-ac-network
 ```
+
+The watchdog is enabled at boot by the installer. Stop it with
+`/etc/init.d/res-ac-network stop`; run `/etc/init.d/res-ac-network disable` to
+keep it off after a reboot.
 
 Use `--probe` only to verify connectivity/authentication; it inserts no test
 reading. Do not run a second full agent alongside the startup service. Use the
