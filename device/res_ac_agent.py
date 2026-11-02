@@ -33,11 +33,11 @@ try:
 except NameError:
     integer_types = (int,)
 
-# SC15T captures: https://randomblock1.com/blog/smartifying-dumb-fan
-# Treat as a starting profile, pending verification on PCF-SC15T-CT.
+# Power/speed codes corrected for PCF-SC15T-CT. Other codes remain provisional.
+# 0x16 is speed up, so the old profile's vertical alias is not supported.
 FAN_ADDRESS = 0xDE80
-FAN_BUTTONS = dict(power=0x00, speed_up=0x08, speed_down=0x10, breeze=0x09,
-                   horizontal=0x15, vertical=0x16, timer_1h=0x12,
+FAN_BUTTONS = dict(power=0x00, speed_up=0x16, speed_down=0x14, breeze=0x09,
+                   horizontal=0x15, timer_1h=0x12,
                    timer_2h=0x0e, timer_4h=0x0a)
 
 
@@ -760,7 +760,7 @@ class CommandProcessor(object):
                     payload = command.get('payload')
                     if (not isinstance(payload, dict) or payload.get('confirmOff') is not True or
                             set(payload) != set(['confirmOff', 'sessionId'])):
-                        raise ValueError('Confirm the fan was restarted and left off')
+                        raise ValueError('Confirm the fan is off with saved speed 1')
                 elif command['type'] == 'fan.level':
                     payload = command.get('payload')
                     if (not isinstance(payload, dict) or set(payload) != set(['level', 'sessionId']) or
@@ -779,15 +779,17 @@ class CommandProcessor(object):
                 if ready not in ('v3', 'v4'):
                     raise ValueError('Arduino firmware does not support calibration; upgrade sketch')
                 if command['type'] in ('fan.level', 'fan.curve') and ready != 'v4':
-                    raise ValueError('Upgrade firmware for cyclic levels and automatic curves')
+                    raise ValueError('Upgrade firmware for target levels and automatic curves')
                 self.session_id = command['payload'].get('sessionId')
                 state = parse_fan_state(self.bridge.get('resac_fan_state'))
                 if (not isinstance(self.session_id, (str, text_type)) or
                         not re.match(r'^[a-f0-9]{32}$', self.session_id) or state['sessionId'] != self.session_id):
-                    raise ValueError('Fan session changed; restart fan to factory position: off and recalibrate')
+                    raise ValueError('Fan session changed; set speed to 1, turn fan off and recalibrate')
                 disabling = command['type'] == 'fan.curve' and command['payload']['enabled'] is False
                 if not self.calibrating and not disabling and not state['calibrated']:
-                    raise ValueError('Calibration required: restart fan to factory position: off')
+                    raise ValueError('Calibration required: set speed to 1, then turn fan off')
+                if self.ir and self.ir[0] == FAN_ADDRESS and self.ir[1] in (0x16, 0x14) and state['power'] != 'on':
+                    raise ValueError('Turn the fan on before changing speed')
                 if command['type'] == 'fan.curve':
                     if self.curve_handler is None:
                         raise ValueError('Automatic controller unavailable')
@@ -836,14 +838,14 @@ class CommandProcessor(object):
                 return
             if self.ir or self.calibrating or self.target_level is not None:
                 if fields == ['v3', self.current['id'], 'rejected', self.session_id]:
-                    self._complete('failed', dict(error='Calibration required or session changed; restart fan to factory position: off'))
+                    self._complete('failed', dict(error='Fan command rejected; check power, session and calibration (off with saved speed 1)'))
                     return
                 if self.calibrating and fields == ['v3', self.current['id'], 'calibrated', self.session_id]:
                     self._complete('succeeded', dict(reply='calibrated', sessionId=self.session_id, fanStateConfirmed=False))
                     return
                 if (self.target_level is not None and len(fields) == 7 and
                         fields[:5] == ['v4', self.current['id'], 'level_set', self.session_id, str(self.target_level)] and
-                        re.match(r'^[0-3]$', fields[5]) and re.match(r'^\d{1,10}$', fields[6]) and int(fields[6]) <= 0xffffffff):
+                        re.match(r'^[0-5]$', fields[5]) and re.match(r'^\d{1,10}$', fields[6]) and int(fields[6]) <= 0xffffffff):
                     self._complete('succeeded', dict(reply='level_set', level=self.target_level, presses=int(fields[5]),
                                                    uptimeMs=int(fields[6]), fanStateConfirmed=False))
                     return

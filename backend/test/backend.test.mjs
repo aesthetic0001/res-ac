@@ -80,7 +80,7 @@ test('device tokens are scoped and readings are validated and deduplicated', asy
 test('fan remote buttons queue short-lived commands and expose transmission results without inferred state', async t => {
   const f = await fixture(t), auth = await f.login();
   const sessionId = randomBytes(16).toString('hex');
-  f.store.setFanState('board-1', { sessionId, calibrated: true, power: 'off', speed: 0, revision: 1 });
+  f.store.setFanState('board-1', { sessionId, calibrated: true, power: 'on', speed: 1, revision: 1 });
   for (const button of ['power', 'speed_down', 'speed_up']) {
     const response = await f.request('/api/admin/devices/board-1/commands', {
       method: 'POST', headers: { cookie: auth.cookie, 'x-csrf-token': auth.csrf, 'content-type': 'application/json' },
@@ -100,6 +100,21 @@ test('fan remote buttons queue short-lived commands and expose transmission resu
     const state = await (await f.request('/api/admin/state', { headers: { cookie: auth.cookie } })).json();
     assert.deepEqual(state.commands.find(command => command.id === queued.id).result, result);
   }
+});
+
+test('speed presses require power on while absolute levels can power on first', async t => {
+  const f = await fixture(t), auth = await f.login(), sessionId = randomBytes(16).toString('hex');
+  const state = { sessionId, calibrated: true, power: 'off', speed: 0, revision: 1, firmwareVersion: 'v4' };
+  f.store.setFanState('board-1', state);
+  const queue = (type, payload) => f.request('/api/admin/devices/board-1/commands', { method: 'POST',
+    headers: { cookie: auth.cookie, 'x-csrf-token': auth.csrf, 'content-type': 'application/json' }, body: JSON.stringify({ type, payload: { ...payload, sessionId } }) });
+  for (const button of ['speed_up', 'speed_down']) assert.equal((await queue('fan.command', { button })).status, 409);
+  for (const command of [0x16, 0x14]) assert.equal((await queue('ir.send', { protocol: 'NEC', address: 0xDE80, command })).status, 409);
+  assert.equal((await queue('fan.command', { button: 'power' })).status, 201);
+  assert.equal((await queue('fan.level', { level: 5 })).status, 201);
+  f.store.setFanState('board-1', { ...state, power: 'on', speed: 1, revision: 2 });
+  for (const button of ['speed_up', 'speed_down']) assert.equal((await queue('fan.command', { button })).status, 201);
+  for (const command of [0x16, 0x14]) assert.equal((await queue('ir.send', { protocol: 'NEC', address: 0xDE80, command })).status, 201);
 });
 
 test('calibration gates remote requests, is session-bound, and stale telemetry cannot unlock controls', async t => {
@@ -145,7 +160,7 @@ test('long polling returns 204 when empty and wakes immediately for new commands
   assert.equal((await response.json()).commands[0].id, queued.id);
 });
 
-test('cyclic target levels and temperature curves validate inputs and remain calibration/session gated', async t => {
+test('target levels and temperature curves validate inputs and remain calibration/session gated', async t => {
   const f=await fixture(t),auth=await f.login(),sessionId=randomBytes(16).toString('hex');
   const settings={enabled:true,thresholdsC:[22,24,26,28,30],hysteresisC:1};
   const queue=(type,payload)=>f.request('/api/admin/devices/board-1/commands',{method:'POST',headers:{cookie:auth.cookie,'x-csrf-token':auth.csrf,'content-type':'application/json'},body:JSON.stringify({type,payload})});

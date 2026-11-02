@@ -108,7 +108,7 @@ checks this key every 250 ms and returns `v1,<command-UUID>,pong,<uptime-ms>` in
 `resac_command_result`. Linux requires a matching UUID and Arduino response;
 it does not answer ping on the Arduino's behalf.
 Polling starts only after the Arduino advertises its handler through Bridge.
-The cyclic-level sketch advertises `v4`; `v3` supports calibrated raw IR,
+The target-level sketch advertises `v4`; `v3` supports calibrated raw IR,
 while old `v1`/`v2` sketches support ping only
 with the updated agent. IR requires a current session and calibrated estimate.
 
@@ -175,7 +175,8 @@ the HTTPS poll/result exchange with a simulated Arduino, stale acknowledgments,
 execution timeout, unsupported commands, retry identity, and restart recovery.
 IR tests cover button codes, payload validation, expiry, matching AVR responses,
 and preventing replay after interrupted transmission or AVR reset.
-Curve tests cover all 25 cyclic routes, threshold/hysteresis behavior, fresh
+Curve tests cover all 25 direct speed routes, clamped limits, off-state speed
+blocking, remembered speed across power toggles, threshold/hysteresis behavior, fresh
 sensor requirements, adjustment dwell, manual override, settings persistence,
 and sharing the command mailbox. Native estimate tests require a host C++ compiler.
 

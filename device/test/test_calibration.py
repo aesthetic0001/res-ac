@@ -9,48 +9,106 @@ from test_ir import Bridge, SESSION, command
 
 
 class CalibrationTests(unittest.TestCase):
-    def test_estimate_core_starts_locked_wraps_speed_and_loses_state(self):
+    def run_native(self, source):
         root = Path(__file__).resolve().parents[2]
-        source = r'''
-        #include <cassert>
-        #include "FanState.h"
-        int main() {
-          FanState f;
-          assert(!f.calibrated()); assert(!f.afterSend(0xDE80, 0, 0));
-          f.calibrateOff(); assert(!f.power() && f.speed()==0);
-          f.afterSend(0xDE80, 0, 0); assert(f.power() && f.speed()==1);
-          for(int i=0;i<10;++i) f.afterSend(0xDE80, 8, 0);
-          assert(f.speed()==1);
-          f.afterSend(0xDE80, 16, 0); assert(f.speed()==5);
-          f.afterSend(0xDE80, 0, 0); assert(!f.power());
-          f.afterSend(0xDE80, 0, 0); assert(f.speed()==5);
-          for(int i=0;i<10;++i) f.afterSend(0xDE80, 16, 0);
-          assert(f.speed()==5);
-          for(int i=0;i<4;++i) f.afterSend(0xDE80, 16, 0);
-          assert(f.speed()==1);
-          for(int from=1;from<=5;++from) for(int to=1;to<=5;++to) {
-            int route=FanState::shortestRoute(from,to);
-            assert(route>=-2 && route<=2);
-            assert(((from-1+route+5)%5)+1==to);
-            int forward=(to-from+5)%5,backward=(from-to+5)%5;
-            assert((route<0?-route:route)==(forward<backward?forward:backward));
-          }
-          assert(FanState::shortestRoute(3,4)==1);
-          assert(FanState::shortestRoute(1,5)==-1);
-          assert(FanState::shortestRoute(5,1)==1);
-          assert(f.afterSend(0xDE80, 21, 0));
-          assert(!f.afterSend(0xDE80, 18, 0)); assert(!f.calibrated());
-          f.calibrateOff(); assert(!f.afterSend(0xDE80, 9, 0));
-          f.calibrateOff(); assert(!f.afterSend(0xDE80, 8, 1));
-          f.calibrateOff(); assert(!f.afterSend(123, 0, 0));
-          f.calibrateOff(); f.reset(); assert(!f.calibrated());
-        }'''
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'fan.cpp'
             path.write_text(source)
             binary = str(Path(directory) / 'fan-test')
             subprocess.run([shutil.which('g++') or 'g++', '-std=c++11', '-I'+str(root/'include'), str(path), '-o', binary], check=True)
             subprocess.run([binary], check=True)
+
+    def test_estimate_clamps_speed_ignores_off_presses_and_remembers_speed(self):
+        self.run_native(r'''
+        #include <cassert>
+        #include <initializer_list>
+        #include "FanState.h"
+        int main() {
+          FanState f;
+          assert(!f.calibrated()); assert(!f.afterSend(0xDE80, 0, 0));
+          f.calibrateOff(); assert(!f.power() && f.speed()==0);
+          f.afterSend(0xDE80, 0x16, 0);
+          f.afterSend(0xDE80, 0x14, 0);
+          f.afterSend(0xDE80, 0, 0); assert(f.power() && f.speed()==1);
+          f.afterSend(0xDE80, 0x14, 0); assert(f.speed()==1);
+          for(int i=0;i<10;++i) f.afterSend(0xDE80, 0x16, 0);
+          assert(f.speed()==5);
+          f.afterSend(0xDE80, 0, 0); assert(!f.power() && f.speed()==0);
+          for(int i=0;i<10;++i) f.afterSend(0xDE80, 0x14, 0);
+          f.afterSend(0xDE80, 0, 0); assert(f.speed()==5);
+          for(int i=0;i<10;++i) f.afterSend(0xDE80, 0x14, 0);
+          assert(f.speed()==1);
+          for(int from=1;from<=5;++from) for(int to=1;to<=5;++to) {
+            int steps=FanState::speedSteps(from,to);
+            assert(steps==to-from);
+            f.calibrateOff(); f.afterSend(0xDE80, 0, 0);
+            for(int i=1;i<from;++i) f.afterSend(0xDE80, 0x16, 0);
+            for(int i=0;i<(steps<0?-steps:steps);++i)
+              f.afterSend(0xDE80, steps<0?0x14:0x16, 0);
+            assert(f.speed()==to);
+            f.afterSend(0xDE80, 0, 0); f.afterSend(0xDE80, 0, 0);
+            assert(f.speed()==to);
+          }
+          assert(FanState::speedSteps(1,5)==4);
+          assert(FanState::speedSteps(5,1)==-4);
+          assert(f.afterSend(0xDE80, 0x15, 0));
+          for(int code : {0x08, 0x10, 0x12, 0x09}) {
+            f.calibrateOff(); assert(!f.afterSend(0xDE80, code, 0)); assert(!f.calibrated());
+          }
+          f.calibrateOff(); assert(!f.afterSend(0xDE80, 0x16, 1));
+          f.calibrateOff(); assert(!f.afterSend(123, 0, 0));
+          f.calibrateOff(); f.reset(); assert(!f.calibrated());
+          f.calibrateOff(); f.afterSend(0xDE80, 0, 0); assert(f.speed()==1);
+        }''')
+
+    def test_firmware_targets_power_on_before_stepping_and_never_wrap(self):
+        root = Path(__file__).resolve().parents[2]
+        firmware = (root / 'src/main.cpp').read_text()
+        control = firmware[firmware.index('bool sendFanIR('):firmware.index('bool validCommandId(')]
+        self.run_native(r'''
+        #include <cassert>
+        #include <vector>
+        #include "FanState.h"
+        #define F(s) s
+        #define HEX 16
+        FanState fan;
+        const char *fanControlSource = "reset";
+        unsigned long fanRevision = 0;
+        std::vector<int> sent;
+        struct {
+          template<typename... Args> void print(Args...) {}
+          template<typename... Args> void println(Args...) {}
+        } Serial;
+        struct {
+          void sendNEC(uint16_t address, uint8_t command, uint8_t repeats) { sent.push_back(command); }
+        } IrSender;
+        void publishFanState() {}
+        void invalidateFan() { fan.reset(); }
+        void delay(unsigned long) {}
+        ''' + control + r'''
+        int main() {
+          uint8_t presses;
+          assert(!setFanLevel(1, false, presses)); assert(sent.empty());
+          fan.calibrateOff();
+          assert(!sendFanIR(0xDE80, 0x16, 0)); assert(sent.empty());
+          assert(!sendFanIR(0xDE80, 0x14, 0)); assert(sent.empty());
+          assert(setFanLevel(5, true, presses)); assert(presses==5);
+          assert((sent==std::vector<int>{0,0x16,0x16,0x16,0x16}));
+          assert(fan.speed()==5);
+          for(int from=1;from<=5;++from) for(int to=1;to<=5;++to) {
+            assert(setFanLevel(from, false, presses));
+            sent.clear();
+            assert(setFanLevel(to, false, presses));
+            assert(presses==(from<to?to-from:from-to)); assert(fan.speed()==to);
+            for(int code : sent) assert(code==(from<to?0x16:0x14));
+            assert(setFanLevel(0, false, presses)); assert(presses==1 && !fan.power());
+            sent.clear();
+            assert(setFanLevel(0, false, presses)); assert(presses==0 && sent.empty());
+            assert(setFanLevel(to, false, presses)); assert(presses==1 && fan.speed()==to);
+            assert((sent==std::vector<int>{0}));
+          }
+          sent.clear(); assert(!setFanLevel(6, false, presses)); assert(sent.empty());
+        }''')
 
     def test_uncalibrated_and_old_session_commands_do_not_reach_mailbox(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -100,7 +158,7 @@ class CalibrationTests(unittest.TestCase):
             processor.bridge_due = 0
             processor._arduino()
             self.assertEqual(processor.reply['status'], 'failed')
-            self.assertIn('session changed', processor.reply['result']['error'])
+            self.assertIn('session', processor.reply['result']['error'])
 
     def test_reporter_initializes_watchdog_and_uploads_live_state(self):
         bridge = Bridge()

@@ -80,7 +80,9 @@ function renderRemote() {
     ? 'Calibration required' : fan.power === 'on' ? `Estimated: On · Speed ${fan.speed} / 5` : 'Estimated: Off';
   el('#remote-device-select').disabled = !backendAvailable || remoteSending || !dashboardState?.devices.length;
   for (const button of document.querySelectorAll('[data-fan-button]')) {
-    button.disabled = !backendAvailable || !calibrated || remoteSending || pending || (button.dataset.fanButton !== 'power' && fan.power !== 'on');
+    const action = button.dataset.fanButton;
+    button.disabled = !backendAvailable || !calibrated || remoteSending || pending || (action !== 'power' && fan.power !== 'on')
+      || (action === 'speed_down' && fan?.speed === 1) || (action === 'speed_up' && fan?.speed === 5);
   }
   for (const button of document.querySelectorAll('[data-fan-level]')) {
     button.disabled = !backendAvailable || !calibrated || fan.firmwareVersion !== 'v4' || remoteSending || pending;
@@ -97,7 +99,7 @@ function renderRemote() {
   if (!device) { status.textContent = 'Add a device to use the remote.'; return; }
   const command = commands[0];
   if (!calibrated && (!command || !['fan.calibrate', 'fan.curve'].includes(command.type) || command.payload.sessionId !== fan?.sessionId)) {
-    status.textContent = fresh ? 'Remote locked. Restart the fan to factory position: off, then confirm calibration.' : 'Remote locked while waiting for current device state.';
+    status.textContent = fresh ? 'Remote locked. Set the fan to speed 1, turn it off, then confirm calibration.' : 'Remote locked while waiting for current device state.';
     return;
   }
   if (!command) { status.textContent = calibrated ? 'Ready. Aim the IR emitter at the fan.' : 'Remote locked until the fan is calibrated.'; return; }
@@ -182,8 +184,8 @@ function renderAutomatic(device, fresh, calibrated, pending) {
   el('#save-curve').disabled = !available || remoteSending || pending || (el('#curve-enabled').checked && !calibrated);
   for (const input of el('#curve-form').querySelectorAll('input, select')) input.disabled = remoteSending || pending;
   drawCurve(remoteSending || pending);
-  const messages = { disabled: 'Automatic mode is off.', manual_override: 'Automatic mode stopped by a manual command.', calibration_required: 'Automatic mode paused: calibration required.', waiting_for_sample: 'Waiting for a new temperature reading.', sensor_unavailable: 'Automatic mode paused: temperature reading unavailable or stale.', waiting_for_device: 'Waiting for the device command handler.', cooldown: 'Waiting for the 30-second adjustment interval.', adjusting: 'Moving to the target level using the shortest route.', active: 'Automatic mode active.', command_error: 'Automatic mode stopped after an uncertain command. Recalibrate before enabling it.', config_error: 'Saved curve could not be read. Apply a new curve.' };
-  el('#automatic-status').textContent = !available ? 'Waiting for fresh device settings and firmware with cyclic-level support.' : automatic
+  const messages = { disabled: 'Automatic mode is off.', manual_override: 'Automatic mode stopped by a manual command.', calibration_required: 'Automatic mode paused: calibration required.', waiting_for_sample: 'Waiting for a new temperature reading.', sensor_unavailable: 'Automatic mode paused: temperature reading unavailable or stale.', waiting_for_device: 'Waiting for the device command handler.', cooldown: 'Waiting for the 30-second adjustment interval.', adjusting: 'Stepping to the target level.', active: 'Automatic mode active.', command_error: 'Automatic mode stopped after an uncertain command. Recalibrate before enabling it.', config_error: 'Saved curve could not be read. Apply a new curve.' };
+  el('#automatic-status').textContent = !available ? 'Waiting for fresh device settings and firmware with target-level support.' : automatic
     ? `${messages[automatic.status] || 'Waiting for automatic status'}${automatic.targetLevel === null ? '' : ` Target: ${automatic.targetLevel === 0 ? 'Off' : `level ${automatic.targetLevel}`}.`}` : 'Automatic mode is off.';
 }
 el('#curve-preset').addEventListener('change', () => {

@@ -170,10 +170,13 @@ export function createApp(config, store, observability) {
           const fan = store.fanState(deviceId);
           if (!fan || Date.now() - fan.receivedAt > 30_000 || !fan.sessionId || value.payload.sessionId !== fan.sessionId)
             throw new HttpError(409, 'Fan status is missing, stale, or changed. Wait for the device and recalibrate.');
-          if (['fan.level', 'fan.curve'].includes(value.type) && fan.firmwareVersion !== 'v4') throw new HttpError(409, 'Update firmware for cyclic levels and automatic curves');
+          if (['fan.level', 'fan.curve'].includes(value.type) && fan.firmwareVersion !== 'v4') throw new HttpError(409, 'Update firmware for target levels and automatic curves');
           if (value.type === 'fan.calibrate') {
-            assert(value.payload.confirmOff === true && Object.keys(value.payload).length === 2, 'Confirm the fan was restarted to factory position: off');
-          } else if (!fan.calibrated && !(value.type === 'fan.curve' && value.payload.enabled === false)) throw new HttpError(409, 'Calibration required: restart fan to factory position: off');
+            assert(value.payload.confirmOff === true && Object.keys(value.payload).length === 2, 'Confirm the fan is off with saved speed 1');
+          } else if (!fan.calibrated && !(value.type === 'fan.curve' && value.payload.enabled === false)) throw new HttpError(409, 'Calibration required: set speed to 1, then turn fan off');
+          const speedPress = value.type === 'fan.command' && ['speed_up', 'speed_down'].includes(value.payload.button)
+            || value.type === 'ir.send' && value.payload.protocol === 'NEC' && value.payload.address === 0xDE80 && [0x16, 0x14].includes(value.payload.command);
+          if (speedPress && fan.power !== 'on') throw new HttpError(409, 'Turn the fan on before changing speed');
         }
         const ttl = value.ttlSeconds ?? 300;
         assert(Number.isInteger(ttl) && ttl >= 1 && ttl <= 86400, 'TTL must be between 1 and 86400 seconds');
