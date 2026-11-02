@@ -1,0 +1,58 @@
+groups:
+  - name: res-ac
+    rules:
+      - alert: BackendUnavailable
+        expr: up{job="backend"} == 0 or resac_backend_ready == 0
+        for: 1m
+        annotations:
+          summary: Backend metrics unavailable
+      - alert: DeviceTelemetryMissing
+        expr: time() - resac_device_telemetry_timestamp_seconds > 120
+        for: 1m
+        annotations:
+          summary: Device diagnostics have stopped
+      - alert: DeviceReadingsMissing
+        expr: time() - resac_device_reading_received_timestamp_seconds > 120
+        for: 1m
+        annotations:
+          summary: No recent sensor uploads; inspect buffered sample age and sensor errors
+      - alert: DeviceDataDropped
+        expr: delta(resac_device_value{metric=~"readings_dropped_total|telemetry_dropped_total"}[5m]) > 0
+        annotations:
+          summary: Device discarded readings or diagnostics
+      - alert: CommandFailures
+        expr: increase(resac_device_events_total{operation="command.execute",outcome="failed"}[5m]) > 0
+        annotations:
+          summary: Device command execution failed
+      - alert: BackendErrors
+        expr: sum(rate(resac_http_requests_total{status=~"5.."}[5m])) > 0
+        for: 1m
+        annotations:
+          summary: Backend returning server errors
+      - alert: TelemetryExportErrors
+        expr: increase(resac_trace_export_errors_total[5m]) + increase(resac_log_export_errors_total[5m]) + increase(resac_trace_dropped_total[5m]) + increase(resac_log_dropped_total[5m]) > 0
+        annotations:
+          summary: Trace or log export failed
+      - alert: BackendDiskLow
+        expr: resac_backend_disk_available_bytes < 1073741824
+        for: 5m
+        annotations:
+          summary: Backend filesystem has less than 1 GiB available
+      - alert: CertificateExpiring
+        expr: resac_tls_expiry_timestamp_seconds - time() < 86400
+        annotations:
+          summary: TLS certificate expires in less than 24 hours
+      - alert: DeviceSensorStale
+        expr: resac_device_value{metric="sensor_sample_age_seconds"} > 120
+        for: 1m
+        annotations:
+          summary: Device is reporting but has no fresh sensor sample
+      - alert: DeviceReadErrors
+        expr: increase(resac_device_events_total{operation="sensor.read",outcome="failed"}[5m]) > 0
+        annotations:
+          summary: AVR sensor read failed
+      - alert: TLSReloadFailures
+        expr: increase(resac_tls_reload_total{outcome="failed"}[5m]) > 0
+        for: 1m
+        annotations:
+          summary: Backend could not reload its TLS certificate

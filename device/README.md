@@ -161,3 +161,20 @@ and preventing replay after interrupted transmission or AVR reset.
 Curve tests cover all 25 cyclic routes, threshold/hysteresis behavior, fresh
 sensor requirements, adjustment dwell, manual override, settings persistence,
 and sharing the command mailbox. Native estimate tests require a host C++ compiler.
+
+## Observability
+
+The firmware publishes versioned `resac_sensor_diagnostic` and
+`resac_command_diagnostic` Bridge frames with elapsed milliseconds and outcomes.
+The agent forwards bounded diagnostics using the existing HTTPS device token,
+including network failures, sample drops, CPU/RAM/storage, and command/read
+correlation IDs. Install the updated agent and flash the updated sketch for
+complete instrumentation. Older firmware can still upload samples and execute
+commands but cannot report internal AVR timings.
+
+Diagnostics use RAM-only queues (128 waiting events plus 32 in flight), send
+every 15 seconds while healthy, and back off up to 60 seconds after errors.
+They do not repeat hardware actions and do not write to flash. Linux memory/CPU
+metrics describe the Linux processor; AVR timings describe hardware operations.
+See the [design](../observability.md) and
+[Grafana deployment guide](../backend/observability/README.md).

@@ -1,0 +1,68 @@
+# Optional overlay; no telemetry ports are published to the host.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "5m"
+    max-file: "2"
+services:
+  backend:
+    logging: *logging
+    environment:
+      GRAFANA_PROXY_URL: http://grafana:3000
+      METRICS_PORT: '9464'
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318/v1/traces
+      LOKI_PUSH_ENDPOINT: http://loki:3100/loki/api/v1/push
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    logging: *logging
+    command: ['--config.file=/etc/prometheus/prometheus.yaml', '--storage.tsdb.path=/prometheus', '--storage.tsdb.retention.time=15d', '--storage.tsdb.retention.size=2GB']
+    volumes:
+      - ./observability/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - ./observability/alerts.yaml:/etc/prometheus/alerts.yaml:ro
+      - prometheus-data:/prometheus
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.136.0
+    restart: unless-stopped
+    logging: *logging
+    command: ['--config=/etc/otelcol/config.yaml']
+    volumes:
+      - ./observability/collector.yaml:/etc/otelcol/config.yaml:ro
+  tempo:
+    image: grafana/tempo:2.8.2
+    restart: unless-stopped
+    logging: *logging
+    command: ['-config.file=/etc/tempo.yaml']
+    volumes:
+      - ./observability/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+  loki:
+    image: grafana/loki:3.5.5
+    restart: unless-stopped
+    logging: *logging
+    command: ['-config.file=/etc/loki.yaml']
+    volumes:
+      - ./observability/loki.yaml:/etc/loki.yaml:ro
+      - loki-data:/loki
+  grafana:
+    image: grafana/grafana:12.2.0
+    restart: unless-stopped
+    logging: *logging
+    ports: ['127.0.0.1:3001:3000']
+    environment:
+      GF_SERVER_ROOT_URL: '${GRAFANA_PUBLIC_URL:-https://${VPS_IP:-localhost}/grafana/}'
+      GF_SERVER_SERVE_FROM_SUB_PATH: 'true'
+      GF_SECURITY_COOKIE_SECURE: 'true'
+      GF_SECURITY_COOKIE_SAMESITE: strict
+      GF_SECURITY_ADMIN_PASSWORD: '${GRAFANA_ADMIN_PASSWORD:-admin}'
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_AUTH_ANONYMOUS_ENABLED: 'false'
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+volumes:
+  prometheus-data:
+  tempo-data:
+  loki-data:
+  grafana-data:

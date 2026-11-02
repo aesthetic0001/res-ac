@@ -4,12 +4,20 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=22.15.0"
   },
   "scripts": {
     "start": "node src/server.mjs",
     "setup": "node deploy/setup.mjs",
     "test": "node --test test/*.test.mjs",
-    "test:docker": "node --test test/docker/*.test.mjs"
+    "test:docker": "node --test test/docker/*.test.mjs",
+    "test:observability": "node --test test/docker/observability.test.mjs"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.10.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.300.0",
+    "@opentelemetry/resources": "^3.0.0",
+    "@opentelemetry/sdk-trace": "^3.0.0",
+    "prom-client": "^15.1.3"
   }
 }

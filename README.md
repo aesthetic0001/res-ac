@@ -62,7 +62,7 @@ cd backend
 npm test
 ```
 
-Requires Node.js 22.13+ and OpenSSL for the TLS certificate-rotation test. The
+Requires Node.js 22.15+ and OpenSSL for the TLS certificate-rotation test. The
 Docker application image uses Node.js 24. Test credentials are generated at run
 time. Tests cover authentication, token isolation, polling, command delivery,
 expiry, persistence, and certificate reloads.
@@ -78,3 +78,9 @@ tracked example file contains placeholders only.
 Git ignore rules do not remove files already staged or committed; inspect the
 staged diff before publishing. Treat a secret that has entered public Git
 history as exposed and rotate it.
+
+## Observability
+
+[Observability design](observability.md) covers firmware, agent, and backend
+traces and metrics. The [optional Grafana stack](backend/observability/README.md)
+provides Prometheus metrics, Tempo traces, Loki logs, dashboards, and alert rules.
