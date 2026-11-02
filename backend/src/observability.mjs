@@ -30,6 +30,22 @@ const commandPayloadFields = {
 };
 const payloadInteger = (value, max) => Number.isInteger(value) && value >= 0 && value <= max;
 const payloadNumber = (value, min, max) => typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max;
+const deviceOutcomes = ['ok', 'succeeded', 'failed', 'timeout', 'dns', 'connect', 'tls', 'other', 'dropped'];
+const requestKinds = ['readings', 'commands', 'result', 'fan-state', 'telemetry', 'other'];
+const diagnosticRules = {
+  'error.reason': value => ['dns_resolution', 'connect_failed', 'timeout', 'tls_handshake', 'tls_certificate',
+    'transport_other', 'http_error', 'invalid_response', 'request_setup', 'connection_refused',
+    'network_unreachable', 'host_unreachable', 'connection_reset', 'broken_pipe'].includes(value),
+  'error.stage': value => ['dns', 'connect', 'tls', 'unknown', 'http', 'local', 'response', 'connect_or_dns'].includes(value)
+};
+for (const phase of ['dns', 'connect', 'tls', 'first_byte', 'total'])
+  diagnosticRules[`http.timing.${phase}_ms`] = value => payloadNumber(value, 0, 86400_000);
+for (const prefix of ['network.', 'network.start.']) {
+  diagnosticRules[`${prefix}ipv4_default_route`] = value => ['present', 'absent', 'unknown'].includes(value);
+  diagnosticRules[`${prefix}interface_state`] = value => ['up', 'down', 'dormant', 'notpresent', 'lowerlayerdown', 'testing', 'unknown'].includes(value);
+  diagnosticRules[`${prefix}wifi_quality`] = value => payloadNumber(value, 0, 255);
+  diagnosticRules[`${prefix}wifi_signal_dbm`] = value => payloadNumber(value, -130, 0);
+}
 const commandPayloadRules = {
   button: value => ['power', 'speed_up', 'speed_down', 'breeze', 'horizontal', 'timer_1h', 'timer_2h', 'timer_4h'].includes(value),
   sessionId: value => typeof value === 'string' && /^[a-f0-9]{32}$/.test(value),
@@ -73,8 +89,9 @@ export function validateTelemetry(value) {
     Number.isFinite(event.durationMs) && event.durationMs >= 0 && event.durationMs <= 86400_000 &&
     Number.isFinite(event.ageMs) && event.ageMs >= 0 && event.ageMs <= 7 * 86400_000 &&
     event.attributes && typeof event.attributes === 'object' && !Array.isArray(event.attributes) &&
-    Object.entries(event.attributes).every(([key, val]) => key === 'command.payload'
-      ? validCommandPayload(event.attributes['command.type'], val) : attributeNames.has(key) &&
+    Object.entries(event.attributes).every(([key, val]) => Object.hasOwn(diagnosticRules, key)
+      ? ['http.device', 'http.request'].includes(event.name) && diagnosticRules[key](val)
+      : key === 'command.payload' ? validCommandPayload(event.attributes['command.type'], val) : attributeNames.has(key) &&
       (key !== 'command.type' || validCommandType(val)) &&
       (key !== 'command.source' || ['manual', 'automatic'].includes(val)) &&
       ((typeof val === 'string' && /^[a-zA-Z0-9_.-]{1,100}$/.test(val)) || (typeof val === 'number' && Number.isFinite(val) && val >= 0 && val <= 1e16))));
@@ -204,6 +221,7 @@ export class Observability {
     return this.local.run(span, fn);
   }
   ingest(device, value) {
+    this.initializeDevice(device);
     // Bounded retry deduplication. Do not let a lost response double-count a batch.
     const previous = this.recentBatches.get(device) || [];
     if (previous.includes(value.batchId)) return;
@@ -214,13 +232,24 @@ export class Observability {
     for (const event of value.events) {
       const attributes = { ...event.attributes, 'device.id': device, 'device.session': value.session, 'timing.approximate': true, component: ['sensor.read', 'avr.execute'].includes(event.name) ? 'avr' : 'agent' };
       this.record(event.name, event.traceparent, Date.now() - event.ageMs - event.durationMs, event.durationMs, attributes, event.spanId);
-      const outcome = ['ok', 'succeeded', 'failed', 'timeout', 'dns', 'connect', 'tls', 'other', 'dropped'].includes(attributes.outcome) ? attributes.outcome : 'other';
+      const outcome = deviceOutcomes.includes(attributes.outcome) ? attributes.outcome : 'other';
       this.deviceEvents.inc({ device, operation: event.name, outcome });
       this.operationLatency.observe({ device, operation: event.name }, event.durationMs / 1000);
       if (['http.device', 'http.request'].includes(event.name)) {
-        const kind = ['readings', 'commands', 'result', 'fan-state'].includes(attributes['request.kind']) ? attributes['request.kind'] : 'other';
+        const kind = requestKinds.includes(attributes['request.kind']) ? attributes['request.kind'] : 'other';
         this.deviceHttp.inc({ device, kind, outcome }); this.deviceLatency.observe({ device, kind }, event.durationMs / 1000);
       }
+    }
+  }
+  initializeDevice(device) {
+    if (this.knownDevices.has(device)) return;
+    this.knownDevices.add(device);
+    this.heartbeat.set({ device }, 0);
+    // Start bounded series at zero before the first event. Otherwise rate and
+    // increase can miss an isolated first failure whose first sample is 1.
+    for (const outcome of deviceOutcomes) {
+      for (const kind of requestKinds) this.deviceHttp.inc({ device, kind, outcome }, 0);
+      for (const operation of eventNames) this.deviceEvents.inc({ device, operation, outcome }, 0);
     }
   }
   collect(store, config) {
@@ -231,7 +260,7 @@ export class Observability {
       for (const row of store.db.prepare('SELECT status, COUNT(*) AS n FROM commands GROUP BY status').all()) this.commands.set({ status: row.status }, row.n);
       this.attempts.set(store.db.prepare('SELECT COALESCE(SUM(attempts),0) AS n FROM commands').get().n);
       for (const row of store.db.prepare('SELECT id,last_seen FROM devices').all()) {
-        if (!this.knownDevices.has(row.id)) { this.heartbeat.set({ device: row.id }, 0); this.knownDevices.add(row.id); }
+        this.initializeDevice(row.id);
         this.contact.set({ device: row.id }, (row.last_seen || 0) / 1000);
         const latest = store.db.prepare('SELECT received_at FROM readings WHERE device_id=? ORDER BY id DESC LIMIT 1').get(row.id);
         this.fresh.set({ device: row.id }, (latest?.received_at || 0) / 1000);

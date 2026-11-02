@@ -2,7 +2,7 @@
   "uid": "res-ac-observability",
   "title": "Res-AC Observability",
   "schemaVersion": 41,
-  "version": 3,
+  "version": 4,
   "refresh": "15s",
   "time": {
     "from": "now-1h",
@@ -1134,6 +1134,33 @@
           "showLegend": true
         }
       }
+    },
+    {
+      "id": 28,
+      "title": "Device HTTP failures — expand for cause and network context",
+      "type": "logs",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 104,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=\"res-ac\"} | json | operation=~\"http.request|http.device\" | outcome!=\"ok\""
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "sortOrder": "Descending",
+        "enableLogDetails": true
+      },
+      "description": "Individual failed device HTTP attempts, including telemetry uploads. Expand error.reason, error.stage, http.timing.*_ms and network.start.*/network.* fields, then open TraceID. Network snapshots are evidence at request start/completion, not proof of an upstream cause. Older events may lack these fields. Log time is receipt time; device execution times are approximate."
     }
   ]
 }

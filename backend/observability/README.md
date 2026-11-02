@@ -133,3 +133,11 @@ client span. Retries receive new client span IDs within the original trace.
 Older agents omit `spanId` and remain compatible, with their older nesting.
 Existing stored traces retain their original identities and parentage. Timing
 positions remain approximate for reconstructed device spans.
+
+For failed device HTTP attempts, expand the log's `error.reason`, `error.stage`,
+`http.timing.*_ms`, `network.start.*` and `network.*` fields. The
+[diagnostic guide](../../observability.md#diagnosing-device-http-failures)
+explains their meaning and limits. Deploy this backend before an agent that
+sends these optional fields; older agents continue working. Telemetry-upload
+attempts appear as request kind `telemetry` in the next scheduled batch; observing
+them does not trigger extra uploads or change retry backoff.
