@@ -52,15 +52,18 @@ the backend does not run shell commands or implement IR transmission itself.
 The **Fan remote** provides power on/off (toggle), speed down, and speed up for
 the selected device. Each press queues a `fan.command` with a 30-second expiry;
 status refreshes more frequently after a press. Controls stay disabled until the
-AVR accepts calibration after the user restarts the fan to **factory position:
-off** and confirms it. The page shows the AVR's estimated on/off state and speed,
+AVR accepts calibration after the user sets speed 1 while on, turns the fan off,
+and confirms **off with saved speed 1**. The fan retains speed across restarts;
+unplugging it does not reset speed. The page shows the AVR's estimated on/off state and speed,
 and locks again after a device restart, loss of tracking, or stale state.
 A successful IR result means transmission completed, not that the fan received
 it. The command form below the remote
 remains available for other buttons, ping, and numeric NEC requests.
 
-**Set level** selects Off or levels 1–5. The AVR uses the shortest path around
-the five-level cycle. **Automatic temperature curve** provides Quiet, Balanced,
+**Set level** selects Off or levels 1–5. The AVR powers on first if needed, then
+uses direct up/down steps. Speed presses require power on and stop at 1 and 5
+without wrapping. Power uses `0x00`, speed up `0x16`, and speed down `0x14`.
+**Automatic temperature curve** provides Quiet, Balanced,
 Cooling, and Custom thresholds, a graph with mouse/touch dragging and keyboard
 editing, and cooling hysteresis. Thresholds may be equal; only decreasing
 temperatures are rejected, and the highest matching level wins at a shared

@@ -46,9 +46,10 @@ long polls commands and supports `device.ping`, named `fan.command` buttons, and
 numeric NEC `ir.send` requests. The Arduino acknowledges completed transmissions;
 this does not confirm the fan received them. [Woozoo IR setup](device/IR.md)
 covers the emitter wiring, button profile, and USB serial bench test. Remote
-control requires an AVR-confirmed calibration after restarting the fan to
-factory position: off; the dashboard displays the AVR's estimated power/speed.
-Target levels use the shortest route around the five-speed cycle. Editable
+control requires an AVR-confirmed calibration with the fan off and saved speed 1;
+the dashboard displays the AVR's estimated power/speed. The fan remembers speed
+across restarts. Speed changes require power on and stop at 1 and 5 without
+wrapping; target levels use direct up/down steps. Editable
 temperature presets run locally on the Seeeduino, with hysteresis, fresh-sensor
 checks, and a minimum adjustment interval; manual control disables automatic mode.
 

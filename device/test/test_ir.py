@@ -32,9 +32,28 @@ def command(button='speed_up', **updates):
 
 
 class IRTests(unittest.TestCase):
+    def test_speed_commands_are_rejected_while_off(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bridge = Bridge()
+            bridge.values['resac_fan_state'] = 'v1,%s,1,0,0,1' % SESSION
+            processor = agent.CommandProcessor({}, bridge, str(Path(directory) / 'result.json'))
+            requests = [command('speed_up'), command('speed_down')]
+            requests += [command(type='ir.send', payload=dict(protocol='NEC', address=56960,
+                         command=code, sessionId=SESSION)) for code in (0x16, 0x14)]
+            for request in requests:
+                processor._accept(request)
+                self.assertEqual(processor.reply['status'], 'failed')
+                self.assertIn('Turn the fan on', processor.reply['result']['error'])
+            self.assertFalse(bridge.sent)
+            processor.reply = None
+            processor._accept(command('power'))
+            self.assertIsNone(processor.reply)
+            processor._arduino()
+            self.assertEqual(len(bridge.sent), 1)
+
     def test_button_profile_and_nec_numeric_contract(self):
-        expected = dict(power=0, speed_up=8, speed_down=16, breeze=9, horizontal=21,
-                        vertical=22, timer_1h=18, timer_2h=14, timer_4h=10)
+        expected = dict(power=0, speed_up=22, speed_down=20, breeze=9, horizontal=21,
+                        timer_1h=18, timer_2h=14, timer_4h=10)
         for name, code in expected.items():
             self.assertEqual(agent.ir_payload(command(name)), (0xde80, code, 0))
         raw = command(type='ir.send', payload=dict(protocol='NEC', address=56960, command=8))
@@ -46,7 +65,7 @@ class IRTests(unittest.TestCase):
                 invalid = dict(raw, payload=dict(raw['payload'], **{key: value}))
                 with self.assertRaises(ValueError):
                     agent.ir_payload(invalid)
-        for payload in [dict(button='mute'), dict(button='power', repeats=1), {}, []]:
+        for payload in [dict(button='vertical'), dict(button='mute'), dict(button='power', repeats=1), {}, []]:
             with self.assertRaises(ValueError):
                 agent.ir_payload(command(payload=payload))
 
@@ -67,18 +86,18 @@ class IRTests(unittest.TestCase):
             request = command()
             processor._accept(request)
             processor._arduino()
-            self.assertEqual(bridge.sent, ['v3,%s,nec,%s,56960,8,0' % (request['id'], SESSION)])
+            self.assertEqual(bridge.sent, ['v3,%s,nec,%s,56960,22,0' % (request['id'], SESSION)])
             self.assertEqual(json.loads(Path(path).read_text())['status'], 'failed')
             self.assertIsNone(processor.reply)
             for reply in ['v1,%s,pong,42' % request['id'],
-                          'v3,%s,ir_sent,%s,56960,8,0,42' % (uuid.uuid4(), SESSION),
-                          'v3,%s,ir_sent,%s,56960,16,0,42' % (request['id'], SESSION)]:
+                          'v3,%s,ir_sent,%s,56960,22,0,42' % (uuid.uuid4(), SESSION),
+                          'v3,%s,ir_sent,%s,56960,20,0,42' % (request['id'], SESSION)]:
                 bridge.values['resac_command_result'] = reply
                 processor.bridge_due = 0
                 processor._arduino()
                 self.assertIsNone(processor.reply)
             self.assertEqual(len(bridge.sent), 1)
-            bridge.values['resac_command_result'] = 'v3,%s,ir_sent,%s,56960,8,0,42' % (request['id'], SESSION)
+            bridge.values['resac_command_result'] = 'v3,%s,ir_sent,%s,56960,22,0,42' % (request['id'], SESSION)
             processor.bridge_due = 0
             processor._arduino()
             self.assertEqual(processor.reply['status'], 'succeeded')

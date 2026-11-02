@@ -45,9 +45,9 @@ class AutomationTests(unittest.TestCase):
             self.assertEqual(bridge.sent,['v4,%s,auto_level,%s,5' % (request['id'],SESSION)])
             bridge.values['resac_command_result']='v4,%s,level_set,%s,4,1,123' % (request['id'],SESSION)
             processor.bridge_due=0;processor._arduino();self.assertIsNone(processor.reply)
-            bridge.values['resac_command_result']='v4,%s,level_set,%s,5,1,123' % (request['id'],SESSION)
+            bridge.values['resac_command_result']='v4,%s,level_set,%s,5,5,123' % (request['id'],SESSION)
             processor.bridge_due=0;processor._arduino()
-            self.assertEqual(processor.reply['result']['presses'],1)
+            self.assertEqual(processor.reply['result']['presses'],5)
             for level in [-1,6,True,2.5]:
                 processor._accept(command(type='fan.level',payload=dict(level=level,sessionId=SESSION)))
                 self.assertEqual(processor.reply['status'],'failed')

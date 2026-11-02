@@ -51,7 +51,7 @@ void invalidateFan() {
   ++fanRevision;
   Bridge.put("resac_fan_session", "");
   publishFanState();
-  Serial.println(F("Calibration required: restart fan to factory position: off; confirm with calibrate off"));
+  Serial.println(F("Calibration required: set fan speed to 1, turn it off; confirm with calibrate off"));
 }
 
 void updateFan() {
@@ -85,11 +85,15 @@ bool parseNumber(const char *text, unsigned long limit, unsigned long &value, ui
 
 bool sendFanIR(uint16_t address, uint8_t command, uint8_t repeats, const char *source = "manual") {
   if (!fan.calibrated()) {
-    Serial.println(F("IR blocked: calibration required; restart fan to factory position: off"));
+    Serial.println(F("IR blocked: calibration required; set fan speed to 1, then turn it off"));
+    return false;
+  }
+  if (address == 0xDE80 && (command == 0x16 || command == 0x14) && !fan.power()) {
+    Serial.println(F("IR blocked: turn the fan on before changing speed"));
     return false;
   }
   // Modern IRremote sends address/command LSB first and adds the complement byte.
-  // 0xDE80 + 0x08 is speed up; do not pass ESPHome's combined 0xF708 command.
+  // 0xDE80 + 0x16 is speed up; 0x14 is speed down.
   IrSender.sendNEC(address, command, repeats);
   fanControlSource = source;
   Serial.print(F("IR transmitted: NEC address=0x")); Serial.print(address, HEX);
@@ -112,10 +116,10 @@ bool setFanLevel(uint8_t target, bool automatic, uint8_t &presses) {
     ++presses;
     delay(150);
   }
-  const int8_t route = FanState::shortestRoute(fan.speed(), target);
+  const int8_t route = FanState::speedSteps(fan.speed(), target);
   const uint8_t count = route < 0 ? -route : route;
   for (uint8_t i = 0; i < count; ++i) {
-    if (!sendFanIR(0xDE80, route < 0 ? 0x10 : 0x08, 0, source)) return false;
+    if (!sendFanIR(0xDE80, route < 0 ? 0x14 : 0x16, 0, source)) return false;
     ++presses;
     if (i + 1 < count) delay(150);
   }
@@ -175,16 +179,17 @@ void processCommand() {
       } else if (calibrate) {
         fan.calibrateOff(); fanControlSource = "calibration"; ++fanRevision; publishFanState();
         snprintf(lastCommandReply, sizeof(lastCommandReply), "v3,%s,calibrated,%s", id, session);
-        Serial.println(F("Fan calibrated: estimated off; default speed 1"));
+        Serial.println(F("Fan calibrated: estimated off; saved speed 1"));
       } else if (levelControl) {
         uint8_t presses;
         if (setFanLevel(command, automatic, presses))
           snprintf(lastCommandReply, sizeof(lastCommandReply), "v4,%s,level_set,%s,%lu,%u,%lu", id, session, command, presses, millis());
         else snprintf(lastCommandReply, sizeof(lastCommandReply), "v3,%s,rejected,%s", id, session);
       } else {
-        sendFanIR(address, command, repeats);
-        snprintf(lastCommandReply, sizeof(lastCommandReply), "v3,%s,ir_sent,%s,%lu,%lu,%lu,%lu",
-                 id, session, address, command, repeats, millis());
+        if (sendFanIR(address, command, repeats))
+          snprintf(lastCommandReply, sizeof(lastCommandReply), "v3,%s,ir_sent,%s,%lu,%lu,%lu,%lu",
+                   id, session, address, command, repeats, millis());
+        else snprintf(lastCommandReply, sizeof(lastCommandReply), "v3,%s,rejected,%s", id, session);
       }
     } else {
       snprintf(lastCommandReply, sizeof(lastCommandReply), "v1,%s,pong,%lu", id, millis());
@@ -203,7 +208,7 @@ void processCommand() {
 }
 
 void processSerial() {
-  // Local bench test: ir 0xDE80 0x08 followed by Enter. Never send on boot.
+  // Local bench test: ir 0xDE80 0x16 followed by Enter. Never send on boot.
   static char line[32];
   static uint8_t used = 0;
   static bool overflow = false;
@@ -224,13 +229,13 @@ void processSerial() {
       if (position && strcmp(position, "off") == 0 && !strtok_r(nullptr, " ", &save) && fanSession[0] &&
           fanHeartbeat[0] && static_cast<unsigned long>(millis() - lastFanHeartbeatMs) <= 10000) {
         fan.calibrateOff(); fanControlSource = "calibration"; ++fanRevision; publishFanState();
-        Serial.println(F("Fan calibrated: estimated off; default speed 1"));
-      } else Serial.println(F("Confirm fan restarted and left off with: calibrate off (agent must be connected)"));
+        Serial.println(F("Fan calibrated: estimated off; saved speed 1"));
+      } else Serial.println(F("Set fan speed to 1, turn it off, then: calibrate off (agent must be connected)"));
     } else if (!overflow && kind && strcmp(kind, "ir") == 0 &&
         parseNumber(strtok_r(nullptr, " ", &save), 65535, address, 0) &&
         parseNumber(strtok_r(nullptr, " ", &save), 255, command, 0) &&
         !strtok_r(nullptr, " ", &save)) sendFanIR(address, command, 0);
-    else Serial.println(F("Usage: calibrate off | ir 0xDE80 0x08"));
+    else Serial.println(F("Usage: calibrate off | ir 0xDE80 0x16"));
     used = 0;
     overflow = false;
   }

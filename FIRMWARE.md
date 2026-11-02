@@ -55,6 +55,50 @@ It lists a 2017 4.1.2 build and a `yun-2.0.8.rar` upload dated 2021. Live downlo
 returned HTTP 406 from the vendor's ModSecurity filter during this assessment.
 Their contents, exact hardware compatibility, and fixes have not been verified.
 
+Follow-up source investigation (2026-10-31): Seeed's current board guide links
+its “newest firmware” directly to that Dragino archive, which is stronger
+board-specific evidence for the vendor Yún firmware family. The archive lists
+[`dragino-yun--v4.1.2-squashfs-sysupgrade.bin`](https://www.dragino.com/downloads/downloads/motherboards/ms14/Firmware/Yun/Newest_Firmware/yun--build-v4.1.2-20170221-2213/)
+and an MD5 manifest. Version 4.1.2 is the best identified update candidate, but
+the link targets a directory that has changed over time; it does not explicitly
+certify that particular binary or its migration path. Its image and checksum
+could not be inspected in the earlier download attempt. Do not treat an archive
+timestamp on `yun-2.0.8.rar` as evidence of its build date or compatibility.
+
+Seeed's [older board guide](https://seeeddoc.github.io/Seeeduino_Cloud/) also
+documents separate kernel and rootfs recovery addresses that match the observed
+legacy layout. [Seeed support's example](https://forum.seeedstudio.com/t/seeeduino-cloud-set-up/6911)
+names `dragino2-yun-seeed-v1.3.4-squashfs-sysupgrade.bin` for this board, but
+that 2014 version is not established as newer than the installed build. Neither
+source establishes that the 4.1.2 binary preserves the required layout, Bridge,
+or network configuration. Verify the downloaded image and a working recovery
+path before considering a flash.
+
+### Inspection of supplied 4.1.2 image
+
+On 2026-10-31 the supplied `dragino-yun--v4.1.2-squashfs-sysupgrade.bin`
+was inspected without flashing it. SHA-256:
+`d8faf66d2751c32615a999737691f7a3f32376760e9e28a63ee77920955b5044`.
+Its provenance and vendor checksum have not been independently verified.
+
+* The image is `0xf76d2c` bytes, within the `0xf90000`-byte firmware region.
+  It starts with an XZ-compressed SquashFS and has a uImage kernel at image
+  offset `0xe50000`, corresponding to flash offset `0xea0000`. Both uImage
+  header and payload CRCs pass. The kernel identifies itself as Linux 3.18.29.
+* The decompressed kernel contains a built-in command line declaring `board=YUN`
+  and the same rootfs, kernel, NVRAM, ART and aggregate firmware partition
+  offsets and sizes as the installed system. Its console is `ttyATH0,250000`;
+  actual bootloader arguments and runtime behavior remain to be verified.
+* The root filesystem identifies Dragino Yun / HE, version 4.1.2, and includes
+  Python 2.7 and the Yun Python Bridge. It contains `wpad-mini`, so full
+  WPA2-Enterprise support required for eduroam must not be assumed.
+
+These findings strongly support this as a plausible layout-compatible vendor
+update, not proof of a successful boot or application compatibility. Confirm the
+vendor checksum, establish Ethernet bootloader recovery, and plan to restore and
+test network credentials, enterprise Wi-Fi, Bridge, and the application before
+flashing. The image itself does not establish whether existing settings migrate.
+
 ## Application migration requirements
 
 The sensor/ping agent supports Python 3, but the installed Linux Bridge service
