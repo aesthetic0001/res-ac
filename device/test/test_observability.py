@@ -106,7 +106,8 @@ class TelemetryTests(unittest.TestCase):
                 ('device.ping', {}), ('fan.command', dict(button='power', sessionId=session)),
                 ('fan.level', dict(level=0, sessionId=session)),
                 ('fan.calibrate', dict(confirmOff=True, sessionId=session)),
-                ('fan.curve', dict(enabled=True, thresholdsC=[-1, 20, 24, 24, 30], hysteresisC=.5, sessionId=session)),
+                *[('fan.curve', dict(enabled=True, thresholdsC=[-1, 20, 24, 24, 30], hysteresisC=hysteresis, sessionId=session))
+                  for hysteresis in [0, .1, 10, 1.7976931348623157e308]],
                 ('ir.send', dict(protocol='NEC', address=56960, command=22, repeats=3, sessionId=session))]:
             attributes = agent.command_payload_attributes(command_type, dict(payload, token='private'))
             self.assertEqual(agent.decode_json(attributes['command.payload']), payload)

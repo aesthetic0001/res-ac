@@ -19,9 +19,36 @@ class AutomationTests(unittest.TestCase):
         for payload in [dict(enabled=True,thresholdsC=[22,21,26,28,30]),
                         dict(enabled=True,thresholdsC=[22,24,26,28]),
                         dict(enabled=True,thresholdsC=[22,24,26,28,float('nan')]),
-                        dict(enabled=True,thresholdsC=thresholds,hysteresisC=0),
+                        dict(enabled=True,thresholdsC=thresholds,hysteresisC=-.1),
                         dict(enabled='yes',thresholdsC=thresholds)]:
             with self.assertRaises(ValueError):agent.validate_curve(payload)
+
+    def test_hysteresis_zero_small_and_uncapped_values_survive_restart(self):
+        settings=dict(enabled=True,thresholdsC=[24.5,24.7,24.7,25,25])
+        self.assertEqual(agent.validate_curve(settings)['hysteresisC'],1)
+        with tempfile.TemporaryDirectory() as directory:
+            path=str(Path(directory)/'curve.json')
+            for hysteresis in [0,.1,10,1.7976931348623157e308]:
+                auto=agent.AutoController({},Bridge(),path)
+                auto.configure(dict(settings,hysteresisC=hysteresis))
+                resumed=agent.AutoController({},Bridge(),path)
+                self.assertEqual(resumed.settings['hysteresisC'],hysteresis)
+                self.assertEqual(resumed.snapshot()['hysteresisC'],hysteresis)
+        for hysteresis in [-.1,float('nan'),float('inf'),float('-inf'),True,None,'0.1']:
+            with self.assertRaises(ValueError):
+                agent.validate_curve(dict(settings,hysteresisC=hysteresis))
+
+    def test_zero_hysteresis_follows_thresholds_in_both_directions(self):
+        thresholds=[24.5,24.7,24.7,25,25]
+        for temperature in [24,24.49,24.5,24.6,24.7,24.9,25,25.1,26]:
+            expected=sum(temperature>=threshold for threshold in thresholds)
+            for previous in range(6):
+                self.assertEqual(agent.curve_target(temperature,thresholds,0,previous),expected)
+        thresholds=[24.5,24.75,24.75,25,25]
+        self.assertEqual(agent.curve_target(24.6875,thresholds,.125,3),3)
+        self.assertEqual(agent.curve_target(24.625,thresholds,.125,3),1)
+        self.assertEqual(agent.curve_target(20,thresholds,10,5),5)
+        self.assertEqual(agent.curve_target(15,thresholds,10,5),3)
 
     def test_equal_thresholds_select_highest_matching_level(self):
         for thresholds,temperature,expected in [([22,24,24,28,30],24,3),

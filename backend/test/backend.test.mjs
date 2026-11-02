@@ -175,7 +175,7 @@ test('target levels and temperature curves validate inputs and remain calibratio
   assert.equal((await queue('fan.curve',{...settings,sessionId})).status,201);
   for(const thresholdsC of [[22,21,26,28,30],[22,24,26,28],[22,24,26,28,61]])
     assert.equal((await queue('fan.curve',{...settings,thresholdsC,sessionId})).status,400);
-  assert.equal((await queue('fan.curve',{...settings,hysteresisC:0,sessionId})).status,400);
+  assert.equal((await queue('fan.curve',{...settings,hysteresisC:-.1,sessionId})).status,400);
   assert.equal((await queue('fan.curve',{...settings,sessionId:'b'.repeat(32)})).status,409);
   f.store.setFanState('board-1',{...state,firmwareVersion:'v3',revision:3});
   assert.equal((await queue('fan.curve',{...settings,enabled:false,sessionId})).status,409);
@@ -193,6 +193,21 @@ test('curve APIs and live telemetry accept ties and small gaps while rejecting d
     const response=await f.request('/api/devices/board-1/fan-state',{method:'POST',headers:f.deviceHeaders,body:JSON.stringify({...state,automatic:{...settings,status:'active',targetLevel:5,minAdjustmentSeconds:30}})});
     assert.equal(response.status,200);
     assert.deepEqual(f.store.fanState('board-1').automatic.thresholdsC,thresholdsC);
+  }
+});
+
+test('curve commands and device reports preserve zero, fractional, and uncapped hysteresis', async t => {
+  const f=await fixture(t),auth=await f.login(),sessionId=randomBytes(16).toString('hex');
+  const state={sessionId,calibrated:true,power:'off',speed:0,revision:1,firmwareVersion:'v4'};
+  f.store.setFanState('board-1',state);
+  for(const hysteresisC of [0,.1,10,Number.MAX_VALUE]) {
+    const settings={enabled:true,thresholdsC:[24.5,24.7,24.7,25,25],hysteresisC};
+    const queued=await f.request('/api/admin/devices/board-1/commands',{method:'POST',headers:{cookie:auth.cookie,'x-csrf-token':auth.csrf,'content-type':'application/json'},body:JSON.stringify({type:'fan.curve',payload:{...settings,sessionId}})});
+    assert.equal(queued.status,201);
+    assert.equal(JSON.parse(f.store.command((await queued.json()).id).payload).hysteresisC,hysteresisC);
+    const reported=await f.request('/api/devices/board-1/fan-state',{method:'POST',headers:f.deviceHeaders,body:JSON.stringify({...state,automatic:{...settings,status:'active',targetLevel:0}})});
+    assert.equal(reported.status,200);
+    assert.equal(f.store.fanState('board-1').automatic.hysteresisC,hysteresisC);
   }
 });
 

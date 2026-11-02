@@ -41,6 +41,15 @@ FAN_BUTTONS = dict(power=0x00, speed_up=0x16, speed_down=0x14, breeze=0x09,
                    timer_2h=0x0e, timer_4h=0x0a)
 
 
+def valid_hysteresis(value):
+    if isinstance(value, bool) or not isinstance(value, integer_types + (float,)):
+        return False
+    try:
+        return value >= 0 and float(value) < float('inf')
+    except OverflowError:
+        return False
+
+
 def command_payload_attributes(command_type, payload):
     fields = {'device.ping': [], 'fan.command': ['button', 'sessionId'], 'fan.level': ['level', 'sessionId'],
               'fan.calibrate': ['confirmOff', 'sessionId'],
@@ -57,7 +66,7 @@ def command_payload_attributes(command_type, payload):
                  level=lambda value: integer(value, 5), confirmOff=lambda value: isinstance(value, bool),
                  enabled=lambda value: isinstance(value, bool),
                  thresholdsC=lambda value: isinstance(value, list) and len(value) == 5 and all(number(v, -20, 60) for v in value),
-                 hysteresisC=lambda value: number(value, .5, 5), protocol=lambda value: value == 'NEC',
+                 hysteresisC=valid_hysteresis, protocol=lambda value: value == 'NEC',
                  address=lambda value: integer(value, 65535), command=lambda value: integer(value, 255),
                  repeats=lambda value: integer(value, 3))
     safe = dict((key, payload[key]) for key in fields[command_type] if key in payload and rules[key](payload[key]))
@@ -74,8 +83,8 @@ def validate_curve(payload):
             any(b < a for a, b in zip(thresholds, thresholds[1:]))):
         raise ValueError('Use five nondecreasing temperatures from -20 to 60 C; equal thresholds are allowed')
     hysteresis = payload.get('hysteresisC', 1)
-    if isinstance(hysteresis, bool) or not isinstance(hysteresis, (int, float)) or not 0.5 <= hysteresis <= 5:
-        raise ValueError('Hysteresis must be 0.5 to 5 C')
+    if not valid_hysteresis(hysteresis):
+        raise ValueError('Hysteresis must be a finite, nonnegative number in C')
     return dict(enabled=payload['enabled'], thresholdsC=thresholds, hysteresisC=hysteresis)
 
 

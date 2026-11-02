@@ -65,8 +65,9 @@ uses direct up/down steps. Speed presses require power on and stop at 1 and 5
 without wrapping. Power uses `0x00`, speed up `0x16`, and speed down `0x14`.
 **Automatic temperature curve** provides Quiet, Balanced,
 Cooling, and Custom thresholds, a graph with mouse/touch dragging and keyboard
-editing, and cooling hysteresis. Thresholds may be equal; only decreasing
-temperatures are rejected, and the highest matching level wins at a shared
+editing, and cooling hysteresis. Hysteresis accepts any finite, nonnegative °C
+value, including fractions; 0 disables it and there is no upper cap. Thresholds
+may be equal; only decreasing temperatures are rejected, and the highest matching level wins at a shared
 temperature. Graph edits update the number fields and remain drafts until applied.
 The Seeeduino evaluates the curve locally against fresh readings, with at least
 30 seconds between automatic adjustments. Manual control disables automatic mode.
