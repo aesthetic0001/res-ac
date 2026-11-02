@@ -1,4 +1,4 @@
-import { validateTelemetry, validTraceparent } from './observability.mjs';
+import { commandPayloadAttributes, validateTelemetry, validTraceparent } from './observability.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { token, digest, equal, verifyPassword, cookieToken } from './auth.mjs';
@@ -239,7 +239,8 @@ export function createApp(config, store, observability) {
           const saved = store.command(commandId);
           const persist = () => store.result(id, commandId, value.status, value.result ?? null);
           const result = observability && saved?.device_id === id && validTraceparent(saved.traceparent)
-            ? observability.run('command.result', { 'command.id': commandId, outcome: value.status }, persist,
+            ? observability.run('command.result', { 'command.id': commandId, 'command.type': saved.type, 'command.source': 'manual',
+              ...commandPayloadAttributes(saved.type, JSON.parse(saved.payload)), outcome: value.status }, persist,
               validTraceparent(req.headers.traceparent) && req.headers.traceparent.slice(3, 35) === saved.traceparent.slice(3, 35)
                 ? undefined : saved.traceparent) : persist();
           if (result.code === 200) notify(id);

@@ -41,6 +41,29 @@ FAN_BUTTONS = dict(power=0x00, speed_up=0x16, speed_down=0x14, breeze=0x09,
                    timer_2h=0x0e, timer_4h=0x0a)
 
 
+def command_payload_attributes(command_type, payload):
+    fields = {'device.ping': [], 'fan.command': ['button', 'sessionId'], 'fan.level': ['level', 'sessionId'],
+              'fan.calibrate': ['confirmOff', 'sessionId'],
+              'fan.curve': ['enabled', 'thresholdsC', 'hysteresisC', 'sessionId'],
+              'ir.send': ['protocol', 'address', 'command', 'repeats', 'sessionId']}
+    if command_type not in fields or not isinstance(payload, dict):
+        return {}
+    def integer(value, limit):
+        return not isinstance(value, bool) and isinstance(value, integer_types) and 0 <= value <= limit
+    def number(value, low, high):
+        return not isinstance(value, bool) and isinstance(value, (int, float)) and low <= value <= high
+    rules = dict(button=lambda value: isinstance(value, (str, text_type)) and value in FAN_BUTTONS,
+                 sessionId=lambda value: isinstance(value, (str, text_type)) and bool(re.match(r'^[a-f0-9]{32}$', value)),
+                 level=lambda value: integer(value, 5), confirmOff=lambda value: isinstance(value, bool),
+                 enabled=lambda value: isinstance(value, bool),
+                 thresholdsC=lambda value: isinstance(value, list) and len(value) == 5 and all(number(v, -20, 60) for v in value),
+                 hysteresisC=lambda value: number(value, .5, 5), protocol=lambda value: value == 'NEC',
+                 address=lambda value: integer(value, 65535), command=lambda value: integer(value, 255),
+                 repeats=lambda value: integer(value, 3))
+    safe = dict((key, payload[key]) for key in fields[command_type] if key in payload and rules[key](payload[key]))
+    return {'command.payload': encode_json(safe)}
+
+
 def validate_curve(payload):
     if (not isinstance(payload, dict) or set(payload) - set(['enabled', 'thresholdsC', 'hysteresisC', 'sessionId']) or
             not isinstance(payload.get('enabled'), bool)):
@@ -687,19 +710,30 @@ class CommandProcessor(object):
         except Exception:
             pass
 
+    def _command_attributes(self, outcome, error_kind=None):
+        command_type = self.current.get('type')
+        if (not isinstance(command_type, (str, text_type)) or
+                not re.match(r'^[a-zA-Z][a-zA-Z0-9_.-]{0,63}$', command_type)):
+            command_type = 'unknown'
+        attributes = {'command.id': self.current['id'], 'command.type': command_type,
+                      'command.source': 'automatic' if self.automatic else 'manual', 'outcome': outcome}
+        attributes.update(command_payload_attributes(command_type, self.current.get('payload')))
+        if error_kind is not None:
+            attributes['error.kind'] = error_kind
+        return attributes
+
     def _complete(self, status, result):
         parent = self.current.get('traceparent') or traceparent()
         telemetry = self.config.get('_telemetry')
         if telemetry:
             telemetry.event('command.execute', parent, monotonic() - self.execution_started,
-                            {'command.id': self.current['id'], 'outcome': status,
-                             'error.kind': 'avr_timeout' if 'timed out' in result.get('error', '') else 'command_rejected' if status == 'failed' else 'none'})
+                            self._command_attributes(status, 'avr_timeout' if 'timed out' in result.get('error', '') else 'command_rejected' if status == 'failed' else 'none'))
             try:
                 fields = (self.bridge.get('resac_command_diagnostic') or '').split(',')
                 if (len(fields) == 4 and fields[:2] == ['v1', self.current['id']] and
                         re.match(r'^\d{1,10}$', fields[2]) and fields[3] in ('ok', 'failed')):
                     telemetry.event('avr.execute', parent, int(fields[2]) / 1000.0,
-                                    {'command.id': self.current['id'], 'outcome': fields[3]})
+                                    self._command_attributes(fields[3]))
             except Exception:
                 pass
         self.reply = dict(id=self.current['id'], status=status, result=result, traceparent=parent)
@@ -747,7 +781,7 @@ class CommandProcessor(object):
         if not re.match(TRACEPARENT, command.get('traceparent', '')):
             command['traceparent'] = traceparent()
             if self.config.get('_telemetry'):
-                self.config['_telemetry'].event('command.local', command['traceparent'], attributes={'command.id': command['id'], 'outcome': 'ok'})
+                self.config['_telemetry'].event('command.local', command['traceparent'], attributes=self._command_attributes('ok'))
         self.ir = None
         self.prepared = False
         self.expires_at = None
@@ -814,7 +848,7 @@ class CommandProcessor(object):
         telemetry = self.config.get('_telemetry')
         if telemetry:
             telemetry.event('bridge.dispatch', self.current.get('traceparent'), monotonic() - started,
-                            {'command.id': self.current['id'], 'outcome': 'ok'})
+                            self._command_attributes('ok'))
 
     def _arduino(self):
         if monotonic() >= self.deadline:
@@ -878,8 +912,8 @@ class CommandProcessor(object):
         except Exception as error:
             telemetry = self.config.get('_telemetry')
             if telemetry and self.current and not self.bridge_failed_reported:
-                telemetry.event('bridge.error', self.current.get('traceparent'), attributes={
-                    'command.id': self.current['id'], 'outcome': 'failed', 'error.kind': type(error).__name__})
+                telemetry.event('bridge.error', self.current.get('traceparent'),
+                                attributes=self._command_attributes('failed', type(error).__name__))
                 self.bridge_failed_reported = True
             # Wait for Bridge/AVR within the bounded execution timeout.
 

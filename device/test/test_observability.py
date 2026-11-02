@@ -95,6 +95,59 @@ class TelemetryTests(unittest.TestCase):
             self.assertEqual(resumed.reply['traceparent'], parent)
             self.assertEqual([e['name'] for e in telemetry.events], ['command.execute', 'avr.execute'])
             self.assertTrue(all(e['traceparent'] == parent for e in telemetry.events))
+            for event in telemetry.events:
+                self.assertEqual(event['attributes']['command.type'], 'device.ping')
+                self.assertEqual(event['attributes']['command.source'], 'manual')
+                self.assertEqual(agent.decode_json(event['attributes']['command.payload']), {})
+
+    def test_command_payload_contents_are_bounded_to_supported_fields(self):
+        session = 'a' * 32
+        for command_type, payload in [
+                ('device.ping', {}), ('fan.command', dict(button='power', sessionId=session)),
+                ('fan.level', dict(level=0, sessionId=session)),
+                ('fan.calibrate', dict(confirmOff=True, sessionId=session)),
+                ('fan.curve', dict(enabled=True, thresholdsC=[-1, 20, 24, 24, 30], hysteresisC=.5, sessionId=session)),
+                ('ir.send', dict(protocol='NEC', address=56960, command=22, repeats=3, sessionId=session))]:
+            attributes = agent.command_payload_attributes(command_type, dict(payload, token='private'))
+            self.assertEqual(agent.decode_json(attributes['command.payload']), payload)
+            self.assertNotIn('private', attributes['command.payload'])
+        self.assertEqual(agent.command_payload_attributes('unknown', dict(token='private')), {})
+        for payload in [dict(level=True), dict(level=6), dict(level=float('nan')), dict(sessionId='private')]:
+            self.assertEqual(agent.decode_json(agent.command_payload_attributes('fan.level', payload)['command.payload']), {})
+
+    def test_command_metadata_on_local_dispatch_and_bridge_failure(self):
+        class Bridge:
+            fail = False
+            def get(self, key):
+                if self.fail:
+                    raise IOError('Bridge unavailable')
+                return ''
+            def put(self, key, value): pass
+        bridge = Bridge()
+        telemetry = agent.Telemetry({}, bridge)
+        with tempfile.TemporaryDirectory() as directory:
+            processor = agent.CommandProcessor({'_telemetry': telemetry}, bridge, directory + '/result.json')
+            processor._accept(dict(id=str(uuid.uuid4()), type='device.ping', payload={}))
+            processor._arduino()
+            bridge.fail = True
+            processor.bridge_due = 0
+            processor._arduino()
+            self.assertEqual([event['name'] for event in telemetry.events], ['command.local', 'bridge.dispatch', 'bridge.error'])
+            for event in telemetry.events:
+                self.assertEqual(event['attributes']['command.type'], 'device.ping')
+                self.assertEqual(event['attributes']['command.source'], 'manual')
+
+    def test_malformed_command_type_does_not_leak_into_diagnostics(self):
+        class Bridge:
+            def get(self, key): return ''
+            def put(self, key, value): pass
+        telemetry = agent.Telemetry({})
+        with tempfile.TemporaryDirectory() as directory:
+            processor = agent.CommandProcessor({'_telemetry': telemetry}, Bridge(), directory + '/result.json')
+            processor._accept(dict(id=str(uuid.uuid4()), type='private value', payload={}))
+            self.assertEqual(processor.reply['status'], 'failed')
+            self.assertTrue(all(e['attributes']['command.type'] == 'unknown' for e in telemetry.events))
+            self.assertNotIn('private value', str(telemetry.events))
 
     def test_reading_drop_has_original_trace_and_buffer_has_bound(self):
         telemetry = agent.Telemetry({})

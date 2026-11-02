@@ -20,7 +20,43 @@ const parentContext = value => validTraceparent(value) ? trace.setSpanContext(RO
 }) : ROOT_CONTEXT;
 export const eventNames = new Set(['reading.collect', 'command.local', 'http.request', 'sensor.read', 'bridge.dispatch', 'bridge.collect', 'bridge.error', 'reading.buffer', 'reading.drop',
   'http.device', 'command.execute', 'avr.execute', 'telemetry.drop']);
-const attributeNames = new Set(['reading.id', 'command.id', 'outcome', 'curl.code', 'http.status_code', 'request.kind', 'error.kind', 'avr.uptime_ms']);
+const attributeNames = new Set(['reading.id', 'command.id', 'command.type', 'command.source', 'outcome', 'curl.code', 'http.status_code', 'request.kind', 'error.kind', 'avr.uptime_ms']);
+const validCommandType = value => typeof value === 'string' && /^[a-zA-Z][a-zA-Z0-9_.-]{0,63}$/.test(value);
+const commandPayloadFields = {
+  'device.ping': [], 'fan.command': ['button', 'sessionId'], 'fan.level': ['level', 'sessionId'],
+  'fan.calibrate': ['confirmOff', 'sessionId'], 'fan.curve': ['enabled', 'thresholdsC', 'hysteresisC', 'sessionId'],
+  'ir.send': ['protocol', 'address', 'command', 'repeats', 'sessionId']
+};
+const payloadInteger = (value, max) => Number.isInteger(value) && value >= 0 && value <= max;
+const payloadNumber = (value, min, max) => typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max;
+const commandPayloadRules = {
+  button: value => ['power', 'speed_up', 'speed_down', 'breeze', 'horizontal', 'timer_1h', 'timer_2h', 'timer_4h'].includes(value),
+  sessionId: value => typeof value === 'string' && /^[a-f0-9]{32}$/.test(value),
+  level: value => payloadInteger(value, 5), confirmOff: value => typeof value === 'boolean',
+  enabled: value => typeof value === 'boolean',
+  thresholdsC: value => Array.isArray(value) && value.length === 5 && value.every(number => payloadNumber(number, -20, 60)),
+  hysteresisC: value => payloadNumber(value, .5, 5), protocol: value => value === 'NEC',
+  address: value => payloadInteger(value, 65535), command: value => payloadInteger(value, 255), repeats: value => payloadInteger(value, 3)
+};
+// OTel attributes use JSON text; the log writer exposes the same payload as an object.
+export function commandPayloadAttributes(type, payload) {
+  if (!Object.hasOwn(commandPayloadFields, type) || !payload || typeof payload !== 'object' || Array.isArray(payload)) return {};
+  const safe = Object.fromEntries(Object.entries(payload).filter(([key, value]) =>
+    commandPayloadFields[type].includes(key) && commandPayloadRules[key](value)));
+  return { 'command.payload': JSON.stringify(safe) };
+}
+function validCommandPayload(type, value) {
+  if (typeof value !== 'string' || value.length > 1024) return false;
+  try {
+    const payload = JSON.parse(value);
+    return commandPayloadAttributes(type, payload)['command.payload'] === JSON.stringify(payload);
+  } catch { return false; }
+}
+function logLevel(value) {
+  if (value.status === 'aborted' || Number(value.status) >= 500) return 'error';
+  if (Number(value.status) >= 400 || value.outcome === 'dropped') return 'warn';
+  return value.outcome && !['ok', 'succeeded'].includes(value.outcome) ? 'error' : 'info';
+}
 export const deviceMetricNames = new Set(['cpu_ratio', 'memory_available_bytes', 'memory_total_bytes', 'agent_rss_bytes',
   'uptime_seconds', 'disk_free_bytes', 'sensor_errors_total', 'sensor_sample_age_seconds', 'buffer_depth', 'readings_dropped_total', 'telemetry_dropped_total', 'telemetry_queue_depth']);
 export function validateTelemetry(value) {
@@ -36,7 +72,10 @@ export function validateTelemetry(value) {
     Number.isFinite(event.durationMs) && event.durationMs >= 0 && event.durationMs <= 86400_000 &&
     Number.isFinite(event.ageMs) && event.ageMs >= 0 && event.ageMs <= 7 * 86400_000 &&
     event.attributes && typeof event.attributes === 'object' && !Array.isArray(event.attributes) &&
-    Object.entries(event.attributes).every(([key, val]) => attributeNames.has(key) &&
+    Object.entries(event.attributes).every(([key, val]) => key === 'command.payload'
+      ? validCommandPayload(event.attributes['command.type'], val) : attributeNames.has(key) &&
+      (key !== 'command.type' || validCommandType(val)) &&
+      (key !== 'command.source' || ['manual', 'automatic'].includes(val)) &&
       ((typeof val === 'string' && /^[a-zA-Z0-9_.-]{1,100}$/.test(val)) || (typeof val === 'number' && Number.isFinite(val) && val >= 0 && val <= 1e16))));
 }
 const buckets = [.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30, 30.1, 31, 35, 40, 45, 60];
@@ -52,6 +91,11 @@ export class Observability {
     this.local = new AsyncLocalStorage(); this.registry = new Registry();
     this.logs = []; this.lokiEndpoint = lokiEndpoint; this.sendingLogs = false;
     this.log = value => {
+      value = { ...value, level: logLevel(value) };
+      if (typeof value['command.payload'] === 'string') {
+        try { value['command.payload'] = JSON.parse(value['command.payload']); }
+        catch { delete value['command.payload']; }
+      }
       try { log(value); } catch {}
       if (lokiEndpoint) {
         if (this.logs.length >= 256) { this.logs.shift(); this.logDrops?.inc(); }

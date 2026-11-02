@@ -45,8 +45,16 @@ they are approximate, and exclude network transit. No distributed clock accuracy
 is implied. A record lost during a device power failure cannot be recovered.
 
 Device events and HTTP request logs carry trace IDs, operation names, outcome,
-and IDs when appropriate. Never record tokens, headers, cookies, passwords,
-SQL values, command payloads, URLs, or raw exceptions. IDs belong in traces/logs,
+and IDs when appropriate. Command spans and corresponding logs also include
+`command.type` and `command.source` (`manual` for backend-queued commands,
+`automatic` for device-local fan adjustments). Supported commands also include
+`command.payload`: a JSON object in logs and JSON text in span attributes. It
+contains the known command parameters (button, target level, calibration or curve
+settings, IR parameters, and fan session ID); unrelated fields and invalid values
+are omitted. Logs have explicit severity levels so
+Loki does not infer an error from a field name such as `error.kind`.
+Never record tokens, headers, cookies, passwords,
+SQL values, unrecognized command fields, URLs, or raw exceptions. IDs belong in traces/logs,
 not metric labels. Known operation names and route templates bound cardinality.
 
 ## Metrics
