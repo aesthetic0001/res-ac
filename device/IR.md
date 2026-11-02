@@ -139,8 +139,10 @@ The Seeeduino's Linux agent evaluates fresh DHT11 samples locally, so operation
 does not depend on a backend temperature polling job. On heating, a threshold
 applies as soon as it is reached. On cooling, its configurable hysteresis (default
 1 °C) must also be crossed: with the balanced preset, level 3 begins at 26 °C
-and steps down at or below 25 °C. Automatic adjustments are at least 30 seconds
-apart. Sensor reads occur at least every 10 seconds while automatic mode is
+and steps down at or below 25 °C. Hysteresis can be any finite, nonnegative °C
+value with no upper cap; fractional values are supported. Set it to 0 to follow
+the same temperature thresholds on warming and cooling. Automatic adjustments
+are at least 30 seconds apart. Sensor reads occur at least every 10 seconds while automatic mode is
 enabled, even if the normal reporting interval is longer.
 
 Settings are atomically persisted in `/etc/res-ac/fan-curve.json` (mode 600).

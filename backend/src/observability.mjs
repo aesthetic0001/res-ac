@@ -9,6 +9,7 @@ import { TracerProvider, BatchSpanProcessor, RandomIdGenerator } from '@opentele
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import { Registry, Counter, Gauge, Histogram, collectDefaultMetrics } from 'prom-client';
+import { validHysteresis } from './fan-curve.mjs';
 
 export const validTraceparent = value => typeof value === 'string' && /^00-(?!0{32})[a-f0-9]{32}-(?!0{16})[a-f0-9]{16}-01$/.test(value);
 const serviceNames = { backend: 'res-ac-backend', agent: 'res-ac-agent', avr: 'res-ac-avr' };
@@ -35,7 +36,7 @@ const commandPayloadRules = {
   level: value => payloadInteger(value, 5), confirmOff: value => typeof value === 'boolean',
   enabled: value => typeof value === 'boolean',
   thresholdsC: value => Array.isArray(value) && value.length === 5 && value.every(number => payloadNumber(number, -20, 60)),
-  hysteresisC: value => payloadNumber(value, .5, 5), protocol: value => value === 'NEC',
+  hysteresisC: validHysteresis, protocol: value => value === 'NEC',
   address: value => payloadInteger(value, 65535), command: value => payloadInteger(value, 255), repeats: value => payloadInteger(value, 3)
 };
 // OTel attributes use JSON text; the log writer exposes the same payload as an object.

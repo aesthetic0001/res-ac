@@ -81,7 +81,8 @@ test('command payloads retain supported contents and exclude unrelated fields', 
   for (const [type, payload] of [
     ['device.ping', {}], ['fan.command', { button: 'power', sessionId }],
     ['fan.level', { level: 0, sessionId }], ['fan.calibrate', { confirmOff: true, sessionId }],
-    ['fan.curve', { enabled: true, thresholdsC: [-1, 20, 24, 24, 30], hysteresisC: .5, sessionId }],
+    ...[0, .1, 10, Number.MAX_VALUE].map(hysteresisC =>
+      ['fan.curve', { enabled: true, thresholdsC: [-1, 20, 24, 24, 30], hysteresisC, sessionId }]),
     ['ir.send', { protocol: 'NEC', address: 56960, command: 22, repeats: 3, sessionId }]
   ]) {
     const attributes = { 'command.type': type, ...commandPayloadAttributes(type, { ...payload, token: 'private' }) };

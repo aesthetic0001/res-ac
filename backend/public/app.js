@@ -157,7 +157,7 @@ for (const button of document.querySelectorAll('[data-fan-level]')) {
   });
 }
 const curveInputs = () => [...document.querySelectorAll('[data-curve-threshold]')];
-const curveValues = () => ({ enabled: el('#curve-enabled').checked, thresholdsC: curveInputs().map(input => input.value === '' ? NaN : Number(input.value)), hysteresisC: Number(el('#curve-hysteresis').value) });
+const curveValues = () => ({ enabled: el('#curve-enabled').checked, thresholdsC: curveInputs().map(input => input.value === '' ? NaN : Number(input.value)), hysteresisC: el('#curve-hysteresis').value === '' ? NaN : Number(el('#curve-hysteresis').value) });
 function editCurve(values) {
   curveInputs().forEach((input, index) => input.value = values[index]);
   curveDirty = true; curvePending = null; el('#curve-preset').value = 'custom';
@@ -205,6 +205,9 @@ el('#curve-form').addEventListener('submit', async event => {
   const settings = curveValues();
   if (!validThresholds(settings.thresholdsC)) {
     el('#curve-message').textContent = 'Temperatures must be nondecreasing, from -20 to 60 °C. Equal thresholds are allowed.'; return;
+  }
+  if (!Number.isFinite(settings.hysteresisC) || settings.hysteresisC < 0) {
+    el('#curve-message').textContent = 'Hysteresis must be a finite, nonnegative number in °C. Use 0 to disable it.'; return;
   }
   curveDirty = true; curvePending = settings;
   const queued = await queueFanCommand('fan.curve', settings);

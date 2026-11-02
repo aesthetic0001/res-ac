@@ -1,6 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { moveThreshold, validThresholds } from '../public/fan-curve.js';
+import { curveSettings } from '../src/fan-curve.mjs';
+
+test('hysteresis accepts zero and uncapped finite values, preserving the existing default', () => {
+  const settings = { enabled: true, thresholdsC: [24.5, 24.7, 24.7, 25, 25] };
+  assert.equal(curveSettings(settings).hysteresisC, 1);
+  for (const hysteresisC of [0, .1, 10, Number.MAX_VALUE])
+    assert.equal(curveSettings({ ...settings, hysteresisC }).hysteresisC, hysteresisC);
+  for (const hysteresisC of [-.1, NaN, Infinity, -Infinity, null, true, '0.1'])
+    assert.throws(() => curveSettings({ ...settings, hysteresisC }), /finite, nonnegative/);
+});
 
 test('graph editing carries neighboring thresholds without breaking nondecreasing order', () => {
   assert.deepEqual(moveThreshold([22,24,26,28,30],2,29),[22,24,29,29,30]);
