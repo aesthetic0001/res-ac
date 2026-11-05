@@ -29,6 +29,15 @@ Read diagnostics, Bridge collection, buffer wait, upload attempts, and database
 insertion share it. Retries preserve the reading ID and trace context. Failed
 reads and Bridge failures also generate diagnostics without requiring a valid
 sample. AVR durations use millis() subtraction, safe across timer rollover.
+
+With event-capable firmware, `bridge.collect` measures local time from decoding
+the pushed sample event (or recovery snapshot) to processing that sample. It
+includes time waiting in the agent's event queue, but does not measure AVR-to-Linux
+transport time before reception. This replaces timing several synchronous
+datastore reads, so its duration is not directly comparable to the old collector.
+The event queue retains the sensor diagnostic paired with each sample. Sensor
+execution still has its own `sensor.read` duration. Reads by all agent components
+use one shared Bridge cache populated by an initial snapshot and Mailbox events.
 Span resource identities are `res-ac-backend`, `res-ac-agent`, and `res-ac-avr`.
 Three fixed tracer providers share one bounded processor/exporter. Device IDs
 and agent sessions remain attributes rather than creating a provider per device.
@@ -99,6 +108,15 @@ output (for example `connection_refused`, `network_unreachable`,
 `host_unreachable`, or `tls_certificate`). Raw stderr, URLs, headers and response
 bodies are never exported. A generic curl message remains `connect_failed`;
 missing detail is not replaced with an inferred cause.
+
+Both `http.device` and `http.request` are agent-side HTTP client spans; the
+backend request span is `http.server`. The persistent libcurl helper shares a
+connection pool across these device requests. A reused connection normally has
+zero connect/TLS milestones; a timeout with ambiguous zero milestones is reported
+at stage `unknown`. HTTP completion arrives through private IPC and wakes the
+agent selector, without periodic subprocess-status checks. The existing
+`reading.buffer` span still ends at the first upload attempt, so retry/backoff
+time should be assessed separately from that initial queue wait.
 
 Failures include `network.start.*` and `network.*` snapshots at request start and
 completion: IPv4 default-route presence, interface operational state, and wireless

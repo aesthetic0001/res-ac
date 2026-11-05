@@ -33,6 +33,22 @@ def modern_curl():
     return gzip.compress(binary, compresslevel=9, mtime=0)
 
 
+def http_helper(path):
+    binary = path.read_bytes()
+    # The board needs big-endian ELF32 MIPS, with a fixed-address static build.
+    if (len(binary) < 52 or binary[:6] != b'\x7fELF\x01\x02' or
+            binary[16:20] != b'\x00\x02\x00\x08'):
+        raise ValueError('HTTP helper must be a static big-endian ELF32 MIPS executable')
+    offset = int.from_bytes(binary[28:32], 'big')
+    size = int.from_bytes(binary[42:44], 'big')
+    count = int.from_bytes(binary[44:46], 'big')
+    if not count or size < 32 or offset + size * count > len(binary):
+        raise ValueError('HTTP helper has an invalid ELF program table')
+    if any(int.from_bytes(binary[offset + i * size:offset + i * size + 4], 'big') == 3 for i in range(count)):
+        raise ValueError('HTTP helper must not require a dynamic loader')
+    return gzip.compress(binary, compresslevel=9, mtime=0)
+
+
 def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -40,7 +56,9 @@ def main():
     parser.add_argument('--config', type=Path, default=root / 'private' / 'device.json')
     parser.add_argument('--no-start', action='store_true', help='Install/verify only; leave the service stopped')
     parser.add_argument('--modern-curl', action='store_true',
-                        help='Install a separate static MIPS TLS client for legacy firmware/IP certificates')
+                        help='Legacy compatibility option; the persistent helper includes modern TLS')
+    parser.add_argument('--http-helper', type=Path, default=root / 'private/http-build/res-ac-http-mips',
+                        help='MIPS helper built locally by scripts/build_http_transport.py')
     args = parser.parse_args()
     if not args.config.is_file():
         parser.error('Run scripts/configure_device.py first, or provide a private --config file.')
@@ -48,10 +66,12 @@ def main():
         parser.error('Private configuration must have mode 600.')
     data = args.config.read_bytes()
     config = json.loads(data)
-    curl_gzip = modern_curl() if args.modern_curl else None
-    if curl_gzip:
-        config['curl_binary'] = '/tmp/res-ac-curl'
-        data = (json.dumps(config, indent=2) + '\n').encode()
+    if not args.http_helper.is_file():
+        parser.error('Build scripts/build_http_transport.py first, or provide --http-helper.')
+    helper_gzip = http_helper(args.http_helper)
+    config['http_helper'] = '/tmp/res-ac-http'
+    config.pop('curl_binary', None)
+    data = (json.dumps(config, indent=2) + '\n').encode()
     if config.get('ca_file') != '/etc/res-ac/ca-bundle.pem':
         parser.error('This installer expects ca_file=/etc/res-ac/ca-bundle.pem.')
     # Download public CA certificates using the host's verified HTTPS trust store.
@@ -66,34 +86,39 @@ def main():
     console = Console(args.port)
     try:
         console.run('mkdir -p /usr/lib/res-ac /etc/res-ac; chmod 700 /etc/res-ac')
-        if curl_gzip:
-            # Only a compressed copy occupies flash. The executable lives in RAM.
-            existing = console.run('md5sum /usr/lib/res-ac/curl.gz 2>/dev/null; true')
-            if hashlib.md5(curl_gzip).hexdigest().encode() not in existing:
-                last_percent = [-10]
-                def progress(done, total):
-                    percent = done * 100 // total
-                    if percent >= last_percent[0] + 5:
-                        print('TLS client transfer: %d%%' % percent, flush=True)
-                        last_percent[0] = percent
-                console.upload(curl_gzip, '/usr/lib/res-ac/curl.gz', progress=progress)
-            console.run('gzip -dc /usr/lib/res-ac/curl.gz > /tmp/res-ac-curl.new && '
-                        'chmod 700 /tmp/res-ac-curl.new && mv /tmp/res-ac-curl.new /tmp/res-ac-curl', timeout=30)
-            console.run('/tmp/res-ac-curl --version')
-        console.upload((root / 'device/res_ac_agent.py').read_bytes(), '/usr/lib/res-ac/res_ac_agent.py')
-        console.upload((root / 'device/dhcp_route_repair.py').read_bytes(), '/usr/lib/res-ac/dhcp_route_repair.py')
-        console.upload((root / 'device/network_watchdog.py').read_bytes(), '/usr/lib/res-ac/network_watchdog.py')
+        # Stage and preflight in RAM before replacing the existing TLS client.
+        console.upload(helper_gzip, '/tmp/res-ac-http.pending.gz')
+        console.run('gzip -dc /tmp/res-ac-http.pending.gz > /tmp/res-ac-http.pending && '
+                    'chmod 700 /tmp/res-ac-http.pending', timeout=30)
+        version = console.run('/tmp/res-ac-http.pending --version')
+        if b'res-ac-http protocol=1 ' not in version:
+            raise RuntimeError('Unexpected HTTP helper protocol')
+        agent_source = (root / 'device/res_ac_agent.py').read_bytes()
+        console.upload(agent_source, '/tmp/res_ac_agent.pending.py')
         console.upload(bundle, '/etc/res-ac/ca-bundle.pem', 0o644)
         # Probe the staged private config before replacing an existing working one.
         staged = '/etc/res-ac/agent.pending.json'
-        console.upload(data, staged)
+        probe_config = dict(config, http_helper='/tmp/res-ac-http.pending')
+        console.upload((json.dumps(probe_config) + '\n').encode(), staged)
         timestamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         console.run('date -u -s ' + shlex.quote(timestamp) + ' && date +%s > /etc/eduroam-clock')
-        probe = console.run('python -u /usr/lib/res-ac/res_ac_agent.py --config ' + staged + ' --probe', timeout=35)
+        probe = console.run('python -u /tmp/res_ac_agent.pending.py --config ' + staged + ' --probe', timeout=35)
         if b'PASS: verified HTTPS' not in probe:
             raise RuntimeError('The board HTTPS/device-token preflight did not pass. Firmware has not been changed.')
         print('Verified trusted HTTPS and device authentication; no synthetic reading was inserted.')
         console.run('if test -x /etc/init.d/res-ac-agent; then /etc/init.d/res-ac-agent stop; fi; true')
+        # Reuse the previous compressed TLS archive's flash slot, rather than
+        # storing two large static TLS binaries. Startup expands it as the helper.
+        existing = console.run('md5sum /usr/lib/res-ac/curl.gz 2>/dev/null; true')
+        if hashlib.md5(helper_gzip).hexdigest().encode() not in existing:
+            console.upload(helper_gzip, '/usr/lib/res-ac/curl.gz')
+        console.run('mv /tmp/res-ac-http.pending /tmp/res-ac-http && '
+                    'rm -f /tmp/res-ac-http.pending.gz /tmp/res_ac_agent.pending.py '
+                    '/tmp/res-ac-curl /tmp/res-ac-curl.new')
+        console.upload(agent_source, '/usr/lib/res-ac/res_ac_agent.py')
+        console.upload((root / 'device/dhcp_route_repair.py').read_bytes(), '/usr/lib/res-ac/dhcp_route_repair.py')
+        console.upload((root / 'device/network_watchdog.py').read_bytes(), '/usr/lib/res-ac/network_watchdog.py')
+        console.upload(data, staged)
         console.run('mv /etc/res-ac/agent.pending.json /etc/res-ac/agent.json; chmod 600 /etc/res-ac/agent.json')
         console.upload((root / 'device/res-ac-agent.init').read_bytes(), '/etc/init.d/res-ac-agent', 0o755)
         console.run('/etc/init.d/res-ac-agent enable')
