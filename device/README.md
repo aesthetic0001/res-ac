@@ -120,7 +120,11 @@ handling, and fan reporting share the same cache; their reads make no repeated
 TCP requests. Events bypass the former half-second collection/acknowledgment
 waits and one-second fan-state/automation waits. Timers still service
 upload retries, safety deadlines, fan heartbeat writes, and periodic
-backend state refreshes. AVR sampling and its 250 ms input-mailbox checks remain.
+backend state refreshes. AVR sampling remains timed. The AVR checks the command
+slot every 20 ms, independently of 250 ms configuration/watchdog housekeeping.
+New control commands refresh pending invalidation and heartbeat/session state
+before execution. Bridge round trips and physical IR dwell still contribute to
+end-to-end latency; the 20 ms value is the scheduled check interval.
 
 Bridge broadcasts both messages and request replies to all clients. The receiver
 separates those envelopes and handles fragmented/concatenated JSON, including the
@@ -181,7 +185,7 @@ In the backend dashboard, queue command type `device.ping` with payload `{}`.
 Linux maintains one 30-second long poll on `GET /api/devices/<device-id>/commands`
 with a 35-second curl timeout. Polling runs alongside sensor uploads. On delivery,
 it writes `v1,<command-UUID>,ping` to the Bridge `resac_command` key. The AVR
-checks this key every 250 ms and returns `v1,<command-UUID>,pong,<uptime-ms>` in
+checks this key every 20 ms and returns `v1,<command-UUID>,pong,<uptime-ms>` in
 `resac_command_result`. Linux requires a matching UUID and Arduino response;
 it does not answer ping on the Arduino's behalf.
 Polling starts only after the Arduino advertises its handler through Bridge.
@@ -258,6 +262,9 @@ Curve tests cover all 25 direct speed routes, clamped limits, off-state speed
 blocking, remembered speed across power toggles, threshold/hysteresis behavior, fresh
 sensor requirements, adjustment dwell, manual override, settings persistence,
 and sharing the command mailbox. Native estimate tests require a host C++ compiler.
+Native sketch tests also run the actual firmware with a virtual clock and
+Bridge/IR doubles, checking independent command cadence, safety refreshes,
+duplicate suppression, timer rollover, and housekeeping after IR dwell.
 Transport integration tests use a local HTTPS server to verify process/connection
 reuse, independent long polls, completion events, helper crash recovery,
 cancellation, timeouts, bounded responses, and certificate rejection. They require

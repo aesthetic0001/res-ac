@@ -19,12 +19,15 @@
 namespace {
 DHT dht(DHTPIN, DHTTYPE);
 const unsigned long DEFAULT_INTERVAL_MS = 10000;
+const unsigned long COMMAND_CHECK_MS = 20;
+const unsigned long HOUSEKEEPING_MS = 250;
 unsigned long intervalMs = DEFAULT_INTERVAL_MS;
 unsigned long lastSampleMs = 0;
 unsigned long sequence = 0;
 unsigned long sensorAttempts = 0;
 unsigned long sensorErrors = 0;
 unsigned long lastCommandCheckMs = 0;
+unsigned long lastHousekeepingMs = 0;
 char lastCommandId[37] = {0};
 char lastCommandReply[128] = {0};
 FanState fan;
@@ -177,6 +180,9 @@ void processCommand() {
     if (strtok_r(nullptr, ",", &save)) return;
   } else if (strcmp(separator + 1, "ping") != 0) return;
   if (strcmp(id, lastCommandId) != 0) {
+    // Fast command checks must still see pending invalidation and fresh agent
+    // heartbeats before authorizing an action, independently of housekeeping.
+    if (control || levelControl) updateFan();
     const unsigned long executionStarted = millis();
     if (control || levelControl) {
       if (!fanSession[0] || strcmp(session, fanSession) != 0 ||
@@ -353,12 +359,17 @@ void setup() {
 
 void loop() {
   processSerial();
+  const unsigned long commandNow = millis();
+  if (static_cast<unsigned long>(commandNow - lastCommandCheckMs) >= COMMAND_CHECK_MS) {
+    lastCommandCheckMs = commandNow;
+    processCommand();
+  }
+  // Recheck time after command execution, which can include physical IR dwell.
   const unsigned long now = millis();
-  if (static_cast<unsigned long>(now - lastCommandCheckMs) >= 250) {
-    lastCommandCheckMs = now;
+  if (static_cast<unsigned long>(now - lastHousekeepingMs) >= HOUSEKEEPING_MS) {
+    lastHousekeepingMs = now;
     updateInterval();
     updateFan();
-    processCommand();
   }
   if (static_cast<unsigned long>(now - lastSampleMs) >= intervalMs) {
     lastSampleMs = now;
