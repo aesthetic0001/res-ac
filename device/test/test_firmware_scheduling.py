@@ -13,6 +13,15 @@ class FirmwareSchedulingTests(unittest.TestCase):
         directory = Path(cls.directory.name)
         root = Path(__file__).resolve().parents[2]
         headers = {
+            'avr/interrupt.h': r'''
+                #pragma once
+                #define ISR(name) void name()
+            ''',
+            'util/atomic.h': r'''
+                #pragma once
+                #define ATOMIC_RESTORESTATE 0
+                #define ATOMIC_BLOCK(unused) for (bool once = true; once; once = false)
+            ''',
             'Arduino.h': r'''
                 #pragma once
                 #include <cstdint>
@@ -26,6 +35,9 @@ class FirmwareSchedulingTests(unittest.TestCase):
                 using std::lround;
                 #define F(s) s
                 #define HEX 16
+                #define _BV(bit) (1U << (bit))
+                enum {PB2=2, DDB2=2, PCIF0=0, PCINT2=2, PCIE0=0};
+                extern uint8_t PINB, DDRB, PORTB, PCIFR, PCMSK0, PCICR;
                 extern unsigned long testClock;
                 inline unsigned long millis() { return testClock; }
                 inline void delay(unsigned long ms) { testClock += ms; }
@@ -88,6 +100,7 @@ class FirmwareSchedulingTests(unittest.TestCase):
             '''
         }
         for name, source in headers.items():
+            (directory / name).parent.mkdir(parents=True, exist_ok=True)
             (directory / name).write_text(source)
         source = r'''
             #include <cassert>
@@ -96,6 +109,7 @@ class FirmwareSchedulingTests(unittest.TestCase):
             #include "Bridge.h"
             #include "Mailbox.h"
             #include "IRremote.hpp"
+            uint8_t PINB=0, DDRB=0xff, PORTB=0xff, PCIFR=0, PCMSK0=0, PCICR=0;
             unsigned long testClock = 0;
             TestSerial Serial;
             TestBridge Bridge;
@@ -106,7 +120,12 @@ class FirmwareSchedulingTests(unittest.TestCase):
             const char *id1 = "11111111-1111-4111-8111-111111111111";
             const char *id2 = "22222222-2222-4222-8222-222222222222";
             void reset() {
-              testClock = lastSampleMs = lastCommandCheckMs = lastHousekeepingMs = 0;
+              testClock = lastSampleMs = lastHousekeepingMs = 0;
+              #if RESAC_COMMAND_GPIO
+              PINB = _BV(PB2); commandWake = commandLowHandled = false;
+              #else
+              lastCommandCheckMs = 0;
+              #endif
               intervalMs = DEFAULT_INTERVAL_MS;
               lastCommandId[0] = lastCommandReply[0] = 0;
               fan.calibrateOff(); std::strcpy(fanSession, session);
@@ -117,13 +136,50 @@ class FirmwareSchedulingTests(unittest.TestCase):
               Bridge.values["resac_fan_heartbeat"] = "1";
               Bridge.values["resac_interval_ms"] = "10000";
             }
+            void notify() {
+              #if RESAC_COMMAND_GPIO
+              PINB &= ~_BV(PB2); PCINT0_vect();
+              #endif
+            }
             void power(const char *id = id1, const char *requestedSession = session) {
               Bridge.values["resac_command"] = std::string("v3,") + id + ",nec," + requestedSession + ",56960,0,0";
+              notify();
             }
             int main(int argc, char **argv) {
               assert(argc == 2); reset();
               const std::string mode = argv[1];
-              if (mode == "cadence") {
+              if (mode == "gpio") {
+                #if RESAC_COMMAND_GPIO
+                Bridge.values["resac_command"] = std::string("v1,") + id1 + ",ping";
+                for (unsigned long t=1; t<250; ++t) { testClock=t; loop(); }
+                assert(Bridge.reads["resac_command"] == 0); // No idle Bridge reads.
+                notify(); loop();
+                assert(Bridge.reads["resac_command"] == 1);
+                for (unsigned long t=250; t<500; ++t) { testClock=t; loop(); }
+                assert(Bridge.reads["resac_command"] == 1); // Held low reads once.
+                PINB = _BV(PB2); PCINT0_vect(); loop();
+                assert(Bridge.reads["resac_command"] == 1); // Release is not work.
+                Bridge.values["resac_command"] = std::string("v1,") + id2 + ",ping";
+                PINB = 0; loop(); // Assertion IRQ masked during a sensor read.
+                assert(Bridge.reads["resac_command"] == 2);
+                notify(); loop(); assert(Bridge.reads["resac_command"] == 3);
+                assert(Mailbox.messages.size() == 4); // Duplicate ID is not executed again.
+                PINB = _BV(PB2); loop(); notify(); PINB = _BV(PB2); loop();
+                assert(Bridge.reads["resac_command"] == 3); // Canceled before main-loop dispatch.
+                #else
+                assert(false);
+                #endif
+              } else if (mode == "boot") {
+                #if RESAC_COMMAND_GPIO
+                PINB = 0; power(); setup();
+                assert(!(DDRB & _BV(DDB2)) && (PORTB & _BV(PB2)));
+                assert(PCMSK0 & _BV(PCINT2)); assert(PCICR & _BV(PCIE0));
+                assert(Bridge.values["resac_command_notify"] == "gpio21-pb2-v1");
+                assert(Bridge.values["resac_command"].empty());
+                lastSampleMs = testClock; loop(); assert(Bridge.reads["resac_command"] == 0);
+                #endif
+              } else if (mode == "cadence") {
+                #if !RESAC_COMMAND_GPIO
                 Bridge.values["resac_command"] = std::string("v1,") + id1 + ",ping";
                 testClock = 19; loop(); assert(Bridge.reads["resac_command"] == 0);
                 testClock = 20; loop(); assert(Bridge.reads["resac_command"] == 1);
@@ -137,6 +193,7 @@ class FirmwareSchedulingTests(unittest.TestCase):
                 testClock = 249; loop(); assert(Bridge.reads["resac_interval_ms"] == 0);
                 testClock = 250; loop(); assert(Bridge.reads["resac_interval_ms"] == 1);
                 assert(Bridge.reads["resac_fan_heartbeat"] == 1);
+              #endif
               } else if (mode == "safety") {
                 power(); Bridge.values["resac_fan_invalidate"] = "1";
                 testClock = 20; loop();
@@ -158,14 +215,17 @@ class FirmwareSchedulingTests(unittest.TestCase):
                 testClock = 20; loop(); assert(IrSender.sends == 0);
               } else if (mode == "rollover") {
                 Bridge.values["resac_command"] = std::string("v1,") + id1 + ",ping";
+                #if !RESAC_COMMAND_GPIO
                 lastCommandCheckMs = std::numeric_limits<unsigned long>::max() - 10;
+                #endif
+                notify();
                 lastHousekeepingMs = std::numeric_limits<unsigned long>::max() - 100;
                 testClock = lastSampleMs = 9; loop();
                 assert(Bridge.reads["resac_command"] == 1);
                 assert(Bridge.reads["resac_interval_ms"] == 0);
               } else if (mode == "dwell") {
                 Bridge.values["resac_command"] = std::string("v4,") + id1 + ",level," + session + ",5";
-                testClock = 20; loop();
+                notify(); testClock = 20; loop();
                 assert(IrSender.sends == 5 && fan.speed() == 5);
                 assert(testClock == 620); // Original power/step dwell is preserved.
                 assert(lastHousekeepingMs == testClock);
@@ -175,9 +235,13 @@ class FirmwareSchedulingTests(unittest.TestCase):
         '''
         path = directory / 'sketch.cpp'
         path.write_text(source)
-        cls.binary = str(directory / 'sketch-test')
-        subprocess.run([shutil.which('g++') or 'g++', '-std=c++11', '-I' + str(directory),
-                        '-I' + str(root / 'include'), str(path), '-o', cls.binary], check=True)
+        cls.binaries = []
+        for enabled in (0, 1):
+            binary = str(directory / ('sketch-test-' + str(enabled)))
+            subprocess.run([shutil.which('g++') or 'g++', '-std=c++11', '-DRESAC_COMMAND_GPIO=' + str(enabled),
+                            '-I' + str(directory), '-I' + str(root / 'include'), str(path), '-o', binary], check=True)
+            cls.binaries.append(binary)
+        cls.binary = cls.binaries[0]
 
     @classmethod
     def tearDownClass(cls):
@@ -187,10 +251,20 @@ class FirmwareSchedulingTests(unittest.TestCase):
         subprocess.run([self.binary, 'cadence'], check=True)
 
     def test_new_commands_refresh_invalidation_heartbeat_and_session_guards(self):
-        subprocess.run([self.binary, 'safety'], check=True)
+        for binary in self.binaries:
+            subprocess.run([binary, 'safety'], check=True)
 
     def test_command_schedule_survives_millis_rollover(self):
-        subprocess.run([self.binary, 'rollover'], check=True)
+        for binary in self.binaries:
+            subprocess.run([binary, 'rollover'], check=True)
 
     def test_housekeeping_runs_after_physical_ir_dwell(self):
-        subprocess.run([self.binary, 'dwell'], check=True)
+        for binary in self.binaries:
+            subprocess.run([binary, 'dwell'], check=True)
+
+
+    def test_gpio_reads_commands_only_on_notification_and_handles_masked_interrupts(self):
+        subprocess.run([self.binaries[1], 'gpio'], check=True)
+
+    def test_gpio_boot_discards_stale_command_and_held_signal(self):
+        subprocess.run([self.binaries[1], 'boot'], check=True)

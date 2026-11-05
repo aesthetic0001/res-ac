@@ -12,7 +12,8 @@ sensor reads are reported as errors rather than uploaded as zero or stale data.
 
 `res_ac_agent.py` runs on the Linux processor. A small event loop receives pushed
 Bridge Mailbox events while one persistent libcurl helper handles HTTPS asynchronously. This works with
-the board's minimal Python 2.7 without installing threading or other packages.
+the board's Python 2.7 without installing threading. GPIO ownership also requires
+the standard `fcntl.flock` module, checked by the installer before replacement.
 Both legacy JSON APIs used by Yun firmware are supported.
 
 The agent and AVR firmware must be updated together: the new agent requires the
@@ -184,10 +185,15 @@ legacy standalone probes retain their CLI adapter.
 In the backend dashboard, queue command type `device.ping` with payload `{}`.
 Linux maintains one 30-second long poll on `GET /api/devices/<device-id>/commands`
 with a 35-second curl timeout. Polling runs alongside sensor uploads. On delivery,
-it writes `v1,<command-UUID>,ping` to the Bridge `resac_command` key. The AVR
-checks this key every 20 ms and returns `v1,<command-UUID>,pong,<uptime-ms>` in
+it writes `v1,<command-UUID>,ping` to the Bridge `resac_command` key. After Bridge
+confirms that exact write, Linux asserts the existing GPIO21 → AVR PB2 connection.
+The AVR handles the notification and returns `v1,<command-UUID>,pong,<uptime-ms>` in
 `resac_command_result`. Linux requires a matching UUID and Arduino response;
 it does not answer ping on the Arduino's behalf.
+The Seeeduino Cloud GPIO sketch makes no periodic command reads. It keeps
+250 ms configuration/watchdog housekeeping and the existing sensor schedule.
+See [GPIO command notifications](GPIO.md) for wiring, ownership, recovery,
+the Bridge socket-readiness update, and the outstanding hardware validation.
 Polling starts only after the Arduino advertises its handler through Bridge.
 The target-level sketch advertises `v4`; command-frame parsing also understands
 the older `v1`/`v2` ping and `v3` calibrated-IR formats. Use an event-capable sketch

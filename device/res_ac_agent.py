@@ -216,6 +216,193 @@ def parse_sample(frame):
                 temperatureC=temperature / 1000.0, humidity=humidity / 1000.0)
 
 
+COMMAND_GPIO_PROTOCOL = 'gpio21-pb2-v1'
+
+
+class CommandGPIO(object):
+    """Exclusive, persistent sysfs GPIO outputs for Seeeduino Cloud v1.0.
+
+    GPIO21 carries an active-low command-pending level; GPIO19 enables the board's SPI
+    voltage translators. Never steal exported pins or unbind a kernel driver.
+    A locked RAM-only ownership record permits cleanup after an agent crash.
+    """
+    def __init__(self, root='/sys/class/gpio', lock_path='/var/run/res-ac-command-gpio.lock',
+                 debug_path='/sys/kernel/debug/gpio'):
+        self.root, self.lock_path = root, lock_path
+        self.debug_path = debug_path
+        self.lock_fd = self.value_fd = None
+        self.owned = []
+        self.enable_restore = None
+
+    def _read(self, pin, name):
+        with open('%s/gpio%d/%s' % (self.root, pin, name)) as stream:
+            return stream.read().strip()
+
+    @staticmethod
+    def _ownership(record):
+        fields = record.split(';')
+        prefix = COMMAND_GPIO_PROTOCOL + ':'
+        pins = fields[0][len(prefix):].split(',') if fields[0].startswith(prefix) else []
+        restore = fields[1].split('=')[1] if (len(fields) == 2 and fields[0].startswith(prefix) and
+                                            fields[1] in ('restore19=0', 'restore19=1')) else None
+        return [int(pin) for pin in pins if pin in ('19', '21')], restore
+
+    def _board_enable(self, debug_path=None):
+        # The installed Linino kernel deliberately exports OE-1 with a fixed
+        # output direction. Its writable value is the board's translator gate;
+        # it is not an export that this agent may unexport or reconfigure.
+        try:
+            with open(debug_path or self.debug_path) as stream:
+                return any(re.match(r'^\s*gpio-19\s+\(\s*OE-1\s*\)\s+out\s+(?:lo|hi)\b', line)
+                           for line in stream)
+        except IOError:
+            return False
+
+    def preflight(self, debug_path='/sys/kernel/debug/gpio'):
+        """Read-only prerequisites; actual exclusive export happens at dispatch."""
+        import fcntl
+        if not hasattr(fcntl, 'flock'):
+            raise IOError('GPIO notifications require flock support')
+        for name in ('export', 'unexport'):
+            if not os.access(self.root + '/' + name, os.W_OK):
+                raise IOError('Writable GPIO sysfs is required')
+        if not os.access(os.path.dirname(self.lock_path), os.W_OK):
+            raise IOError('GPIO ownership directory is not writable')
+        try:
+            with open(self.lock_path) as stream:
+                record = stream.read(128)
+        except IOError as error:
+            if error.errno != errno.ENOENT:
+                raise
+            record = ''
+        recovered, _ = self._ownership(record)
+        for pin in (21, 19):
+            exists = os.path.isdir('%s/gpio%d' % (self.root, pin))
+            if exists and pin not in recovered:
+                if pin == 19 and self._board_enable(debug_path):
+                    if not os.access(self.root + '/gpio19/value', os.W_OK):
+                        raise IOError('Board translator enable is not writable')
+                    continue
+                if pin != 19 or self._read(pin, 'direction') != 'out' or self._read(pin, 'value') != '1':
+                    raise IOError('GPIO is already exported by another owner')
+        if os.path.isfile(debug_path):
+            with open(debug_path) as stream:
+                for line in stream:
+                    match = re.match(r'^\s*gpio-(19|21)\s', line)
+                    if match and not os.path.isdir('%s/gpio%s' % (self.root, match.group(1))):
+                        raise IOError('GPIO is reserved by a kernel driver')
+
+    def _write(self, path, value):
+        fd = os.open(self.root + '/' + path, os.O_WRONLY)
+        try:
+            if os.write(fd, value.encode('ascii')) != len(value):
+                raise IOError('Incomplete GPIO write')
+        finally:
+            os.close(fd)
+
+    def _record(self):
+        os.lseek(self.lock_fd, 0, os.SEEK_SET)
+        os.ftruncate(self.lock_fd, 0)
+        record = ('%s:%s' % (COMMAND_GPIO_PROTOCOL,
+                            ','.join(str(pin) for pin in self.owned)))
+        if self.enable_restore is not None:
+            record += ';restore19=' + self.enable_restore
+        record = record.encode('ascii')
+        if os.write(self.lock_fd, record) != len(record):
+            raise IOError('Incomplete GPIO ownership record')
+
+    def open(self):
+        if self.value_fd is not None:
+            return
+        # Lazy import preserves compatibility with old sketches and --probe on
+        # minimal Python installs. GPIO preflight checks this dependency.
+        import fcntl
+        fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except Exception:
+            os.close(fd)
+            raise IOError('Command GPIO is already owned by another agent')
+        self.lock_fd = fd
+        try:
+            os.fchmod(fd, 0o600)
+            record = os.read(fd, 128).decode('ascii')
+            recovered, self.enable_restore = self._ownership(record)
+            self.owned = [pin for pin in recovered if os.path.isdir('%s/gpio%d' % (self.root, pin))]
+            for pin in (21, 19):
+                exists = os.path.isdir('%s/gpio%d' % (self.root, pin))
+                if pin == 19 and exists and self._board_enable():
+                    if self.enable_restore is None:
+                        self.enable_restore = self._read(19, 'value')
+                    if self.enable_restore not in ('0', '1'):
+                        raise IOError('Invalid board translator enable state')
+                    self._record()  # Persist the original value before changing it.
+                    self._write('gpio19/value', '1')
+                    continue
+                if exists and pin not in recovered:
+                    # GPIO19 may be deliberately enabled by board startup. Reuse
+                    # only that existing high output, without taking ownership.
+                    if pin == 19 and self._read(pin, 'direction') == 'out' and self._read(pin, 'value') == '1':
+                        continue
+                    raise IOError('Command GPIO is reserved; stop its owner before enabling notifications')
+                if not exists:
+                    self._write('export', str(pin))  # EBUSY also protects kernel-owned pins.
+                if pin not in self.owned:
+                    self.owned.append(pin)
+                self._record()
+                # Initialize idle high before enabling the translator; no low glitch.
+                self._write('gpio%d/direction' % pin, 'high')
+            self.value_fd = os.open(self.root + '/gpio21/value', os.O_WRONLY)
+        except Exception:
+            self.close()
+            raise
+
+    def set(self, pending):
+        if self.value_fd is None:
+            if not pending:
+                return
+            raise IOError('Command GPIO is not open')
+        os.lseek(self.value_fd, 0, os.SEEK_SET)
+        if os.write(self.value_fd, b'0' if pending else b'1') != 1:
+            raise IOError('Incomplete command notification')
+
+    def close(self):
+        failed = False
+        if self.value_fd is not None:
+            try:
+                self.set(False)
+            except (IOError, OSError):
+                failed = True
+            os.close(self.value_fd)
+            self.value_fd = None
+        if self.lock_fd is not None:
+            if self.enable_restore is not None:
+                try:
+                    if not self._board_enable():
+                        raise IOError('Board translator ownership changed')
+                    self._write('gpio19/value', self.enable_restore)
+                    self.enable_restore = None
+                except (IOError, OSError):
+                    failed = True
+            for pin in list(self.owned):
+                try:
+                    if pin == 21:
+                        self._write('gpio21/direction', 'high')
+                    self._write('unexport', str(pin))
+                    self.owned.remove(pin)
+                except (IOError, OSError):
+                    failed = True
+            try:
+                self._record()
+            except (IOError, OSError):
+                failed = True
+            finally:
+                os.close(self.lock_fd)
+                self.lock_fd = None
+        if failed:
+            log('Command GPIO cleanup incomplete; check recorded pin ownership before reuse')
+
+
 class BridgeStore(object):
     """Short local TCP transactions; decode fragmented JSON without Yun client bugs."""
     def __init__(self, host='127.0.0.1', port=5700):
@@ -265,9 +452,10 @@ class BridgeEvents(object):
                       'resac_sensor_status', 'resac_sensor_diagnostic', 'resac_command_ready',
                       'resac_command_result', 'resac_command_diagnostic', 'resac_fan_state',
                       'resac_fan_session', 'resac_fan_heartbeat', 'resac_fan_invalidate',
-                      'resac_command', 'resac_command_status', 'resac_upload_status'])
+                      'resac_command', 'resac_command_status', 'resac_upload_status',
+                      'resac_command_notify'])
 
-    def __init__(self, host='127.0.0.1', port=5700):
+    def __init__(self, host='127.0.0.1', port=5700, command_gpio=None):
         self.host, self.port = host, port
         self.connection = None
         self.connecting = False
@@ -289,6 +477,8 @@ class BridgeEvents(object):
         self.depth = 0
         self.quoted = False
         self.escaped = False
+        self.command_gpio = command_gpio
+        self.notification = None
 
     def version(self, *keys):
         return (self.generation,) + tuple(self.revisions.get(key, 0) for key in keys)
@@ -303,6 +493,45 @@ class BridgeEvents(object):
             raise IOError('Bridge event stream is not ready')
         self._queue(dict(command='put', key=key, value=value))
         self._update(key, value)
+
+    def dispatch_command(self, frame, deadline):
+        capability = self.get('resac_command_notify')
+        if capability and capability != COMMAND_GPIO_PROTOCOL:
+            raise IOError('Unsupported command GPIO wiring profile')
+        if not capability:
+            self.put('resac_command', frame)  # Older firmware retains its polling handler.
+            return
+        if self.command_gpio is None:
+            raise IOError('GPIO command firmware requires GPIO support in the agent')
+        if self.notification is not None:
+            raise IOError('An AVR command notification is already pending')
+        if monotonic() >= deadline:
+            raise IOError('Command expired before Bridge dispatch')
+        self.command_gpio.open()
+        self.command_gpio.set(False)
+        self.put('resac_command', frame)
+        # Wait for this exact put confirmation before asserting the wire. TCP
+        # send completion alone does not establish that the datastore was updated.
+        self.notification = dict(frame=frame, deadline=deadline, signaled=False)
+
+    def cancel_command(self, command_id=None):
+        pending = self.notification
+        if pending is not None and (command_id is None or pending['frame'].split(',')[1] == command_id):
+            self.notification = None
+            try:
+                self.command_gpio.set(False)
+            except (IOError, OSError):
+                self.command_gpio.close()
+                raise
+
+    def _close_command_gpio(self):
+        self.notification = None
+        if self.command_gpio is not None:
+            self.command_gpio.close()
+
+    def _expire_notification(self):
+        if self.notification is not None and monotonic() >= self.notification['deadline']:
+            self.cancel_command()
 
     def _queue(self, value):
         encoded = encode_json(value).encode('utf-8')
@@ -334,6 +563,7 @@ class BridgeEvents(object):
         return samples
 
     def _snapshot(self):
+        self._close_command_gpio()
         self.ready = False
         self.snapshot_pending = True
         self.deadline = monotonic() + 2
@@ -341,6 +571,14 @@ class BridgeEvents(object):
 
     def _message(self, message):
         if not isinstance(message, dict):
+            return
+        pending = self.notification
+        if (self.ready and pending is not None and message.get('response') == 'put' and
+                message.get('key') == 'resac_command' and message.get('value') == pending['frame']):
+            self._expire_notification()
+            if self.notification is not None and not pending['signaled']:
+                self.command_gpio.set(True)
+                pending['signaled'] = True
             return
         if message.get('response') == 'get' and 'key' not in message and self.snapshot_pending:
             values = message.get('value')
@@ -376,6 +614,7 @@ class BridgeEvents(object):
                 self.snapshot_pending = False
                 self.values = {}
                 self.outgoing = b''
+                self._close_command_gpio()
                 self.sample_live = False
                 self.generation += 1
                 self.deadline = monotonic() + 2
@@ -418,6 +657,7 @@ class BridgeEvents(object):
                 self._message(message)
 
     def _disconnect(self):
+        self._close_command_gpio()
         if self.connection is not None:
             self.connection.close()
         self.connection = None
@@ -436,6 +676,7 @@ class BridgeEvents(object):
 
     def poll(self, timeout=0):
         try:
+            self._expire_notification()
             if self.connection is None:
                 if monotonic() < self.retry_at:
                     if timeout:
@@ -1316,6 +1557,11 @@ class CommandProcessor(object):
         return attributes
 
     def _complete(self, status, result):
+        if isinstance(self.bridge, BridgeEvents):
+            try:
+                self.bridge.cancel_command(self.current['id'])
+            except (IOError, OSError):
+                log('Command notification could not be cleared; GPIO will be reopened before reuse')
         parent = self.current.get('traceparent') or traceparent()
         telemetry = self.config.get('_telemetry')
         if telemetry:
@@ -1438,7 +1684,10 @@ class CommandProcessor(object):
 
     def _dispatch(self, frame):
         started = monotonic()
-        self.bridge.put('resac_command', frame)
+        if isinstance(self.bridge, BridgeEvents):
+            self.bridge.dispatch_command(frame, self.deadline)
+        else:
+            self.bridge.put('resac_command', frame)
         telemetry = self.config.get('_telemetry')
         if telemetry:
             telemetry.event('bridge.dispatch', self.current.get('traceparent'), monotonic() - started,
@@ -1746,11 +1995,14 @@ def next_wakeup(bridge, telemetry, commands, automation, fan_reporter, pending, 
         due(getattr(bridge, 'retry_at', None))
     elif not bridge.ready:
         due(bridge.deadline)
+    notification = getattr(bridge, 'notification', None)
+    if notification is not None:
+        due(notification['deadline'])
     return max(0, min(deadlines or [now + 60]) - now)
 
 
 def run(config):
-    bridge = config.get('_bridge') or BridgeEvents()
+    bridge = config.get('_bridge') or BridgeEvents(command_gpio=CommandGPIO())
     config['_bridge'] = bridge
     http = config.get('_http') or HttpTransport(config)
     config['_http'] = http
@@ -1816,6 +2068,10 @@ def run(config):
 
 
 def main():
+    if '--gpio-preflight' in sys.argv:
+        CommandGPIO().preflight()
+        print('PASS: GPIO notification prerequisites; no GPIO outputs changed')
+        return 0
     path = CONFIG_PATH
     if '--config' in sys.argv:
         path = sys.argv[sys.argv.index('--config') + 1]

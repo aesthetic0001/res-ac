@@ -13,6 +13,7 @@ import sys
 import tarfile
 from urllib.request import urlopen
 from serial_console import Console
+from prepare_bridge_socket_wait import prepare as prepare_bridge_reader
 
 
 # Separate, reproducible TLS client for legacy PolarSSL IP-SAN incompatibility.
@@ -95,6 +96,18 @@ def main():
             raise RuntimeError('Unexpected HTTP helper protocol')
         agent_source = (root / 'device/res_ac_agent.py').read_bytes()
         console.upload(agent_source, '/tmp/res_ac_agent.pending.py')
+        gpio_probe = console.run('python -u /tmp/res_ac_agent.pending.py --gpio-preflight')
+        if b'PASS: GPIO notification prerequisites' not in gpio_probe:
+            raise RuntimeError('GPIO notification preflight did not pass. Firmware has not been changed.')
+        bridge_path = '/usr/lib/python2.7/bridge/'
+        # Match the installed implementation before touching vendor source. A
+        # different Bridge version needs review rather than a guessed patch.
+        bridge_reader = prepare_bridge_reader(console.download(bridge_path + 'packet.py', max_bytes=65536))
+        socket_wait = (root / 'device/bridge_socket_wait.py').read_bytes()
+        console.upload(bridge_reader, '/tmp/resac_packet.pending.py')
+        console.upload(socket_wait, '/tmp/bridge_socket_wait.pending.py')
+        console.run("python -c \"compile(open('/tmp/resac_packet.pending.py').read(), 'packet.py', 'exec'); "
+                    "compile(open('/tmp/bridge_socket_wait.pending.py').read(), 'bridge_socket_wait.py', 'exec')\"")
         console.upload(bundle, '/etc/res-ac/ca-bundle.pem', 0o644)
         # Probe the staged private config before replacing an existing working one.
         staged = '/etc/res-ac/agent.pending.json'
@@ -107,6 +120,13 @@ def main():
             raise RuntimeError('The board HTTPS/device-token preflight did not pass. Firmware has not been changed.')
         print('Verified trusted HTTPS and device authentication; no synthetic reading was inserted.')
         console.run('if test -x /etc/init.d/res-ac-agent; then /etc/init.d/res-ac-agent stop; fi; true')
+        console.upload(socket_wait, bridge_path + 'bridge_socket_wait.py', 0o644)
+        console.upload(bridge_reader, bridge_path + 'packet.py.res-ac-pending', 0o644)
+        console.run('test -f ' + bridge_path + 'packet.py.res-ac-original || '
+                    'cp ' + bridge_path + 'packet.py ' + bridge_path + 'packet.py.res-ac-original')
+        console.run('mv ' + bridge_path + 'packet.py.res-ac-pending ' + bridge_path + 'packet.py && '
+                    'rm -f ' + bridge_path + 'packet.pyc ' + bridge_path + 'bridge_socket_wait.pyc '
+                    '/tmp/resac_packet.pending.py /tmp/bridge_socket_wait.pending.py')
         # Reuse the previous compressed TLS archive's flash slot, rather than
         # storing two large static TLS binaries. Startup expands it as the helper.
         existing = console.run('md5sum /usr/lib/res-ac/curl.gz 2>/dev/null; true')
@@ -138,6 +158,7 @@ def main():
             console.run('/etc/init.d/res-ac-network start')
         print('Agent installed and enabled for boot. Private configuration was not printed.')
         print('The Bridge collector becomes active when the reporting firmware starts.')
+        print('Bridge socket wake-ups take effect when Bridge restarts with the AVR firmware.')
     finally:
         console.close()
 

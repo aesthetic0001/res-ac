@@ -6,6 +6,20 @@
 #include <string.h>
 #include <FanState.h>
 
+// Seeeduino Cloud v1.0: Linux GPIO21 -> TXS0102 -> PB2/MOSI (PCINT2).
+// This is NOT the D7 handshake connection found on the original Arduino Yun.
+#ifndef RESAC_COMMAND_GPIO
+#define RESAC_COMMAND_GPIO 1
+#endif
+#if RESAC_COMMAND_GPIO
+#include <avr/interrupt.h>
+#include <util/atomic.h>
+volatile bool commandWake = false;
+ISR(PCINT0_vect) {
+  if (!(PINB & _BV(PB2))) commandWake = true;
+}
+#endif
+
 // Software carrier leaves the Bridge UART, millis() and DHT11 pin available.
 #define IR_SEND_PIN 9
 #define IR_SEND_DUTY_CYCLE_PERCENT 50
@@ -19,14 +33,18 @@
 namespace {
 DHT dht(DHTPIN, DHTTYPE);
 const unsigned long DEFAULT_INTERVAL_MS = 10000;
+#if RESAC_COMMAND_GPIO
+bool commandLowHandled = false;
+#else
 const unsigned long COMMAND_CHECK_MS = 20;
+unsigned long lastCommandCheckMs = 0;
+#endif
 const unsigned long HOUSEKEEPING_MS = 250;
 unsigned long intervalMs = DEFAULT_INTERVAL_MS;
 unsigned long lastSampleMs = 0;
 unsigned long sequence = 0;
 unsigned long sensorAttempts = 0;
 unsigned long sensorErrors = 0;
-unsigned long lastCommandCheckMs = 0;
 unsigned long lastHousekeepingMs = 0;
 char lastCommandId[37] = {0};
 char lastCommandReply[128] = {0};
@@ -339,6 +357,7 @@ void setup() {
   Bridge.begin();
   Mailbox.begin();
   publishValue("resac_events", "");
+  publishValue("resac_command_notify", "");
   publishValue("resac_sensor_status", "starting");
   // AVR sequence numbers restart at zero; request a fresh reading-ID epoch.
   publishValue("resac_epoch", "");
@@ -350,6 +369,21 @@ void setup() {
   publishValue("resac_sensor_diagnostic", "");
   Bridge.put("resac_fan_invalidate", "");
   invalidateFan();
+#if RESAC_COMMAND_GPIO
+  // An AVR pull-up keeps this active-low input inactive if Linux releases it
+  // or disables the translator. The board translates 3.3 V to 5 V; never drive
+  // this shared line from the AVR.
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    DDRB &= ~_BV(DDB2);
+    PORTB |= _BV(PB2);
+    commandWake = false;
+    commandLowHandled = (PINB & _BV(PB2)) == 0;
+    PCIFR = _BV(PCIF0);
+    PCMSK0 |= _BV(PCINT2);
+    PCICR |= _BV(PCIE0);
+  }
+  publishValue("resac_command_notify", "gpio21-pb2-v1");
+#endif
   publishValue("resac_command_ready", "v4");
   publishValue("resac_events", "v1");
   Serial.println(F("Bridge ready; DHT11 on digital pin 3"));
@@ -359,11 +393,28 @@ void setup() {
 
 void loop() {
   processSerial();
+#if RESAC_COMMAND_GPIO
+  bool wake;
+  bool pending;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    wake = commandWake;
+    commandWake = false;
+    pending = (PINB & _BV(PB2)) == 0;
+  }
+  // A held level also catches assertion during DHT's interrupt-masked section.
+  // Reading the local input does not generate a Bridge transaction.
+  if (!pending) commandLowHandled = false;
+  if (pending && (wake || !commandLowHandled)) {
+    commandLowHandled = pending;
+    processCommand();
+  }
+#else
   const unsigned long commandNow = millis();
   if (static_cast<unsigned long>(commandNow - lastCommandCheckMs) >= COMMAND_CHECK_MS) {
     lastCommandCheckMs = commandNow;
     processCommand();
   }
+#endif
   // Recheck time after command execution, which can include physical IR dwell.
   const unsigned long now = millis();
   if (static_cast<unsigned long>(now - lastHousekeepingMs) >= HOUSEKEEPING_MS) {
