@@ -25,6 +25,8 @@ class TransportInstallTests(unittest.TestCase):
     def setUp(self):
         self.events, self.uploads = [], {}
         self.probe_ok = True
+        self.gpio_ok = True
+        self.bridge_ok = True
         outer = self
 
         class Console:
@@ -35,10 +37,16 @@ class TransportInstallTests(unittest.TestCase):
                 outer.events.append(('upload', destination))
                 outer.uploads[destination] = data
 
+            def download(self, source, **kwargs):
+                outer.events.append(('download', source))
+                return (outer.preparer.ORIGINAL if outer.bridge_ok else 'unrecognized').encode()
+
             def run(self, command, **kwargs):
                 outer.events.append(('run', command))
                 if command == '/tmp/res-ac-http.pending --version':
                     return b'res-ac-http protocol=1 libcurl=8.23.0'
+                if '--gpio-preflight' in command:
+                    return b'PASS: GPIO notification prerequisites' if outer.gpio_ok else b'FAIL'
                 if '--probe' in command:
                     config = json.loads(outer.uploads['/etc/res-ac/agent.pending.json'])
                     outer.assertEqual(config['http_helper'], '/tmp/res-ac-http.pending')
@@ -51,7 +59,11 @@ class TransportInstallTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         spec = importlib.util.spec_from_file_location('installer', root / 'scripts/install_device.py')
         self.installer = importlib.util.module_from_spec(spec)
-        with patch.dict(sys.modules, {'serial_console': SimpleNamespace(Console=Console)}):
+        prepare_spec = importlib.util.spec_from_file_location('prepare_bridge_socket_wait', root / 'scripts/prepare_bridge_socket_wait.py')
+        self.preparer = importlib.util.module_from_spec(prepare_spec)
+        prepare_spec.loader.exec_module(self.preparer)
+        with patch.dict(sys.modules, {'serial_console': SimpleNamespace(Console=Console),
+                                     'prepare_bridge_socket_wait': self.preparer}):
             spec.loader.exec_module(self.installer)
 
     def invoke(self):
@@ -100,6 +112,20 @@ class TransportInstallTests(unittest.TestCase):
                 path.write_bytes(content)
                 with self.assertRaises(ValueError):
                     self.installer.http_helper(path)
+
+    def test_gpio_preflight_failure_keeps_existing_agent_running(self):
+        self.gpio_ok = False
+        with self.assertRaises(RuntimeError):
+            self.invoke()
+        self.assertNotIn('/usr/lib/res-ac/res_ac_agent.py', self.uploads)
+        self.assertFalse(any(event[0] == 'run' and 'res-ac-agent stop' in event[1] for event in self.events))
+
+    def test_unrecognized_bridge_is_rejected_before_stopping_existing_agent(self):
+        self.bridge_ok = False
+        with self.assertRaises(ValueError):
+            self.invoke()
+        self.assertFalse(any(event[0] == 'run' and 'res-ac-agent stop' in event[1] for event in self.events))
+        self.assertFalse(any(path.startswith('/usr/lib/python2.7/bridge/') for path in self.uploads))
 
 
 if __name__ == '__main__':

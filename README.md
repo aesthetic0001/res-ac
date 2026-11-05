@@ -43,8 +43,10 @@ backend address are configured privately at installation time.
 and retry behavior. The original USB-to-Linux terminal is preserved as a
 [separate recovery project](recovery/serial-terminal/README.md). The agent also
 long polls commands and supports `device.ping`, named `fan.command` buttons, and
-numeric NEC `ir.send` requests. The Arduino acknowledges completed transmissions;
-this does not confirm the fan received them. [Woozoo IR setup](device/IR.md)
+numeric NEC `ir.send` requests. Commands use an existing interprocessor GPIO
+notification to avoid periodic AVR command reads; see the
+[board-specific GPIO flow](device/GPIO.md). The Arduino acknowledges completed
+transmissions; this does not confirm the fan received them. [Woozoo IR setup](device/IR.md)
 covers the emitter wiring, button profile, and USB serial bench test. Remote
 control requires an AVR-confirmed calibration with the fan off and saved speed 1;
 the dashboard displays the AVR's estimated power/speed. The fan remembers speed
