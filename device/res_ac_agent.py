@@ -226,14 +226,37 @@ class CommandGPIO(object):
     voltage translators. Never steal exported pins or unbind a kernel driver.
     A locked RAM-only ownership record permits cleanup after an agent crash.
     """
-    def __init__(self, root='/sys/class/gpio', lock_path='/var/run/res-ac-command-gpio.lock'):
+    def __init__(self, root='/sys/class/gpio', lock_path='/var/run/res-ac-command-gpio.lock',
+                 debug_path='/sys/kernel/debug/gpio'):
         self.root, self.lock_path = root, lock_path
+        self.debug_path = debug_path
         self.lock_fd = self.value_fd = None
         self.owned = []
+        self.enable_restore = None
 
     def _read(self, pin, name):
         with open('%s/gpio%d/%s' % (self.root, pin, name)) as stream:
             return stream.read().strip()
+
+    @staticmethod
+    def _ownership(record):
+        fields = record.split(';')
+        prefix = COMMAND_GPIO_PROTOCOL + ':'
+        pins = fields[0][len(prefix):].split(',') if fields[0].startswith(prefix) else []
+        restore = fields[1].split('=')[1] if (len(fields) == 2 and fields[0].startswith(prefix) and
+                                            fields[1] in ('restore19=0', 'restore19=1')) else None
+        return [int(pin) for pin in pins if pin in ('19', '21')], restore
+
+    def _board_enable(self, debug_path=None):
+        # The installed Linino kernel deliberately exports OE-1 with a fixed
+        # output direction. Its writable value is the board's translator gate;
+        # it is not an export that this agent may unexport or reconfigure.
+        try:
+            with open(debug_path or self.debug_path) as stream:
+                return any(re.match(r'^\s*gpio-19\s+\(\s*OE-1\s*\)\s+out\s+(?:lo|hi)\b', line)
+                           for line in stream)
+        except IOError:
+            return False
 
     def preflight(self, debug_path='/sys/kernel/debug/gpio'):
         """Read-only prerequisites; actual exclusive export happens at dispatch."""
@@ -252,11 +275,14 @@ class CommandGPIO(object):
             if error.errno != errno.ENOENT:
                 raise
             record = ''
-        prefix = COMMAND_GPIO_PROTOCOL + ':'
-        recovered = record[len(prefix):].split(',') if record.startswith(prefix) else []
+        recovered, _ = self._ownership(record)
         for pin in (21, 19):
             exists = os.path.isdir('%s/gpio%d' % (self.root, pin))
-            if exists and str(pin) not in recovered:
+            if exists and pin not in recovered:
+                if pin == 19 and self._board_enable(debug_path):
+                    if not os.access(self.root + '/gpio19/value', os.W_OK):
+                        raise IOError('Board translator enable is not writable')
+                    continue
                 if pin != 19 or self._read(pin, 'direction') != 'out' or self._read(pin, 'value') != '1':
                     raise IOError('GPIO is already exported by another owner')
         if os.path.isfile(debug_path):
@@ -278,7 +304,10 @@ class CommandGPIO(object):
         os.lseek(self.lock_fd, 0, os.SEEK_SET)
         os.ftruncate(self.lock_fd, 0)
         record = ('%s:%s' % (COMMAND_GPIO_PROTOCOL,
-                            ','.join(str(pin) for pin in self.owned))).encode('ascii')
+                            ','.join(str(pin) for pin in self.owned)))
+        if self.enable_restore is not None:
+            record += ';restore19=' + self.enable_restore
+        record = record.encode('ascii')
         if os.write(self.lock_fd, record) != len(record):
             raise IOError('Incomplete GPIO ownership record')
 
@@ -298,12 +327,18 @@ class CommandGPIO(object):
         try:
             os.fchmod(fd, 0o600)
             record = os.read(fd, 128).decode('ascii')
-            prefix = COMMAND_GPIO_PROTOCOL + ':'
-            recovered = record[len(prefix):].split(',') if record.startswith(prefix) else []
-            recovered = [int(pin) for pin in recovered if pin in ('19', '21')]
+            recovered, self.enable_restore = self._ownership(record)
             self.owned = [pin for pin in recovered if os.path.isdir('%s/gpio%d' % (self.root, pin))]
             for pin in (21, 19):
                 exists = os.path.isdir('%s/gpio%d' % (self.root, pin))
+                if pin == 19 and exists and self._board_enable():
+                    if self.enable_restore is None:
+                        self.enable_restore = self._read(19, 'value')
+                    if self.enable_restore not in ('0', '1'):
+                        raise IOError('Invalid board translator enable state')
+                    self._record()  # Persist the original value before changing it.
+                    self._write('gpio19/value', '1')
+                    continue
                 if exists and pin not in recovered:
                     # GPIO19 may be deliberately enabled by board startup. Reuse
                     # only that existing high output, without taking ownership.
@@ -341,6 +376,14 @@ class CommandGPIO(object):
             os.close(self.value_fd)
             self.value_fd = None
         if self.lock_fd is not None:
+            if self.enable_restore is not None:
+                try:
+                    if not self._board_enable():
+                        raise IOError('Board translator ownership changed')
+                    self._write('gpio19/value', self.enable_restore)
+                    self.enable_restore = None
+                except (IOError, OSError):
+                    failed = True
             for pin in list(self.owned):
                 try:
                     if pin == 21:

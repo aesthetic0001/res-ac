@@ -25,9 +25,12 @@ interprocessor wiring despite using the same PlatformIO AVR target.
 1. The existing command processor validates the session/deadline and durably
    journals physical actions before dispatch.
 2. The agent exclusively claims GPIO21 and initializes it inactive. It claims
-   GPIO19, or preserves an already enabled high output without taking ownership.
-   It refuses foreign GPIO21 exports, a disabled exported GPIO19, and kernel
-   ownership; it never unbinds a driver or steals a pin.
+   GPIO19 when free, or uses the installed kernel's fixed-direction `OE-1` output
+   after verifying its role in debugfs. That output starts low on the tested board;
+   its original value is recorded before enabling it and restored on release.
+   An unrelated enabled high output is preserved without taking ownership.
+   Foreign GPIO21 exports, other kernel owners, and unknown disabled GPIO19
+   exports are rejected; no driver is unbound or pin stolen.
 3. It queues the atomic `resac_command` write on the persistent Bridge socket.
    The notification is asserted only when the exact command frame is echoed in
    Bridge's `put` confirmation, before the command's execution deadline.
@@ -61,8 +64,9 @@ command latency.
 `bridge_socket_wait.py` includes Mailbox listener/client read readiness and queued
 TCP response write readiness in that wait. It also drains already decoded JSON
 commands. TCP events service the existing runners immediately, while each UART
-byte retains its original timeout. A TCP event does not return a false UART
-timeout midway through a frame. The 50 ms timeout remains for the existing
+byte retains its original timeout. Direct `os.read()` avoids Python stdin
+read-ahead hiding bytes from `select()` when the vendor launcher omits `-u`.
+A TCP event does not return a false UART timeout midway through a frame. The 50 ms timeout remains for the existing
 background runners; command delivery and put confirmation do not depend on it.
 
 The installer downloads `bridge/packet.py` and matches the exact known
@@ -84,7 +88,9 @@ The RAM-only record identifies pins exported by this feature. After a process
 crash, a new lock owner can reclaim only those recorded pins, first releasing
 any stale assertion. Normal shutdown, Bridge disconnect/re-handshake, and AVR
 restart discard pending notifications and release owned pins. Existing enabled
-GPIO19 outputs remain untouched on cleanup.
+GPIO19 outputs owned by another user are preserved; a borrowed kernel `OE-1`
+output returns to its recorded initial value, including after process-crash
+recovery. Kernel-exported controls are never unexported or given a new direction.
 
 Expired or canceled commands cannot be asserted by a late Bridge confirmation.
 Signal failures disconnect the stream and discard queued actions. Missing
@@ -114,7 +120,18 @@ read-only preflight, staged installation, and UART/TCP readiness interactions.
 Both GPIO and compatibility firmware paths compile in native tests; the GPIO
 sketch also builds with the AVR toolchain.
 
-No live GPIO was driven and no firmware was flashed during development. Board
-revision, actual GPIO ownership/multiplexing, voltage levels, boot/programming
-interaction, and command latency still require a separately authorized hardware
-test. The implementation does not claim measured hardware latency gains.
+Live validation on the existing Seeeduino Cloud confirmed the GPIO path with
+20/20 ping acknowledgements, exactly 20 command reads, zero reads during idle
+windows, and one read while a notification remained asserted. Reconnect and
+SIGKILL ownership recovery passed; GPIO21 was released and kernel `OE-1` returned
+to its original low value. Sixteen sensor samples were collected in one run.
+Tests used a 2-second sensor interval and only non-actuating ping commands.
+
+That run measured approximately 1.17 seconds ping p95 (another run approximately
+1.19 seconds). GPIO notifications remove idle command reads, but these results do
+not demonstrate a latency improvement. Timing traces show considerable time in
+existing synchronous Bridge exchanges and sensor/housekeeping work. Disabling
+TCP Nagle and avoiding buffered stdin did not materially reduce that hardware
+latency. Electrical voltage measurements, physical IR behavior, and worst-case
+boot/programming timing were not measured by these tests. The tests used temporary firmware and agent code; the permanent device
+configuration was preserved.

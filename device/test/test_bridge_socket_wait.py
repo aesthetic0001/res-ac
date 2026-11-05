@@ -23,6 +23,18 @@ prepare = module('prepare_bridge_socket_wait', ROOT / 'scripts/prepare_bridge_so
 
 
 class BridgeSocketWaitTests(unittest.TestCase):
+    def test_buffered_python_stdin_does_not_hide_remaining_uart_bytes(self):
+        uart_read, uart_write = os.pipe()
+        stream = os.fdopen(uart_read, 'rb')  # Match the live launcher's buffering.
+        self.addCleanup(stream.close)
+        self.addCleanup(os.close, uart_write)
+        server = SimpleNamespace(sockets=[], clients=[], clients_sendbuffer={}, available=lambda: 0)
+        processor = SimpleNamespace(run=lambda: None)
+        os.write(uart_write, b'AB')
+        with patch.dict(sys.modules, {'mailbox': SimpleNamespace(json_server=server)}):
+            self.assertEqual(wait.read_byte(stream, processor), b'A')
+            self.assertEqual(wait.read_byte(stream, processor), b'B')
+
     def test_patch_is_narrow_idempotent_and_rejects_unknown_source(self):
         source = ('prefix\n' + prepare.ORIGINAL + '\nsuffix\n').encode()
         result = prepare.prepare(source)

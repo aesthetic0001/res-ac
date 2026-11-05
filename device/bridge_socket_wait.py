@@ -24,7 +24,7 @@ def read_byte(stream, processor):
         # queue without waiting for another socket edge or a UART timeout.
         if json_server.available():
             if select.select([uart], [], [], 0)[0]:
-                return stream.read(1)
+                return os.read(uart, 1)
             processor.run()
             continue
         writers = [client for client in json_server.clients
@@ -32,7 +32,10 @@ def read_byte(stream, processor):
         readable, writable, _ = select.select([uart] + list(json_server.sockets),
                                               writers, [], remaining)
         if uart in readable:
-            return stream.read(1)
+            # The vendor launcher does not use python -u. A buffered read(1)
+            # can read ahead, leaving the next byte in Python while select()
+            # waits on an empty kernel buffer and falsely times out the frame.
+            return os.read(uart, 1)
         if readable or writable:
             processor.run()
         else:

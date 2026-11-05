@@ -173,6 +173,7 @@ class SysfsTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         (self.root / 'export').touch(); (self.root / 'unexport').touch()
+        (self.root / 'debug').write_text('')
         self.writes = []
         outer = self
 
@@ -188,6 +189,8 @@ class SysfsTests(unittest.TestCase):
                     (pin / 'direction').write_text('in')
                 elif path == 'unexport':
                     shutil.rmtree(outer.root / ('gpio' + value))
+                elif path.endswith('/value'):
+                    (outer.root / path).write_text(value)
                 else:
                     (outer.root / path).write_text('out')
                     (outer.root / path).with_name('value').write_text('1' if value == 'high' else '0')
@@ -197,7 +200,7 @@ class SysfsTests(unittest.TestCase):
         self.addCleanup(self.gpio.close)
 
     def make(self):
-        return self.cls(str(self.root), str(self.root / 'ownership.lock'))
+        return self.cls(str(self.root), str(self.root / 'ownership.lock'), str(self.root / 'debug'))
 
     def test_persistent_descriptor_and_exclusive_ownership(self):
         self.gpio.open()
@@ -252,3 +255,37 @@ class SysfsTests(unittest.TestCase):
         self.gpio.preflight(str(debug))
         self.assertEqual(self.writes, [])
         self.assertFalse((self.root / 'ownership.lock').exists())
+
+    def test_kernel_exported_fixed_direction_enable_is_restored(self):
+        self.gpio._write('export', '19')
+        (self.root / 'gpio19/direction').unlink()
+        (self.root / 'debug').write_text(' gpio-19  (OE-1                ) out lo\n')
+        self.gpio.preflight(str(self.root / 'debug'))
+        self.gpio.open()
+        self.assertEqual((self.root / 'gpio19/value').read_text(), '1')
+        self.assertEqual(self.gpio.owned, [21])
+        self.gpio.close()
+        self.assertEqual((self.root / 'gpio19/value').read_text(), '0')
+        self.assertTrue((self.root / 'gpio19').exists())
+        self.assertNotIn(('unexport', '19'), self.writes)
+
+    def test_kernel_enable_baseline_survives_process_crash(self):
+        self.gpio._write('export', '19')
+        (self.root / 'gpio19/direction').unlink()
+        (self.root / 'debug').write_text('gpio-19 (OE-1) out lo\n')
+        self.gpio.open(); self.gpio.set(True)
+        os.close(self.gpio.value_fd); os.close(self.gpio.lock_fd)
+        self.gpio.value_fd = self.gpio.lock_fd = None
+        replacement = self.make()
+        replacement.open()
+        self.assertEqual(replacement.enable_restore, '0')
+        replacement.close()
+        self.assertEqual((self.root / 'gpio19/value').read_text(), '0')
+
+    def test_different_kernel_owner_is_not_treated_as_the_board_enable(self):
+        self.gpio._write('export', '19')
+        (self.root / 'gpio19/direction').unlink()
+        (self.root / 'debug').write_text('gpio-19 (different-owner) out lo\n')
+        with self.assertRaises(IOError):
+            self.gpio.open()
+        self.assertEqual((self.root / 'gpio19/value').read_text(), '0')
