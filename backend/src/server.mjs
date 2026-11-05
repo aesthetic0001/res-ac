@@ -57,6 +57,7 @@ if (grafana) server.on('upgrade', (req, socket, head) => grafana.upgrade(req, so
 server.requestTimeout = 15_000; // Limits receiving a request; does not limit the long-poll response wait.
 server.headersTimeout = 10_000;
 server.timeout = 45_000;
+server.keepAliveTimeout = 60_000; // Reuse TLS connections between 5s state reports and 10s readings.
 server.listen(config.port, config.host, () => {
   observability.ready.set(1);
   console.info(`${config.httpDev ? 'HTTP' : 'HTTPS'} backend listening on port ${config.port}`);

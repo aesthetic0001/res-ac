@@ -109,6 +109,15 @@ output (for example `connection_refused`, `network_unreachable`,
 bodies are never exported. A generic curl message remains `connect_failed`;
 missing detail is not replaced with an inferred cause.
 
+Both `http.device` and `http.request` are agent-side HTTP client spans; the
+backend request span is `http.server`. The persistent libcurl helper shares a
+connection pool across these device requests. A reused connection normally has
+zero connect/TLS milestones; a timeout with ambiguous zero milestones is reported
+at stage `unknown`. HTTP completion arrives through private IPC and wakes the
+agent selector, without periodic subprocess-status checks. The existing
+`reading.buffer` span still ends at the first upload attempt, so retry/backoff
+time should be assessed separately from that initial queue wait.
+
 Failures include `network.start.*` and `network.*` snapshots at request start and
 completion: IPv4 default-route presence, interface operational state, and wireless
 quality/signal when available. They use bounded local procfs/sysfs reads without

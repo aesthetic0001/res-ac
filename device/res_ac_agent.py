@@ -14,6 +14,7 @@ import re
 import select
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -597,7 +598,7 @@ class Telemetry(object):
 
     def _tick(self, pending):
         if self.request is not None:
-            if self.request.process.poll() is None:
+            if not request_completed(self.request):
                 return
             try:
                 status, unused = self.request.finish()
@@ -729,11 +730,183 @@ def curl_diagnostics(output, errors, code):
     return status, attributes
 
 
+class HttpResult(object):
+    def __init__(self, request_id):
+        self.id = request_id
+        self.completed = False
+        self.code = 0
+        self.status = 0
+        self.connections = 0
+        self.output = b''
+        self.errors = b''
+        self.body = b''
+        self.local_error = False
+
+
+class HttpTransport(object):
+    """A persistent libcurl helper; completion messages wake the shared selector."""
+    def __init__(self, config):
+        self.config = config
+        self.connection = None
+        self.process = None
+        self.pending = {}
+        self.serial = 0
+        self.outgoing = b''
+        self.incoming = b''
+
+    @staticmethod
+    def field(value):
+        value = value.encode('utf-8') if isinstance(value, text_type) else value
+        return struct.pack('!I', len(value)) + value
+
+    def _queue(self, message):
+        if len(self.outgoing) + len(message) + 4 > 150000:
+            raise IOError('HTTP transport queue is full')
+        self.outgoing += struct.pack('!I', len(message)) + message
+
+    def _start(self):
+        parent, child = socket.socketpair()
+        try:
+            parent.setblocking(False)
+            with open(os.devnull, 'wb') as quiet:
+                process = subprocess.Popen([self.config.get('http_helper', '/tmp/res-ac-http')],
+                                           stdin=child, stdout=child, stderr=quiet, close_fds=True)
+            self.connection, self.process = parent, process
+            base = self.config['server_url'] + '/api/devices/' + self.config['device_id'] + '/'
+            self._queue(b'I' + self.field(base) + self.field(self.config['ca_file']) +
+                        self.field(self.config['device_token']))
+        except BaseException:
+            parent.close()
+            self._failed()
+            raise
+        finally:
+            child.close()
+
+    def submit(self, route, parent, payload, method, timeout):
+        if len(self.pending) >= 4:
+            raise IOError('All HTTP request slots are occupied')
+        if self.connection is None:
+            self._start()
+        self.serial = self.serial % 0xffffffff + 1
+        result = HttpResult(self.serial)
+        body = encode_json(payload) if payload is not None else b''
+        if isinstance(body, text_type):
+            body = body.encode('utf-8')
+        if len(body) > 32768 or method not in ('GET', 'POST') or not 1 <= timeout <= 60:
+            raise ValueError('Invalid HTTP request')
+        message = b'Q' + struct.pack('!II', result.id, timeout) + (b'G' if method == 'GET' else b'P')
+        self._queue(message + self.field(route) + self.field(parent) + self.field(body))
+        self.pending[result.id] = result
+        return result
+
+    def cancel(self, result):
+        if result.id not in self.pending:
+            return
+        if not result.completed and self.connection is not None:
+            try:
+                self._queue(b'C' + struct.pack('!I', result.id))
+            except IOError:
+                self._failed()
+        del self.pending[result.id]
+
+    def _receive(self, block):
+        self.incoming += block
+        while len(self.incoming) >= 4:
+            size = struct.unpack('!I', self.incoming[:4])[0]
+            if size < 44 or size > 32812:
+                raise ValueError('Invalid HTTP completion frame')
+            if len(self.incoming) < size + 4:
+                break
+            frame, self.incoming = self.incoming[4:size + 4], self.incoming[size + 4:]
+            fields = struct.unpack('!11I', frame[:44])
+            request_id, code, status, connections, reason = fields[:5]
+            if fields[10] != len(frame) - 44 or status > 599:
+                raise ValueError('Invalid HTTP completion metadata')
+            result = self.pending.get(request_id)
+            if result is None:
+                continue  # Completion raced with a cancellation.
+            if result.completed:
+                raise ValueError('Duplicate HTTP completion')
+            result.code, result.status, result.connections = code, status, connections
+            result.output = ('%d ' % status + ' '.join('%.6f' % (value / 1000000.0)
+                                                     for value in fields[5:10])).encode('ascii')
+            result.errors = {1: b'Connection refused', 2: b'Network is unreachable', 3: b'No route to host',
+                             4: b'Connection reset', 5: b'Broken pipe'}.get(reason, b'')
+            result.body = frame[44:]
+            result.completed = True
+
+    def _failed(self):
+        if self.connection is not None:
+            self.connection.close()
+        self.connection = None
+        if self.process is not None:
+            try:
+                self.process.kill()
+            except OSError:
+                pass
+            self.process.wait()
+        self.process = None
+        self.incoming = self.outgoing = b''
+        for result in self.pending.values():
+            if not result.completed:
+                result.code, result.local_error, result.completed = 2, True, True
+
+    def wait(self, bridge=None, timeout=None):
+        if bridge is not None:
+            before = (bridge.version(*bridge.keys), len(bridge.samples)) if isinstance(bridge, BridgeEvents) else None
+            bridge.poll()  # Establish/recover Bridge without blocking.
+            if before is not None and before != (bridge.version(*bridge.keys), len(bridge.samples)):
+                # Do not consume a just-arrived event and then sleep until a
+                # timer: let the application process that event immediately.
+                timeout = 0
+        connection = self.connection
+        bridge_socket = getattr(bridge, 'connection', None)
+        reads = [sock for sock in (connection, bridge_socket) if sock is not None]
+        writes = []
+        if connection is not None and self.outgoing:
+            writes.append(connection)
+        if bridge_socket is not None and (bridge.connecting or bridge.outgoing):
+            writes.append(bridge_socket)
+        try:
+            readable, writable, errors = select.select(reads, writes, reads, timeout)
+            if connection is not None:
+                if connection in errors:
+                    raise IOError('HTTP helper connection failed')
+                if connection in writable:
+                    sent = connection.send(self.outgoing)
+                    if sent == 0:
+                        raise IOError('HTTP helper closed')
+                    self.outgoing = self.outgoing[sent:]
+                if connection in readable:
+                    block = connection.recv(65536)
+                    if not block:
+                        raise IOError('HTTP helper exited')
+                    self._receive(block)
+        except (IOError, OSError, ValueError, select.error) as error:
+            if getattr(error, 'errno', None) not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+                self._failed()
+        if bridge is not None:
+            bridge.poll()
+
+    def close(self):
+        self._failed()
+
+
+def request_completed(request):
+    # The running agent uses an in-memory flag set by a completion event.
+    # Standalone CLI probes and older test adapters retain their process API.
+    if hasattr(request, 'completed'):
+        return request.completed
+    return request.process.poll() is not None
+
+
 class CurlUpload(object):
-    """A bounded curl subprocess; polling completion never waits for the network."""
+    """HTTP attempt backed by the shared helper, or standalone curl for probes."""
     def __init__(self, config, payload=None, route='readings', method='POST', timeout=25):
         self.process = None
         self.files = []
+        self.transport = config.get('_http')
+        self.result = None
         self.telemetry = config.get('_telemetry')
         self.started = monotonic()
         self.reported = False
@@ -751,6 +924,9 @@ class CurlUpload(object):
         # Keep the collection/command context as its parent across retries.
         self.request_traceparent = self.parent if self.root_request else traceparent(self.parent)
         try:
+            if self.transport is not None:
+                self.result = self.transport.submit(route, self.request_traceparent, payload, method, timeout)
+                return
             header_fd, header_path = temporary('res-ac-curl-')
             self.files.append(header_path)
             response_fd, self.response_path = temporary('res-ac-response-')
@@ -785,6 +961,10 @@ class CurlUpload(object):
             self.close()
             raise
 
+    @property
+    def completed(self):
+        return self.result.completed if self.result is not None else self.process.poll() is not None
+
     def _report(self, status, code, diagnostics=None):
         if self.reported or self.telemetry is None:
             return
@@ -805,19 +985,36 @@ class CurlUpload(object):
                              attributes, span_id=self.request_traceparent[36:52])
 
     def finish(self):
-        output, errors = self.process.communicate()
-        status, diagnostics = curl_diagnostics(output, errors, self.process.returncode)
-        if self.process.returncode:
-            self._report(status, self.process.returncode, diagnostics)
-            raise UploadError(curl_code=self.process.returncode)
+        if self.result is not None:
+            if not self.result.completed:
+                raise RuntimeError('HTTP request has not completed')
+            output, errors, code = self.result.output, self.result.errors, self.result.code
+        else:
+            output, errors = self.process.communicate()
+            code = self.process.returncode
+        status, diagnostics = curl_diagnostics(output, errors, code)
+        if (self.result is not None and code == 28 and not self.result.connections and
+                not diagnostics.get('http.timing.connect_ms') and not diagnostics.get('http.timing.tls_ms')):
+            # Reused connections have zero connect/TLS milestones. Those zeros
+            # cannot establish whether a timeout happened during connection setup.
+            diagnostics['error.stage'] = 'unknown'
+        if self.result is not None and self.result.local_error:
+            diagnostics.update({'error.reason': 'request_setup', 'error.stage': 'local'})
+        if code:
+            self._report(status, code, diagnostics)
+            raise UploadError(curl_code=code)
         if not status:
             self._report(0, 0, diagnostics)
             raise UploadError()
         self._report(status, 0, diagnostics)
+        if self.result is not None:
+            return status, self.result.body
         with open(self.response_path, 'rb') as stream:
             return status, stream.read(32768)
 
     def close(self):
+        if self.result is not None:
+            self.transport.cancel(self.result)
         if self.process is not None and self.process.poll() is None:
             self.process.terminate()
             self.process.communicate()
@@ -827,11 +1024,26 @@ class CurlUpload(object):
 
 
 def post(config, payload):
-    upload = CurlUpload(config, payload)
+    owned = config.get('_http') is None and bool(config.get('http_helper'))
+    transport = HttpTransport(config) if owned else config.get('_http')
+    request_config = dict(config, _http=transport) if transport is not None else config
+    upload = None
     try:
+        upload = CurlUpload(request_config, payload)
+        if transport is not None:
+            # Standalone preflight is deliberately synchronous, but still waits
+            # on completion events and uses the same verified HTTPS helper.
+            deadline = monotonic() + 30
+            while not upload.completed:
+                if monotonic() >= deadline:
+                    raise UploadError(curl_code=28)
+                transport.wait(timeout=max(0, deadline - monotonic()))
         return upload.finish()
     finally:
-        upload.close()
+        if upload is not None:
+            upload.close()
+        if owned:
+            transport.close()
 
 
 class Buffer(object):
@@ -985,7 +1197,9 @@ class FanReporter(object):
         self.bridge_version = None
 
     def tick(self):
-        if self.request is not None and self.request.process.poll() is not None:
+        finished = False
+        if self.request is not None and request_completed(self.request):
+            finished = True
             try:
                 status, body = self.request.finish()
                 if status not in (200, 201):
@@ -999,7 +1213,7 @@ class FanReporter(object):
         if isinstance(self.bridge, BridgeEvents):
             version = (self.bridge.version('resac_command_ready', 'resac_fan_session', 'resac_fan_state'),
                        encode_json(self.automation.snapshot()) if self.automation else None)
-            changed = version != self.bridge_version
+            changed = finished or version != self.bridge_version
             self.bridge_version = version
         else:
             changed = False
@@ -1306,7 +1520,7 @@ class CommandProcessor(object):
         self.backoff = min(self.backoff * 2, 60)
 
     def tick(self, allow_execution=True):
-        if self.request is not None and self.request.process.poll() is not None:
+        if self.request is not None and request_completed(self.request):
             try:
                 status, body = self.request.finish()
                 if self.request_kind == 'result':
@@ -1500,9 +1714,46 @@ class AutoController(object):
                 self.status = 'waiting_for_device'
 
 
+def next_wakeup(bridge, telemetry, commands, automation, fan_reporter, pending, upload, retry_at):
+    """Wait until real scheduled work; HTTP completions and Bridge changes wake IO."""
+    now = monotonic()
+    deadlines = []
+    def due(value):
+        if value is not None:
+            deadlines.append(value)
+    due(getattr(fan_reporter, 'next_due', None))  # AVR watchdog heartbeat.
+    runner = getattr(automation, 'runner', None)
+    if runner is None:
+        due(getattr(automation, 'next_due', None))  # Freshness and adjustment dwell.
+    else:
+        current = getattr(runner, 'current', None)
+        if current is None:
+            due(now)  # Persist a just-completed local command.
+        else:
+            due(runner.deadline)
+            if getattr(bridge, 'ready', False) and not runner.prepared:
+                due(now)  # Dispatch a newly accepted automatic command.
+    current = getattr(commands, 'current', None)
+    if current is not None:
+        due(commands.deadline)
+    elif getattr(commands, 'request', None) is None and not automation.busy:
+        due(getattr(commands, 'retry_at', None))
+    if getattr(telemetry, 'request', None) is None:
+        due(getattr(telemetry, 'next_due', None))
+    if upload is None and pending.first() is not None:
+        due(retry_at)
+    if getattr(bridge, 'connection', None) is None:
+        due(getattr(bridge, 'retry_at', None))
+    elif not bridge.ready:
+        due(bridge.deadline)
+    return max(0, min(deadlines or [now + 60]) - now)
+
+
 def run(config):
     bridge = config.get('_bridge') or BridgeEvents()
     config['_bridge'] = bridge
+    http = config.get('_http') or HttpTransport(config)
+    config['_http'] = http
     telemetry = Telemetry(config)
     config['_telemetry'] = telemetry
     pending = Buffer(config.get('queue_limit', 100), telemetry)
@@ -1516,13 +1767,11 @@ def run(config):
     sample = None
     try:
         while True:
-            bridge.poll()
+            http.wait(bridge, 0)
             collector.tick()
-            telemetry.tick(pending)
             commands.tick(allow_execution=not automation.busy)
             automation.tick(commands)
-            fan_reporter.tick()
-            if upload is not None and upload.process.poll() is not None:
+            if upload is not None and request_completed(upload):
                 try:
                     status, response = upload.finish()
                     if status not in (200, 201):
@@ -1546,10 +1795,16 @@ def run(config):
                     if queued_at is not None:
                         telemetry.event('reading.buffer', sample.get('traceparent'), monotonic() - queued_at,
                                         {'reading.id': sample['readingId'], 'outcome': 'ok'})
-                    upload = CurlUpload(config, sample)
-            # Socket readability wakes collection immediately; the timeout only
-            # services HTTP subprocess completion, heartbeats and retry timers.
-            bridge.poll(0.1)
+                    try:
+                        upload = CurlUpload(config, sample)
+                    except (UploadError, IOError, OSError):
+                        retry_at = monotonic() + backoff
+                        backoff = min(backoff * 2, 60)
+                        log('Reading request setup failed; retaining sample for retry')
+            fan_reporter.tick()
+            telemetry.tick(pending)
+            http.wait(bridge, next_wakeup(bridge, telemetry, commands, automation,
+                                          fan_reporter, pending, upload, retry_at))
     finally:
         telemetry.close()
         commands.close()
@@ -1557,6 +1812,7 @@ def run(config):
         if upload is not None:
             upload.close()
         bridge.close()
+        http.close()
 
 
 def main():

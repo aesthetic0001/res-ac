@@ -11,7 +11,7 @@ humidity, a sequence number, and a Linux-provided boot/session epoch. Invalid
 sensor reads are reported as errors rather than uploaded as zero or stale data.
 
 `res_ac_agent.py` runs on the Linux processor. A small event loop receives pushed
-Bridge Mailbox events while curl subprocesses handle HTTPS asynchronously. This works with
+Bridge Mailbox events while one persistent libcurl helper handles HTTPS asynchronously. This works with
 the board's minimal Python 2.7 without installing threading or other packages.
 Both legacy JSON APIs used by Yun firmware are supported.
 
@@ -26,7 +26,8 @@ The backend must already be reachable via trusted HTTPS. From the project root:
 
 ```sh
 ~/.platformio/penv/bin/python scripts/configure_device.py
-~/.platformio/penv/bin/python scripts/install_device.py --modern-curl
+python3 scripts/build_http_transport.py
+~/.platformio/penv/bin/python scripts/install_device.py
 ~/.platformio/penv/bin/pio run -t upload
 ```
 
@@ -52,15 +53,23 @@ The installer normally starts the service; `--no-start` defers that. It waits fo
 the reporting firmware to initialize Bridge before collecting real samples.
 
 The host installer needs PySerial (normally included in PlatformIO's Python
-venv). The board needs its existing Bridge, Python, curl, and gzip components.
-`--modern-curl` installs a separate static MIPS curl from
-[stunnel/static-curl](https://github.com/stunnel/static-curl/releases/tag/8.23.0-1),
-downloaded over verified HTTPS and checked against a pinned SHA-256. This handles
-IP-address certificates that the original PolarSSL client rejects. The system
-curl is preserved; a compressed copy uses about 4.2 MiB of flash and unpacks to
-about 9.9 MiB in RAM at service startup. Serial transfer takes several minutes.
-Subsequent installs reuse an identical compressed copy. Omit this flag on firmware
-whose system curl already validates the backend certificate correctly.
+venv). The board needs its existing Bridge, Python, and gzip components.
+`build_http_transport.py` uses Python 3.12+, downloads checksum-pinned MIPS
+libcurl development archives from [stunnel/static-curl](https://github.com/stunnel/static-curl/releases/tag/8.23.0-1)
+and a pinned [MIPS compiler](https://github.com/userdocs/qbt-musl-cross-make/releases/tag/2644),
+and builds a static MIPS32 soft-float helper under `private/http-build/` with a
+source/build checksum manifest. It only builds locally. The installer accepts
+`--http-helper PATH` for a different build location and validates the ELF target.
+The helper supplies modern certificate/IP-SAN verification independently of the
+board's legacy PolarSSL curl.
+
+The installer stages the new agent and helper in RAM and preflights that pair
+before stopping the existing agent or replacing its transport. The helper reuses
+`/usr/lib/res-ac/curl.gz`, the previous compressed TLS client's flash slot; it is
+expanded as `/tmp/res-ac-http` at startup. The static helper is approximately
+8.2 MiB, compressed to 3.6 MiB. The system curl is preserved. Serial transfer takes
+several minutes. `--modern-curl` remains accepted for command-line compatibility;
+the persistent helper is now always installed.
 
 The installer also adds a small `/etc/udhcpc.user` hook, preserving other hooks,
 to work around legacy firmware that loses its IPv4 default route on DHCP renewal.
@@ -109,8 +118,8 @@ service at `127.0.0.1:5700`. It requests one datastore snapshot after connecting
 then waits with `select()` for pushed changes. Collector, automation, command
 handling, and fan reporting share the same cache; their reads make no repeated
 TCP requests. Events bypass the former half-second collection/acknowledgment
-waits and one-second fan-state/automation waits. Timers still service subprocess
-completion, upload retries, safety deadlines, fan heartbeat writes, and periodic
+waits and one-second fan-state/automation waits. Timers still service
+upload retries, safety deadlines, fan heartbeat writes, and periodic
 backend state refreshes. AVR sampling and its 250 ms input-mailbox checks remain.
 
 Bridge broadcasts both messages and request replies to all clients. The receiver
@@ -129,11 +138,42 @@ the retained snapshot has no trustworthy sample age. AVR boot notifications also
 invalidate the cache and trigger snapshot/epoch initialization.
 
 The POST route is `/api/devices/<device-id>/readings` with a device bearer token.
-Curl reads the URL/token from a private temporary config rather than command-line
-arguments. Temporary request files are removed afterward. Logs exclude tokens,
+The URL/token and request bodies reach the helper through private nonblocking IPC,
+without per-request files or credentials in command-line arguments. Logs exclude tokens,
 server URLs, and response bodies; `/tmp/res-ac-agent.log` is bounded in size.
 The AVR USB serial monitor shows sensor values and the latest uploader and
 command status.
+
+### Persistent HTTP transport
+
+One helper process owns a libcurl multi handle with a four-connection pool shared
+by readings, command polls/results, fan state, and telemetry. Idle connections and
+TLS sessions can be reused across requests. An open command long poll leaves
+capacity for the other request types. The backend keeps idle connections for
+60 seconds so they can survive the normal reporting intervals. Restarted or stale
+server connections are replaced by libcurl under the existing request timeout.
+
+`select()` waits for Bridge data, helper completion messages, writable IPC queues,
+or the nearest real heartbeat/retry/safety deadline. There is no fixed 100 ms
+subprocess-completion timer. Completions set request state directly; Python does
+not periodically inspect curl process exit status. Commands run before reading
+handoff, and a completed reading frees its slot and starts the next buffered
+reading before background reporting. No batching delay is added.
+
+Requests and responses remain limited to 32 KiB, with four requests in flight and
+bounded IPC buffers. The binary IPC protocol prefixes each message with a
+network-order 32-bit length. Initialization sends the fixed API base, CA path,
+and token; requests send an ID, timeout, method, route, traceparent, and JSON body.
+Completions contain the ID, curl/HTTP status, connection count, five timing
+milestones, a safe error category, and response body. Raw libcurl error strings
+never leave the helper. Redirects are not followed and TLS verification is enabled.
+
+Helper EOF/crash fails unresolved attempts and wakes Python immediately. The next
+ordinary retry starts a fresh helper and pool. The helper never automatically
+replays application requests after a process restart; reading/batch IDs and the
+existing command journal retain retry identity. It is killed/reaped during agent
+shutdown. Standalone `--probe` also uses the helper when `http_helper` is configured;
+legacy standalone probes retain their CLI adapter.
 
 ## Ping commands
 
@@ -145,9 +185,9 @@ checks this key every 250 ms and returns `v1,<command-UUID>,pong,<uptime-ms>` in
 `resac_command_result`. Linux requires a matching UUID and Arduino response;
 it does not answer ping on the Arduino's behalf.
 Polling starts only after the Arduino advertises its handler through Bridge.
-The target-level sketch advertises `v4`; `v3` supports calibrated raw IR,
-while old `v1`/`v2` sketches support ping only
-with the updated agent. IR requires a current session and calibrated estimate.
+The target-level sketch advertises `v4`; command-frame parsing also understands
+the older `v1`/`v2` ping and `v3` calibrated-IR formats. Use an event-capable sketch
+with this agent. IR requires a current session and calibrated estimate.
 
 The agent posts the result to
 `POST /api/devices/<device-id>/commands/<command-UUID>/result`:
@@ -200,7 +240,8 @@ restore USB access to Linux. Recovery flashing preserves all Linux/Wi-Fi files.
 Host-side verification:
 
 ```sh
-python3 -m unittest discover -s device/test -v
+python3 scripts/build_http_transport.py --target native
+RESAC_HTTP_HELPER="$PWD/private/http-build/res-ac-http-native" python3 -m unittest discover -s device/test -v
 ~/.platformio/penv/bin/pio run
 ~/.platformio/penv/bin/pio run -d recovery/serial-terminal
 ```
@@ -217,6 +258,11 @@ Curve tests cover all 25 direct speed routes, clamped limits, off-state speed
 blocking, remembered speed across power toggles, threshold/hysteresis behavior, fresh
 sensor requirements, adjustment dwell, manual override, settings persistence,
 and sharing the command mailbox. Native estimate tests require a host C++ compiler.
+Transport integration tests use a local HTTPS server to verify process/connection
+reuse, independent long polls, completion events, helper crash recovery,
+cancellation, timeouts, bounded responses, and certificate rejection. They require
+the native helper and are explicitly skipped if it is not available; building it
+requires a Linux C compiler and shared libcurl 7.85+.
 
 ## Observability
 
@@ -225,8 +271,8 @@ The firmware publishes versioned `resac_sensor_diagnostic` and
 The agent forwards bounded diagnostics using the existing HTTPS device token,
 including network failures, sample drops, CPU/RAM/storage, and command/read
 correlation IDs. Install the updated agent and flash the updated sketch for
-complete instrumentation. Older firmware can still upload samples and execute
-commands but cannot report internal AVR timings.
+complete instrumentation. This agent requires the sketch's `resac_events=v1`
+capability; earlier deployments can continue using their matched older agent/sketch.
 
 Diagnostics use RAM-only queues (128 waiting events plus 32 in flight), send
 every 15 seconds while healthy, and back off up to 60 seconds after errors.
