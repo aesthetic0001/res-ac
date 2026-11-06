@@ -127,6 +127,41 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(len(telemetry.events), 1)
         self.assertEqual(telemetry.events[0]['attributes']['request.kind'], 'telemetry')
 
+    def test_full_batches_wake_immediately_and_drain_after_inflight_success(self):
+        clock = [10]
+        requests = []
+        class Request:
+            def __init__(self, config, payload, **kwargs):
+                self.payload = payload
+                self.process = MagicMock()
+                self.process.poll.return_value = None
+                requests.append(self)
+            def finish(self): return 200, b'{}'
+            def close(self): pass
+        with patch.object(agent, 'monotonic', lambda: clock[0]), patch.object(agent, 'CurlUpload', Request):
+            telemetry = agent.Telemetry({})
+            telemetry.next_due = 25
+            for _ in range(31): telemetry.event('bridge.dispatch')
+            telemetry.tick(agent.Buffer(1))
+            self.assertFalse(requests)
+            telemetry.event('bridge.dispatch')
+            self.assertEqual(telemetry.next_due, 10)
+            telemetry.tick(agent.Buffer(1))
+            self.assertEqual(len(requests[0].payload['events']), 32)
+            for _ in range(64): telemetry.event('bridge.dispatch')
+            telemetry.tick(agent.Buffer(1))
+            self.assertEqual(len(requests), 1)  # One request at a time.
+            requests[0].process.poll.return_value = 0
+            telemetry.tick(agent.Buffer(1))
+            self.assertEqual(len(requests), 2)
+            requests[1].process.poll.return_value = 0
+            telemetry.tick(agent.Buffer(1))
+            self.assertEqual(len(requests), 3)
+            requests[2].process.poll.return_value = 0
+            telemetry.tick(agent.Buffer(1))
+            self.assertEqual(telemetry.next_due, 25)
+            self.assertEqual(telemetry.dropped, 0)
+
     def test_bounded_queue_drops_and_sensor_attempt_identity(self):
         epoch = 'a' * 32
         class Bridge:
@@ -170,6 +205,11 @@ class TelemetryTests(unittest.TestCase):
             first = requests[0].payload
             telemetry.tick(agent.Buffer(1))
             self.assertIsNotNone(telemetry.batch)
+            retry_at = telemetry.next_due
+            for _ in range(64): telemetry.event('bridge.dispatch')
+            self.assertEqual(telemetry.next_due, retry_at)
+            telemetry.tick(agent.Buffer(1))
+            self.assertEqual(len(requests), 1)
             clock[0] += 6
             telemetry.tick(agent.Buffer(1))
             second = requests[1].payload
@@ -177,7 +217,8 @@ class TelemetryTests(unittest.TestCase):
             self.assertGreater(second['events'][0]['ageMs'], first['events'][0]['ageMs'])
             requests[1].status = 200
             telemetry.tick(agent.Buffer(1))
-            self.assertIsNone(telemetry.batch)
+            self.assertIsNotNone(telemetry.batch)
+            self.assertNotEqual(telemetry.batch['batchId'], first['batchId'])
 
     def test_curl_failures_and_latency_are_observed_once(self):
         telemetry = agent.Telemetry({})

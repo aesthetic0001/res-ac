@@ -240,6 +240,11 @@ class BridgeTimingTests(unittest.TestCase):
         self.assertFalse(self.events('bridge.socket_flushed'))
         self.assertFalse(self.hooks.pending)
 
+    def test_datastore_tags_accept_binary_separator_after_latin1_decode(self):
+        self.packet.PacketReader(self.processor)
+        self.assertEqual(self.processor.process(b'Dresac_command_result\xfev1,reply'), 'ACK')
+        self.assertEqual(self.events('uart.frame_parsed')[-1][3], 35)
+
     def test_explicit_uart_markers_reset_and_freeze_bridge_capture(self):
         self.trace.record('uart.frame_end')
         self.mailbox.data_store_put('resac_timing_arm','1')

@@ -829,6 +829,10 @@ class Telemetry(object):
                                     attributes=attributes or dict(outcome='ok'), ended=monotonic()))
             if span_id is not None:
                 self.events[-1]['spanId'] = span_id
+            # A full batch is work, not a reason to wait for the idle heartbeat.
+            # Failed batches retain their retry deadline and identity.
+            if self.request is None and self.batch is None and len(self.events) >= 32:
+                self.next_due = min(self.next_due, monotonic())
         except Exception:
             self.dropped += 1
 
@@ -904,7 +908,7 @@ class Telemetry(object):
                     raise UploadError(status=status)
                 self.batch = None
                 self.backoff = 5
-                self.next_due = monotonic() + 15
+                self.next_due = monotonic() + (0 if len(self.events) >= 32 else 15)
             finally:
                 self.request.close()
                 self.request = None

@@ -60,7 +60,7 @@ class BridgeTiming(object):
                 else:
                     text = data
                 opcode = text[0:1]
-                key = text[1:].split('\xfe', 1)[0] if opcode in ('d', 'D') else ''
+                key = text[1:].split(u'\xfe', 1)[0] if opcode in ('d', 'D') else ''
                 if opcode == 'M':
                     fields = text[1:].split(',', 2)
                     key = fields[1] if len(fields) == 3 and fields[0] == 'v1' else ''
