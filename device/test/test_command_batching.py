@@ -76,11 +76,12 @@ class CommandBatchingTests(unittest.TestCase):
             self.assertEqual(processor.reply['result']['reply'], 'pong')
             self.assertIsNone(bridge.notification)
             events = {item['name']: item for item in telemetry.events}
-            self.assertEqual(events['avr.fetch']['durationMs'], 100)
-            self.assertEqual(events['avr.safety']['durationMs'], 120)
+            self.assertEqual(events['command.execute']['attributes']['command.timing.fetch_ms'], 100)
+            self.assertEqual(events['command.execute']['attributes']['command.timing.safety_ms'], 120)
             self.assertEqual(events['avr.execute']['durationMs'], 10)
-            self.assertAlmostEqual(events['command.notify']['durationMs'], 20, delta=1)
-            self.assertAlmostEqual(events['bridge.roundtrip']['durationMs'], 580, delta=1)
+            self.assertEqual(len(telemetry.events), 4)  # local root, dispatch, execution, AVR; phases add no events.
+            self.assertAlmostEqual(events['command.execute']['attributes']['command.timing.notify_ms'], 20, delta=1)
+            self.assertAlmostEqual(events['command.execute']['attributes']['command.timing.roundtrip_ms'], 580, delta=1)
 
     def test_timeout_invalidates_atomic_context_before_accepting_another_action(self):
         bridge = self.bridge()

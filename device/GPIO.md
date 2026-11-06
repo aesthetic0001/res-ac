@@ -165,7 +165,8 @@ Commands are also checked between configuration and safety housekeeping. Each
 retained value and its pushed event remain together. Commands never run inside
 a background publication stack frame, during setup, or recursively.
 
-Phase telemetry adds `command.journal`, `command.notify` (queue to confirmed GPIO
+Phase telemetry carries numeric fields on the existing command event; the backend
+expands them without multiplying the device queue. It adds `command.journal`, `command.notify` (queue to confirmed GPIO
 assertion), `bridge.roundtrip` (assertion to Linux completion), `avr.fetch`, and
 `avr.safety`. `avr.execute` retains its existing action/state-publication scope.
 Round-trip duration includes the AVR phases; these overlapping spans must not be

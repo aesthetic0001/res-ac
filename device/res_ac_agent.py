@@ -1608,13 +1608,18 @@ class CommandProcessor(object):
         parent = self.current.get('traceparent') or traceparent()
         telemetry = self.config.get('_telemetry')
         if telemetry:
-            telemetry.event('command.execute', parent, monotonic() - self.execution_started,
-                            self._command_attributes(status, 'avr_timeout' if 'timed out' in result.get('error', '') else 'command_rejected' if status == 'failed' else 'none'))
+            attributes = self._command_attributes(status, 'avr_timeout' if 'timed out' in result.get('error', '') else 'command_rejected' if status == 'failed' else 'none')
+            attributes.update(self.phase_timings)
             if signaled_at is not None:
-                telemetry.event('bridge.roundtrip', parent, monotonic() - signaled_at, self._command_attributes(status))
+                attributes['command.timing.roundtrip_ms'] = max(0, (monotonic() - signaled_at) * 1000)
             if getattr(self, 'avr_phases', None) is not None:
-                for name, duration in zip(('avr.fetch', 'avr.safety', 'avr.execute'), self.avr_phases):
-                    telemetry.event(name, parent, duration, self._command_attributes(status))
+                attributes['command.timing.fetch_ms'] = self.avr_phases[0] * 1000
+                attributes['command.timing.safety_ms'] = self.avr_phases[1] * 1000
+            # Carry compact fields on the existing event. The backend expands
+            # phases so bursts do not multiply the board's bounded event queue.
+            telemetry.event('command.execute', parent, monotonic() - self.execution_started, attributes)
+            if getattr(self, 'avr_phases', None) is not None:
+                telemetry.event('avr.execute', parent, self.avr_phases[2], self._command_attributes(status))
             try:
                 fields = (self.bridge.get('resac_command_diagnostic') or '').split(',')
                 if (getattr(self, 'avr_phases', None) is None and len(fields) == 4 and fields[:2] == ['v1', self.current['id']] and
@@ -1664,6 +1669,7 @@ class CommandProcessor(object):
             return
         self.current = command
         self.avr_phases = None
+        self.phase_timings = {}
         self.execution_started = monotonic()
         self.bridge_failed_reported = False
         if not re.match(TRACEPARENT, command.get('traceparent', '')):
@@ -1740,11 +1746,10 @@ class CommandProcessor(object):
     def _dispatch(self, frame):
         started = monotonic()
         if isinstance(self.bridge, BridgeEvents):
-            telemetry = self.config.get('_telemetry')
-            attributes = self._command_attributes('ok')
-            parent = self.current.get('traceparent')
-            callback = (lambda elapsed: telemetry.event('command.notify', parent, elapsed, attributes)) if telemetry else None
-            self.bridge.dispatch_command(frame, self.deadline, on_signal=callback)
+            timings = self.phase_timings
+            def signaled(elapsed):
+                timings['command.timing.notify_ms'] = max(0, elapsed * 1000)
+            self.bridge.dispatch_command(frame, self.deadline, on_signal=signaled)
         else:
             self.bridge.put('resac_command', frame)
         telemetry = self.config.get('_telemetry')
@@ -1815,10 +1820,7 @@ class CommandProcessor(object):
                     journal_started = monotonic()
                     self._write_state(dict(id=self.current['id'], traceparent=self.current.get('traceparent'), status='failed', result=dict(
                         error='IR execution interrupted; transmission uncertain; verify fan before retrying')))
-                    telemetry = self.config.get('_telemetry')
-                    if telemetry:
-                        telemetry.event('command.journal', self.current.get('traceparent'), monotonic() - journal_started,
-                                        self._command_attributes('ok'))
+                    self.phase_timings['command.timing.journal_ms'] = max(0, (monotonic() - journal_started) * 1000)
                     self.prepared = True
                     if self.calibrating:
                         self._dispatch('v3,%s,calibrate,%s' % (self.current['id'], self.session_id))

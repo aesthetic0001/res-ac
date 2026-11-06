@@ -78,7 +78,7 @@ class AutomationTests(unittest.TestCase):
             processor.bridge_due=0;processor._arduino()
             self.assertEqual(processor.reply['result']['presses'],5)
             events=telemetry.events[:]
-            self.assertEqual([event['name'] for event in events],['command.local','command.journal','bridge.dispatch','command.execute','avr.execute'])
+            self.assertEqual([event['name'] for event in events],['command.local','bridge.dispatch','command.execute','avr.execute'])
             for event in events:
                 self.assertEqual(event['attributes']['command.type'],'fan.level')
                 self.assertEqual(event['attributes']['command.source'],'automatic')
