@@ -454,6 +454,7 @@ test('handoff recovery survives reopening and never advances a duplicate decisio
     assert.equal(store.resultAndClaim('board',a.id,'failed',null,10_000).code,409);
     assert.equal(store.resultAndClaim('other',a.id,'succeeded',{reply:'pong'},10_000).code,404);
     assert.deepEqual(store.resultAndClaim('board',c.id,'succeeded',{reply:'pong'},10_000).commands,[]);
+    assert.equal(store.db.prepare('SELECT next_id FROM command_handoffs WHERE previous_id=?').get(c.id),undefined);
     const d=store.enqueue('board','device.ping',{},120);
     assert.deepEqual(store.resultAndClaim('board',c.id,'succeeded',{reply:'pong'},10_000).commands,[]);
     assert.equal(store.command(d.id).status,'pending');

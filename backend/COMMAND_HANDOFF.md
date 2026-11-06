@@ -16,7 +16,9 @@ A lost response must not strand the next lease or select a different action.
 Repeating the exact result returns the same mapped, still-active command without
 incrementing attempts while its lease remains valid. An expired lease can renew
 only that mapped command, within its original command TTL. A completed or expired
-mapped command is never returned. Empty initial decisions remain empty on retry;
+mapped command is never returned. A committed final-result row also seals an
+empty initial decision, so ordinary commands need no extra handoff-table write.
+Empty initial decisions remain empty on retry;
 a duplicate result received without a handoff association also remains empty.
 Conflicting results and cross-device requests retain their existing rejection.
 Associations persist across backend restart and are removed if their commands

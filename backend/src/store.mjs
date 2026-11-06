@@ -197,8 +197,9 @@ export class Store {
         }
       } else if (!previous && !result.duplicate) {
         next = allowClaim ? this.claim(deviceId, leaseMs, 'result') : null;
-        // Persist an empty decision too: a duplicate must not claim another action.
-        this.db.prepare('INSERT INTO command_handoffs(previous_id,next_id) VALUES(?,?)').run(id, next?.id ?? null);
+        // The durable final-result row seals an empty decision: duplicates never
+        // claim without a mapping. Only an actual next lease needs another row.
+        if (next) this.db.prepare('INSERT INTO command_handoffs(previous_id,next_id) VALUES(?,?)').run(id, next.id);
       }
       return { ...result, resultId: id, commands: next ? [next] : [] };
     });
