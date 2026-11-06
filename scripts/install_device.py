@@ -60,6 +60,8 @@ def main():
                         help='Legacy compatibility option; the persistent helper includes modern TLS')
     parser.add_argument('--http-helper', type=Path, default=root / 'private/http-build/res-ac-http-mips',
                         help='MIPS helper built locally by scripts/build_http_transport.py')
+    parser.add_argument('--native-bridge-helper', type=Path,
+                        help='Opt in to the native UART service using its static MIPS build')
     args = parser.parse_args()
     if not args.config.is_file():
         parser.error('Run scripts/configure_device.py first, or provide a private --config file.')
@@ -70,6 +72,10 @@ def main():
     if not args.http_helper.is_file():
         parser.error('Build scripts/build_http_transport.py first, or provide --http-helper.')
     helper_gzip = http_helper(args.http_helper)
+    bridge_gzip = http_helper(args.native_bridge_helper) if args.native_bridge_helper else None
+    if config.get('native_bridge') and bridge_gzip is None:
+        parser.error('A native Bridge configuration requires --native-bridge-helper.')
+    config['native_bridge'] = bridge_gzip is not None
     config['http_helper'] = '/tmp/res-ac-http'
     config.pop('curl_binary', None)
     data = (json.dumps(config, indent=2) + '\n').encode()
@@ -94,6 +100,14 @@ def main():
         version = console.run('/tmp/res-ac-http.pending --version')
         if b'res-ac-http protocol=1 ' not in version:
             raise RuntimeError('Unexpected HTTP helper protocol')
+        if bridge_gzip is not None:
+            console.upload(bridge_gzip, '/tmp/res-ac-bridge.pending.gz')
+            console.run('gzip -dc /tmp/res-ac-bridge.pending.gz > /tmp/res-ac-bridge.pending && '
+                        'chmod 700 /tmp/res-ac-bridge.pending', timeout=30)
+            if b'res-ac-bridge protocol=1 uart=yun1' not in console.run('/tmp/res-ac-bridge.pending --version'):
+                raise RuntimeError('Unexpected native Bridge protocol')
+            if b'PASS: native Bridge' not in console.run('/tmp/res-ac-bridge.pending --self-test'):
+                raise RuntimeError('Native Bridge clock/CRC preflight failed')
         agent_source = (root / 'device/res_ac_agent.py').read_bytes()
         console.upload(agent_source, '/tmp/res_ac_agent.pending.py')
         gpio_probe = console.run('python -u /tmp/res_ac_agent.pending.py --gpio-preflight')
@@ -136,7 +150,17 @@ def main():
                     'rm -f /tmp/res-ac-http.pending.gz /tmp/res_ac_agent.pending.py '
                     '/tmp/res-ac-curl /tmp/res-ac-curl.new')
         console.upload(agent_source, '/usr/lib/res-ac/res_ac_agent.py')
-        for name in ('timing_trace.py', 'bridge_timing.py', 'run_bridge_timing.py'):
+        if bridge_gzip is not None:
+            console.upload(bridge_gzip, '/usr/lib/res-ac/bridge.gz')
+            console.run('test -f /usr/bin/run-bridge.res-ac-original || '
+                        'cp -p /usr/bin/run-bridge /usr/bin/run-bridge.res-ac-original')
+            console.upload((root / 'device/run-native-bridge.sh').read_bytes(), '/usr/bin/run-bridge.pending', 0o755)
+            console.run('mv /usr/bin/run-bridge.pending /usr/bin/run-bridge && '
+                        'rm -f /tmp/res-ac-bridge.pending /tmp/res-ac-bridge.pending.gz')
+        else:
+            console.run('if test -f /usr/bin/run-bridge.res-ac-original; then '
+                        'cp -p /usr/bin/run-bridge.res-ac-original /usr/bin/run-bridge; fi')
+        for name in ('timing_trace.py', 'bridge_timing.py', 'run_bridge_timing.py', 'native_bridge_protocol.py'):
             console.upload((root / 'device' / name).read_bytes(), '/usr/lib/res-ac/' + name)
         console.upload((root / 'device/dhcp_route_repair.py').read_bytes(), '/usr/lib/res-ac/dhcp_route_repair.py')
         console.upload((root / 'device/network_watchdog.py').read_bytes(), '/usr/lib/res-ac/network_watchdog.py')

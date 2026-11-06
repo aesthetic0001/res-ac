@@ -27,6 +27,7 @@ class TransportInstallTests(unittest.TestCase):
         self.probe_ok = True
         self.gpio_ok = True
         self.bridge_ok = True
+        self.native_ok = True
         outer = self
 
         class Console:
@@ -45,6 +46,10 @@ class TransportInstallTests(unittest.TestCase):
                 outer.events.append(('run', command))
                 if command == '/tmp/res-ac-http.pending --version':
                     return b'res-ac-http protocol=1 libcurl=8.23.0'
+                if command == '/tmp/res-ac-bridge.pending --version':
+                    return b'res-ac-bridge protocol=1 uart=yun1' if outer.native_ok else b'WRONG'
+                if command == '/tmp/res-ac-bridge.pending --self-test':
+                    return b'PASS: native Bridge clock, framing, and CRC'
                 if '--gpio-preflight' in command:
                     return b'PASS: GPIO notification prerequisites' if outer.gpio_ok else b'FAIL'
                 if '--probe' in command:
@@ -66,7 +71,7 @@ class TransportInstallTests(unittest.TestCase):
                                      'prepare_bridge_socket_wait': self.preparer}):
             spec.loader.exec_module(self.installer)
 
-    def invoke(self):
+    def invoke(self, native=False):
         with tempfile.TemporaryDirectory() as directory:
             helper = Path(directory) / 'helper'
             helper.write_bytes(elf())
@@ -76,6 +81,7 @@ class TransportInstallTests(unittest.TestCase):
                                               curl_binary='/tmp/old-curl')))
             config.chmod(0o600)
             args = ['install_device.py', '--config', str(config), '--http-helper', str(helper), '--no-start']
+            if native: args += ['--native-bridge-helper', str(helper)]
             with patch.object(sys, 'argv', args), patch.object(self.installer, 'urlopen',
                     side_effect=lambda *args, **kwargs: io.BytesIO(b'-----BEGIN CERTIFICATE-----\nPUBLIC\n')):
                 self.installer.main()
@@ -95,6 +101,25 @@ class TransportInstallTests(unittest.TestCase):
         self.assertNotIn('curl_binary', active_config)
         self.assertFalse(any(event[0] == 'run' and event[1] == '/etc/init.d/res-ac-agent start'
                              for event in self.events))
+
+    def test_native_preflight_and_backup_launcher_precede_activation(self):
+        self.invoke(native=True)
+        config = json.loads(self.uploads['/etc/res-ac/agent.pending.json'])
+        self.assertTrue(config['native_bridge'])
+        version = next(i for i,e in enumerate(self.events) if e == ('run','/tmp/res-ac-bridge.pending --version'))
+        stop = next(i for i,e in enumerate(self.events) if e[0]=='run' and 'res-ac-agent stop' in e[1])
+        backup = next(i for i,e in enumerate(self.events) if e[0]=='run' and 'cp -p /usr/bin/run-bridge ' in e[1])
+        launcher = self.events.index(('upload','/usr/bin/run-bridge.pending'))
+        self.assertLess(version,stop)
+        self.assertLess(backup,launcher)
+        self.assertEqual(gzip.decompress(self.uploads['/usr/lib/res-ac/bridge.gz']),elf())
+        self.assertIn('/usr/lib/res-ac/native_bridge_protocol.py',self.uploads)
+
+    def test_bad_native_helper_does_not_stop_or_replace_running_agent(self):
+        self.native_ok=False
+        with self.assertRaises(RuntimeError): self.invoke(native=True)
+        self.assertNotIn('/usr/lib/res-ac/bridge.gz',self.uploads)
+        self.assertFalse(any(e[0]=='run' and 'res-ac-agent stop' in e[1] for e in self.events))
 
     def test_failed_preflight_keeps_existing_agent_and_transport(self):
         self.probe_ok = False

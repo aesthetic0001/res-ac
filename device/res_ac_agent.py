@@ -190,6 +190,8 @@ def load_config(path):
     interval = config.get('interval_seconds', 10)
     if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not 2 <= interval <= 3600:
         raise ValueError('Invalid reporting interval')
+    if not isinstance(config.get('native_bridge', False), bool):
+        raise ValueError('native_bridge must be a boolean')
     limit = config.get('queue_limit', 100)
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
         raise ValueError('Invalid queue limit')
@@ -454,10 +456,11 @@ class BridgeEvents(object):
                       'resac_fan_session', 'resac_fan_heartbeat', 'resac_fan_invalidate',
                       'resac_command', 'resac_command_status', 'resac_upload_status',
                       'resac_command_notify', 'resac_command_protocol', 'resac_fan_control',
-                      'resac_timing_arm', 'resac_timing_dump'])
+                      'resac_timing_arm', 'resac_timing_dump', 'resac_native_bridge'])
 
-    def __init__(self, host='127.0.0.1', port=5700, command_gpio=None, timing=None):
-        self.host, self.port = host, port
+    def __init__(self, host='127.0.0.1', port=None, command_gpio=None, timing=None, native=False):
+        self.host, self.port = host, (5701 if native else 5700) if port is None else port
+        self.native = native
         self.connection = None
         self.connecting = False
         self.ready = False
@@ -559,7 +562,11 @@ class BridgeEvents(object):
             self.cancel_command()
 
     def _queue(self, value):
-        encoded = encode_json(value).encode('utf-8')
+        if self.native:
+            from native_bridge_protocol import encode
+            encoded = encode(value)
+        else:
+            encoded = encode_json(value).encode('utf-8')
         if len(self.outgoing) + len(encoded) > 8192:
             self._disconnect()
             raise IOError('Bridge write queue is full')
@@ -623,6 +630,8 @@ class BridgeEvents(object):
                     log('Bridge event firmware is required; waiting for matching firmware')
                     self.firmware_warning = True
                 raise ValueError('Matching event firmware is required')
+            if self.native and values.get('resac_native_bridge') != 'v1':
+                raise ValueError('Native Bridge capability is required')
             self.values = {}
             for key, value in values.items():
                 self._update(key, value)
@@ -675,6 +684,21 @@ class BridgeEvents(object):
                 self._sample(True)
 
     def _receive(self, block):
+        if self.native:
+            from native_bridge_protocol import decode, MAX_FRAME
+            self.incoming.extend(block)
+            if len(self.incoming) > MAX_FRAME + 4 + 4096:
+                raise ValueError('Native Bridge receive queue too large')
+            while len(self.incoming) >= 4:
+                length = struct.unpack('!I', self.incoming[:4])[0]
+                if not 0 < length <= MAX_FRAME:
+                    raise ValueError('Native Bridge frame too large')
+                if len(self.incoming) < 4 + length:
+                    break
+                frame = bytes(self.incoming[4:4+length])
+                del self.incoming[:4+length]
+                self._message(decode(frame))
+            return
         # Frame concatenated JSON objects without relying on JSONDecoder, which
         # is missing from the board's legacy JSON module. Decode only full UTF-8.
         for char in block:
@@ -2137,7 +2161,9 @@ def next_wakeup(bridge, telemetry, commands, automation, fan_reporter, pending, 
 
 
 def run(config):
-    bridge = config.get('_bridge') or BridgeEvents(command_gpio=CommandGPIO(), timing=config.get('_timing_trace'))
+    native = config.get('native_bridge', False)
+    bridge = config.get('_bridge') or BridgeEvents(port=5701 if native else 5700, native=native,
+                                                   command_gpio=CommandGPIO(), timing=config.get('_timing_trace'))
     config['_bridge'] = bridge
     http = config.get('_http') or HttpTransport(config)
     config['_http'] = http

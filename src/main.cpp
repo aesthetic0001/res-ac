@@ -76,6 +76,7 @@ void serviceCommandNotification();
 bool commandExecuting = false;
 bool commandNotificationsReady = false;
 bool fanStatePending = false;
+bool nativeBridge = false;
 
 unsigned int bridgeGet(const char *key, char *buffer, unsigned int size) {
 #if RESAC_COMMAND_TIMING
@@ -111,6 +112,27 @@ void mailboxWrite(const uint8_t *data, unsigned int size) {
 }
 
 void publishValue(const char *key, const char *value) {
+  // The native service retains and publishes atomically in one UART exchange.
+  // Legacy services keep the original datastore plus Mailbox implementation.
+  if (nativeBridge) {
+    uint8_t prefix[66];
+    const size_t keyLength = strlen(key);
+    if (keyLength <= sizeof(prefix) - 2) {
+      prefix[0] = 'B'; memcpy(prefix + 1, key, keyLength); prefix[keyLength + 1] = 0xfe;
+      uint8_t reply = 0;
+#if RESAC_COMMAND_TIMING
+      commandTiming.record(CommandTiming::UART_BEGIN, CommandTiming::ATOMIC_PUBLICATION);
+#endif
+      const unsigned int length = Bridge.transfer(prefix, keyLength + 2,
+          reinterpret_cast<const uint8_t *>(value), strlen(value), &reply, 1);
+#if RESAC_COMMAND_TIMING
+      commandTiming.record(CommandTiming::UART_END, CommandTiming::ATOMIC_PUBLICATION);
+#endif
+      if (length == 1 && reply == 1) return;
+      // Publication is idempotent. Keep recovery data even if negotiation failed.
+      nativeBridge = false;
+    }
+  }
   // Retain a snapshot for reconnects, then notify connected Linux clients.
   bridgePut(key, value);
   char event[224];
@@ -566,6 +588,9 @@ void setup() {
   IrSender.begin();
   Serial.println(F("Starting sensor Bridge; Linux boot may take a moment..."));
   Bridge.begin();
+  char nativeCapability[4] = {0};
+  bridgeGet("resac_native_bridge", nativeCapability, sizeof(nativeCapability) - 1);
+  nativeBridge = strcmp(nativeCapability, "v1") == 0;
   Mailbox.begin();
   publishValue("resac_events", "");
   publishValue("resac_command_notify", "");
