@@ -12,6 +12,14 @@ function json(res, status, value) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
   res.end(status === 204 ? undefined : JSON.stringify(value));
 }
+function commandResponse(req, res, status, value) {
+  if (status === 200 && new URL(req.url, 'http://local').searchParams.get('format') === 'binary-v1') {
+    if (res.destroyed || res.writableEnded) return;
+    const encoded = encodeCommand(value);
+    res.writeHead(status, { 'content-type': commandMediaType, 'cache-control': 'no-store' });
+    res.end(encoded);
+  } else json(res, status, value);
+}
 async function body(req) {
   if (!/^application\/json(?:;|$)/i.test(req.headers['content-type'] || '')) throw new HttpError(415, 'Use application/json');
   let size = 0;
@@ -90,12 +98,7 @@ export function createApp(config, store, observability) {
       return () => {
         if (stopped || res.destroyed) return cleanup();
         cleanup();
-        const value = { commands: [command] };
-        if (new URL(req.url, 'http://local').searchParams.get('format') === 'binary-v1') {
-          const encoded = encodeCommand(value);
-          res.writeHead(200, { 'content-type': commandMediaType, 'cache-control': 'no-store' });
-          res.end(encoded);
-        } else json(res, 200, value);
+        commandResponse(req, res, 200, { commands: [command] });
       };
     };
     const wake = () => {
@@ -264,14 +267,25 @@ export function createApp(config, store, observability) {
             const value = await body(req);
             assert(['succeeded', 'failed'].includes(value.status), 'Status must be succeeded or failed');
             const saved = store.command(commandId);
-            const persist = () => store.transaction(() => { touch(); return store.result(id, commandId, value.status, value.result ?? null); });
+            const handoff = url.searchParams.get('next') === '1';
+            let deliver;
+            const persist = () => store.transaction(() => {
+              touch();
+              const result = handoff
+                ? store.resultAndClaim(id, commandId, value.status, value.result ?? null, config.leaseMs, !waiters.has(id))
+                : store.result(id, commandId, value.status, value.result ?? null);
+              if (result.code === 200) deliver = waiters.get(id)?.prepare();
+              return result;
+            });
             const result = observability && saved?.device_id === id && validTraceparent(saved.traceparent)
               ? observability.run('command.result', { 'command.id': commandId, 'command.type': saved.type, 'command.source': 'manual',
                 ...commandPayloadAttributes(saved.type, JSON.parse(saved.payload)), outcome: value.status }, persist,
                 validTraceparent(req.headers.traceparent) && req.headers.traceparent.slice(3, 35) === saved.traceparent.slice(3, 35)
                   ? undefined : saved.traceparent) : persist();
-            if (result.code === 200) notify(id);
-            return json(res, result.code, result.error ? { error: result.error } : { ok: true, duplicate: result.duplicate });
+            if (deliver) deliver();
+            else if (result.code === 200) notify(id);
+            return commandResponse(req, res, result.code, result.error ? { error: result.error }
+              : { ok: true, duplicate: result.duplicate, ...(handoff ? {resultId: result.resultId, commands: result.commands} : {}) });
           }
           throw new HttpError(405, 'Method not allowed');
         } finally { touch(); }

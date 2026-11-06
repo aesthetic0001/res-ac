@@ -191,6 +191,26 @@ test('command context survives reopening SQLite and redelivery, and result spans
   assert.equal(f.store.command(command.id).status, 'failed');
 });
 
+test('a result handoff keeps the next command context and observes its delivery once', async t => {
+  const f=await fixture(t);f.config.leaseMs=10_000;
+  const first=f.obs.run('command.request',{},()=>f.store.enqueue('board','device.ping',{},60));
+  const second=f.obs.run('command.request',{},()=>f.store.enqueue('board','device.ping',{},60));
+  assert.notEqual(first.traceparent,second.traceparent);
+  f.store.claim('board',10_000);
+  const post=()=>f.request(`/api/devices/board/commands/${first.id}/result?next=1`,{status:'succeeded',result:{reply:'pong'}},true,first.traceparent);
+  const handed=await (await post()).json();
+  assert.equal(handed.commands[0].traceparent,second.traceparent);
+  await post();
+  await f.obs.provider.forceFlush();
+  const delivered=f.exporter.getFinishedSpans().filter(s=>s.name==='command.delivery'&&s.attributes['command.id']===second.id);
+  assert.equal(delivered.length,1);
+  assert.equal(delivered[0].attributes['delivery.transport'],'result');
+  assert.equal(delivered[0].spanContext().traceId,second.traceparent.slice(3,35));
+  const result=f.exporter.getFinishedSpans().find(s=>s.name==='command.result');
+  assert.equal(result.spanContext().traceId,first.traceparent.slice(3,35));
+  assert.equal(f.exporter.getFinishedSpans().filter(s=>s.name==='db.transaction'&&s.spanContext().traceId===first.traceparent.slice(3,35)).length,2);
+});
+
 test('reading uploads propagate trace context and database errors are measured without SQL values', async t => {
   const f = await fixture(t), parent = newTraceparent();
   const reading = { readingId: 'sample-1', temperatureC: 23, humidity: 50 };

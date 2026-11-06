@@ -407,6 +407,95 @@ test('presence and result persistence share one commit and retry safely after ro
   assert.deepEqual(calls, ['BEGIN IMMEDIATE', 'COMMIT']);
 });
 
+test('result handoff commits result, next lease and recovery mapping atomically', async t => {
+  const f = await fixture(t, {leaseMs: 10_000}), auth = await f.login();
+  const first = await f.enqueue(auth), second = await f.enqueue(auth);
+  await f.request('/api/devices/board-1/commands', {headers: f.deviceHeaders});
+  const exec = f.store.db.exec.bind(f.store.db), calls = []; let fail = true;
+  f.store.db.exec = sql => {
+    calls.push(sql);
+    if (sql === 'COMMIT' && fail) {fail = false; throw Error('Injected commit failure');}
+    return exec(sql);
+  };
+  const post = () => f.request(`/api/devices/board-1/commands/${first.id}/result?next=1`, {
+    method: 'POST', headers: f.deviceHeaders, body: JSON.stringify({status:'succeeded',result:{reply:'pong'}})});
+  assert.equal((await post()).status, 500);
+  assert.equal(f.store.command(first.id).status, 'inflight');
+  assert.equal(f.store.command(second.id).status, 'pending');
+  assert.equal(f.store.db.prepare('SELECT count(*) n FROM command_handoffs').get().n, 0);
+  assert.deepEqual(calls, ['BEGIN IMMEDIATE','COMMIT','ROLLBACK']); calls.length = 0;
+  const accepted = await (await post()).json();
+  assert.equal(accepted.resultId, first.id); assert.equal(accepted.commands[0].id, second.id);
+  assert.deepEqual(calls, ['BEGIN IMMEDIATE','COMMIT']);
+  assert.equal(f.store.command(second.id).attempts, 1);
+  // Ignore the first response's command as though it was lost in transit.
+  const recovered = await (await post()).json();
+  assert.equal(recovered.duplicate, true); assert.deepEqual(recovered.commands, accepted.commands);
+  assert.equal(f.store.command(second.id).attempts, 1);
+  const binary = await f.request(`/api/devices/board-1/commands/${first.id}/result?next=1&format=binary-v1`, {
+    method:'POST',headers:f.deviceHeaders,body:JSON.stringify({status:'succeeded',result:{reply:'pong'}})});
+  assert.equal(binary.headers.get('content-type'),commandMediaType);
+  assert.deepEqual(Buffer.from(await binary.arrayBuffer()),encodeCommand(recovered));
+});
+
+test('handoff recovery survives reopening and never advances a duplicate decision', () => {
+  const directory = mkdtempSync(join(tmpdir(),'handoff-')),path=join(directory,'state.sqlite');
+  let store = new Store(path,[{id:'board',token:firstDeviceToken}]);
+  try {
+    const a=store.enqueue('board','device.ping',{},120),b=store.enqueue('board','device.ping',{},120),c=store.enqueue('board','device.ping',{},120);
+    store.claim('board',10_000);
+    assert.equal(store.resultAndClaim('board',a.id,'succeeded',{reply:'pong'},10_000).commands[0].id,b.id);
+    store.close();store=new Store(path);
+    assert.equal(store.resultAndClaim('board',a.id,'succeeded',{reply:'pong'},10_000).commands[0].id,b.id);
+    assert.equal(store.command(b.id).attempts,1);
+    assert.equal(store.resultAndClaim('board',b.id,'succeeded',{reply:'pong'},10_000).commands[0].id,c.id);
+    assert.deepEqual(store.resultAndClaim('board',a.id,'succeeded',{reply:'pong'},10_000).commands,[]);
+    assert.equal(store.command(c.id).attempts,1);
+    assert.equal(store.resultAndClaim('board',a.id,'failed',null,10_000).code,409);
+    assert.equal(store.resultAndClaim('other',a.id,'succeeded',{reply:'pong'},10_000).code,404);
+    assert.deepEqual(store.resultAndClaim('board',c.id,'succeeded',{reply:'pong'},10_000).commands,[]);
+    assert.equal(store.db.prepare('SELECT next_id FROM command_handoffs WHERE previous_id=?').get(c.id),undefined);
+    const d=store.enqueue('board','device.ping',{},120);
+    assert.deepEqual(store.resultAndClaim('board',c.id,'succeeded',{reply:'pong'},10_000).commands,[]);
+    assert.equal(store.command(d.id).status,'pending');
+    assert.equal(store.claim('board',10_000).id,d.id);
+  } finally {store.close();rmSync(directory,{recursive:true,force:true});}
+});
+
+test('handoff lease recovery renews only expired leases and honors command TTL', t => {
+  const store=new Store(':memory:',[{id:'board',token:firstDeviceToken}]);
+  try {
+    const a=store.enqueue('board','device.ping',{},120),b=store.enqueue('board','device.ping',{},120);
+    store.claim('board',1000);store.resultAndClaim('board',a.id,'succeeded',null,1000);
+    const lease=store.command(b.id).lease_until;
+    t.mock.method(Date,'now',()=>lease+1);
+    assert.equal(store.resultAndClaim('board',a.id,'succeeded',null,1000).commands[0].id,b.id);
+    assert.equal(store.command(b.id).attempts,2);
+    store.resultAndClaim('board',a.id,'succeeded',null,1000);
+    assert.equal(store.command(b.id).attempts,2);
+    t.mock.method(Date,'now',()=>b.expires_at+1);
+    assert.deepEqual(store.resultAndClaim('board',a.id,'succeeded',null,1000).commands,[]);
+    assert.equal(store.command(b.id).status,'expired');
+  } finally {store.close();}
+});
+
+test('an existing poll receives the next lease instead of duplicating the handoff', async t => {
+  const f=await fixture(t,{pollWaitMs:5000,leaseMs:10_000}),auth=await f.login();
+  const first=await f.enqueue(auth),second=await f.enqueue(auth);
+  await f.request('/api/devices/board-1/commands',{headers:f.deviceHeaders});
+  let ready;const waiting=new Promise(resolve=>{ready=resolve;});const claim=f.store.claim.bind(f.store);
+  f.store.claim=(...args)=>{const value=claim(...args);if(!value)ready();return value;};
+  const poll=f.request('/api/devices/board-1/commands',{headers:f.deviceHeaders});await waiting;
+  const exec=f.store.db.exec.bind(f.store.db),calls=[];
+  f.store.db.exec=sql=>{calls.push(sql);return exec(sql);};
+  const response=await f.request(`/api/devices/board-1/commands/${first.id}/result?next=1`,{
+    method:'POST',headers:f.deviceHeaders,body:JSON.stringify({status:'succeeded',result:{reply:'pong'}})});
+  assert.deepEqual((await response.json()).commands,[]);
+  assert.equal((await (await poll).json()).commands[0].id,second.id);
+  assert.equal(f.store.command(second.id).attempts,1);
+  assert.deepEqual(calls,['BEGIN IMMEDIATE','COMMIT']);
+});
+
 test('transaction observers run only after successful durable commit', () => {
   const store = new Store(':memory:', [{ id: 'board', token: firstDeviceToken }]);
   const events = [];
