@@ -3,5 +3,6 @@ config/*
 !config/example.env
 data/
 node_modules/
+native/
 .env
 *.sqlite*
