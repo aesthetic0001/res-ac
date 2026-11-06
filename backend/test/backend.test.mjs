@@ -386,10 +386,13 @@ test('presence and result persistence share one commit and retry safely after ro
   };
   const post = () => f.request(`/api/devices/board-1/commands/${queued.id}/result`, {
     method: 'POST', headers: f.deviceHeaders, body: JSON.stringify({ status: 'succeeded', result: { reply: 'pong' } }) });
-  const before = f.store.device('board-1').last_seen;
+  const before = f.store.db.prepare('SELECT last_seen FROM devices WHERE id=?').get('board-1').last_seen;
+  const now = Date.now() + 5001;
+  t.mock.method(Date, 'now', () => now);
   assert.equal((await post()).status, 500);
   assert.equal(f.store.command(queued.id).status, 'inflight');
-  assert.equal(f.store.device('board-1').last_seen, before);
+  assert.equal(f.store.db.prepare('SELECT last_seen FROM devices WHERE id=?').get('board-1').last_seen, before);
+  assert.equal(f.store.device('board-1').last_seen, now);
   assert.deepEqual(calls, ['BEGIN IMMEDIATE', 'COMMIT', 'ROLLBACK']);
   calls.length = 0;
   assert.equal((await post()).status, 200);
@@ -419,4 +422,38 @@ test('transaction observers run only after successful durable commit', () => {
     assert.throws(() => store.transaction(async () => {}), /synchronous/);
     assert.equal(store.db.prepare('PRAGMA synchronous').get().synchronous, 2);
   } finally { store.close(); }
+});
+
+test('presence remains live while disk writes coalesce, roll back, and handle clock changes', t => {
+  let now=100_000;
+  t.mock.method(Date,'now',()=>now);
+  const store=new Store(':memory:',[{id:'board',token:firstDeviceToken}]);
+  const persisted=()=>store.db.prepare('SELECT last_seen FROM devices WHERE id=?').get('board').last_seen;
+  const changes=()=>store.db.prepare('SELECT total_changes() n').get().n;
+  try {
+    store.seen('board');assert.equal(persisted(),100_000);
+    const before=changes();
+    now+=100;store.seen('board');
+    assert.equal(changes(),before);
+    assert.equal(store.device('board').last_seen,now);
+    assert.equal(store.snapshot().devices[0].lastSeen,new Date(now).toISOString());
+    now=105_000;store.seen('board');assert.equal(persisted(),105_000);
+    now=110_000;
+    assert.throws(()=>store.transaction(()=>{store.seen('board');throw new Error('rollback');}),/rollback/);
+    assert.equal(persisted(),105_000);assert.equal(store.device('board').last_seen,110_000);
+    now=110_001;store.seen('board');assert.equal(persisted(),now);
+    now=109_000;store.seen('board');assert.equal(persisted(),now);
+  } finally {store.close();}
+});
+
+test('clean shutdown persists the latest coalesced presence without changing command durability', t => {
+  let now=100_000;t.mock.method(Date,'now',()=>now);
+  const directory=mkdtempSync(join(tmpdir(),'presence-test-')),path=join(directory,'state.sqlite');
+  const store=new Store(path,[{id:'board',token:firstDeviceToken}]);
+  store.seen('board');now+=10;store.seen('board');store.close();
+  const reopened=new Store(path);
+  try {
+    assert.equal(reopened.device('board').last_seen,now);
+    assert.equal(reopened.db.prepare('PRAGMA synchronous').get().synchronous,2);
+  } finally {reopened.close();rmSync(directory,{recursive:true,force:true});}
 });

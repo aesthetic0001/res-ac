@@ -48,3 +48,10 @@ on existing events. The local command interval includes delivery-body decoding.
 Grouped SQLite work is measured by `db.transaction`, including durable commit;
 inner SQL spans do not include that commit. Compare durable server completion as
 well as the stored result timestamp, which precedes its commit.
+
+Presence observations stay exact in the live backend API. Their disk copy is
+coalesced to one write per five seconds of authenticated traffic and flushed on
+clean shutdown; after a crash that noncritical timestamp can lag by up to five
+seconds. Command enqueue/claim/result durability and fan-state freshness are
+unchanged. Native HTTP completions retain their integer timing fields rather than
+formatting them as curl output and parsing them back to floats.

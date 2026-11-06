@@ -13,6 +13,7 @@ export class Store {
   constructor(path, devices = [], observability) {
     this.observability = observability;
     this.commitObservers = null;
+    this.presence = new Map();
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
@@ -36,7 +37,14 @@ export class Store {
     }
     for (const device of devices) this.db.prepare('INSERT INTO devices(id,token_hash) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET token_hash=excluded.token_hash').run(device.id, digest(device.token));
   }
-  close() { this.db.close(); }
+  close() {
+    const pending = [...this.presence].filter(([, state]) => state.latest !== state.persisted);
+    if (pending.length) this.transaction(() => {
+      for (const [id, state] of pending)
+        this.db.prepare('UPDATE devices SET last_seen=? WHERE id=?').run(state.latest, id);
+    });
+    this.db.close();
+  }
   transaction(fn) {
     if (fn.constructor.name === 'AsyncFunction') throw new TypeError('SQLite transactions require synchronous callbacks');
     const execute = () => {
@@ -64,8 +72,28 @@ export class Store {
     if (this.commitObservers !== null) this.commitObservers.push(fn);
     else fn();
   }
-  device(id) { return this.db.prepare('SELECT * FROM devices WHERE id=?').get(id); }
-  seen(id) { this.db.prepare('UPDATE devices SET last_seen=? WHERE id=?').run(Date.now(), id); }
+  device(id) {
+    const row = this.db.prepare('SELECT * FROM devices WHERE id=?').get(id);
+    if (row && this.presence.has(id)) row.last_seen = this.presence.get(id).latest;
+    return row;
+  }
+  seen(id) {
+    let state = this.presence.get(id);
+    if (!state) {
+      const row = this.db.prepare('SELECT last_seen FROM devices WHERE id=?').get(id);
+      if (!row) return;
+      state = { latest: row.last_seen, persisted: row.last_seen };
+      this.presence.set(id, state);
+    }
+    const now = Date.now();
+    state.latest = now;
+    // Presence stays exact in the live API. Persist at most once per five
+    // seconds of incoming traffic; command/result commits remain fully durable.
+    if (state.persisted === null || now < state.persisted || now - state.persisted >= 5000) {
+      this.db.prepare('UPDATE devices SET last_seen=? WHERE id=?').run(now, id);
+      this.afterCommit(() => { state.persisted = now; });
+    }
+  }
   fanState(id) {
     const row = this.db.prepare('SELECT state,received_at FROM fan_states WHERE device_id=?').get(id);
     return row ? { ...JSON.parse(row.state), receivedAt: row.received_at } : null;
@@ -152,7 +180,8 @@ export class Store {
   snapshot() {
     this.expire();
     const devices = this.db.prepare('SELECT id,last_seen FROM devices ORDER BY id').all().map(device => ({
-      id: device.id, lastSeen: device.last_seen ? new Date(device.last_seen).toISOString() : null, fanState: this.fanState(device.id),
+      id: device.id, lastSeen: (this.presence.get(device.id)?.latest ?? device.last_seen) != null
+        ? new Date(this.presence.get(device.id)?.latest ?? device.last_seen).toISOString() : null, fanState: this.fanState(device.id),
       latest: this.db.prepare('SELECT temperature_c AS temperatureC,humidity,recorded_at AS recordedAt,received_at AS receivedAt FROM readings WHERE device_id=? ORDER BY id DESC LIMIT 1').get(device.id) || null
     }));
     const commands = this.db.prepare('SELECT * FROM commands ORDER BY created_at DESC,rowid DESC LIMIT 100').all().map(({ lease_until, ...c }) => ({ ...c, payload: JSON.parse(c.payload), result: c.result === null ? null : JSON.parse(c.result) }));
