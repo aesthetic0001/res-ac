@@ -73,29 +73,39 @@ export function createApp(config, store, observability) {
     const supplied = req.headers.authorization || '';
     const found = store.device(id);
     if (!found || !supplied.startsWith('Bearer ') || !equal(digest(supplied.slice(7)), found.token_hash)) throw new HttpError(401, 'Invalid device credentials');
-    store.seen(id);
   }
-  function poll(req, res, deviceId) {
+  function poll(req, res, deviceId, touch) {
     if (waiters.has(deviceId)) throw new HttpError(409, 'Only one command poll may be open per device');
     const deadline = Date.now() + config.pollWaitMs;
-    let timer, stopped = false;
+    let timer, stopped = false, firstWake = true;
     const cleanup = () => {
       stopped = true; clearTimeout(timer); waiters.delete(deviceId); res.off('close', cleanup);
+    };
+    const prepare = () => {
+      if (stopped || res.destroyed) return null;
+      const command = store.claim(deviceId, config.leaseMs);
+      if (!command) return null;
+      // Preparation can run in an enqueue transaction. Send only after commit.
+      return () => {
+        if (stopped || res.destroyed) return cleanup();
+        cleanup(); json(res, 200, { commands: [command] });
+      };
     };
     const wake = () => {
       if (stopped) return;
       clearTimeout(timer);
       if (res.destroyed) return cleanup();
       try {
-        const command = store.claim(deviceId, config.leaseMs);
-        if (command) { cleanup(); json(res, 200, { commands: [command] }); return; }
+        const deliver = firstWake ? store.transaction(() => { touch(); return prepare(); }) : prepare();
+        firstWake = false;
+        if (deliver) { deliver(); return; }
         if (Date.now() >= deadline) { cleanup(); json(res, 204); return; }
         timer = setTimeout(wake, Math.min(1000, deadline - Date.now()));
       } catch {
         cleanup(); json(res, 500, { error: 'Could not retrieve commands' });
       }
     };
-    waiters.set(deviceId, { wake, close: () => { cleanup(); json(res, 503, { error: 'Server is restarting; reconnect shortly' }); } });
+    waiters.set(deviceId, { wake, prepare, close: () => { cleanup(); json(res, 503, { error: 'Server is restarting; reconnect shortly' }); } });
     res.on('close', cleanup);
     wake();
   }
@@ -180,7 +190,13 @@ export function createApp(config, store, observability) {
         }
         const ttl = value.ttlSeconds ?? 300;
         assert(Number.isInteger(ttl) && ttl >= 1 && ttl <= 86400, 'TTL must be between 1 and 86400 seconds');
-        const command = store.enqueue(deviceId, value.type, value.payload, ttl);
+        let deliver;
+        const command = store.transaction(() => {
+          const queued = store.enqueue(deviceId, value.type, value.payload, ttl);
+          deliver = waiters.get(deviceId)?.prepare();
+          return queued;
+        });
+        deliver?.();
         notify(deviceId);
         return json(res, 201, { id: command.id, status: command.status, expiresAt: new Date(command.expires_at).toISOString() });
       }
@@ -188,65 +204,70 @@ export function createApp(config, store, observability) {
       if (deviceRoute) {
         const [, id, route, commandId] = deviceRoute;
         requireDevice(req, id);
-        if (req.method === 'POST' && route === 'telemetry' && !commandId) {
-          const value = await body(req);
-          assert(validateTelemetry(value), 'Invalid telemetry');
-          observability?.ingest(id, value);
-          return json(res, 200, { ok: true });
-        }
-        if (req.method === 'POST' && route === 'fan-state' && !commandId) {
-          const value = await body(req);
-          assert(value.sessionId === null || (typeof value.sessionId === 'string' && /^[a-f0-9]{32}$/.test(value.sessionId)), 'Invalid fan session');
-          assert(typeof value.calibrated === 'boolean' && ['on', 'off', 'unknown'].includes(value.power), 'Invalid fan estimate');
-          assert(Number.isInteger(value.revision) && value.revision >= 0 && value.revision <= 0xffffffff, 'Invalid fan revision');
-          assert(value.calibrated
-            ? value.sessionId !== null && ((value.power === 'off' && value.speed === 0) || (value.power === 'on' && Number.isInteger(value.speed) && value.speed >= 1 && value.speed <= 5))
-            : value.power === 'unknown' && value.speed === null, 'Inconsistent fan estimate');
-          const state = { sessionId: value.sessionId, calibrated: value.calibrated, power: value.power, speed: value.speed, revision: value.revision };
-          if (value.firmwareVersion !== undefined) {
-            assert(['v3', 'v4'].includes(value.firmwareVersion), 'Invalid firmware version');
-            state.firmwareVersion = value.firmwareVersion;
+        let touched = false;
+        const touch = () => { if (!touched) { store.seen(id); touched = true; } };
+        try {
+          if (req.method === 'POST' && route === 'telemetry' && !commandId) {
+            touch();
+            const value = await body(req);
+            assert(validateTelemetry(value), 'Invalid telemetry');
+            observability?.ingest(id, value);
+            return json(res, 200, { ok: true });
           }
-          if (value.controlSource !== undefined) {
-            assert(['reset', 'manual', 'automatic', 'calibration'].includes(value.controlSource), 'Invalid fan control source');
-            state.controlSource = value.controlSource;
+          if (req.method === 'POST' && route === 'fan-state' && !commandId) {
+            const value = await body(req);
+            assert(value.sessionId === null || (typeof value.sessionId === 'string' && /^[a-f0-9]{32}$/.test(value.sessionId)), 'Invalid fan session');
+            assert(typeof value.calibrated === 'boolean' && ['on', 'off', 'unknown'].includes(value.power), 'Invalid fan estimate');
+            assert(Number.isInteger(value.revision) && value.revision >= 0 && value.revision <= 0xffffffff, 'Invalid fan revision');
+            assert(value.calibrated
+              ? value.sessionId !== null && ((value.power === 'off' && value.speed === 0) || (value.power === 'on' && Number.isInteger(value.speed) && value.speed >= 1 && value.speed <= 5))
+              : value.power === 'unknown' && value.speed === null, 'Inconsistent fan estimate');
+            const state = { sessionId: value.sessionId, calibrated: value.calibrated, power: value.power, speed: value.speed, revision: value.revision };
+            if (value.firmwareVersion !== undefined) {
+              assert(['v3', 'v4'].includes(value.firmwareVersion), 'Invalid firmware version');
+              state.firmwareVersion = value.firmwareVersion;
+            }
+            if (value.controlSource !== undefined) {
+              assert(['reset', 'manual', 'automatic', 'calibration'].includes(value.controlSource), 'Invalid fan control source');
+              state.controlSource = value.controlSource;
+            }
+            if (value.automatic !== undefined) {
+              const automatic = value.automatic;
+              try {
+                state.automatic = curveSettings({ enabled: automatic.enabled, thresholdsC: automatic.thresholdsC, hysteresisC: automatic.hysteresisC });
+              } catch { throw new HttpError(400, 'Invalid automatic curve state'); }
+              assert(['disabled', 'waiting_for_sample', 'calibration_required', 'sensor_unavailable', 'waiting_for_device', 'cooldown', 'adjusting', 'active', 'manual_override', 'command_error', 'config_error'].includes(automatic.status), 'Invalid automatic status');
+              assert(automatic.targetLevel === null || (Number.isInteger(automatic.targetLevel) && automatic.targetLevel >= 0 && automatic.targetLevel <= 5), 'Invalid automatic target');
+              Object.assign(state.automatic, { status: automatic.status, targetLevel: automatic.targetLevel, minAdjustmentSeconds: 30 });
+            }
+            if (!store.transaction(() => { touch(); return store.setFanState(id, state); })) throw new HttpError(409, 'Outdated fan revision');
+            return json(res, 200, { ok: true });
           }
-          if (value.automatic !== undefined) {
-            const automatic = value.automatic;
-            try {
-              state.automatic = curveSettings({ enabled: automatic.enabled, thresholdsC: automatic.thresholdsC, hysteresisC: automatic.hysteresisC });
-            } catch { throw new HttpError(400, 'Invalid automatic curve state'); }
-            assert(['disabled', 'waiting_for_sample', 'calibration_required', 'sensor_unavailable', 'waiting_for_device', 'cooldown', 'adjusting', 'active', 'manual_override', 'command_error', 'config_error'].includes(automatic.status), 'Invalid automatic status');
-            assert(automatic.targetLevel === null || (Number.isInteger(automatic.targetLevel) && automatic.targetLevel >= 0 && automatic.targetLevel <= 5), 'Invalid automatic target');
-            Object.assign(state.automatic, { status: automatic.status, targetLevel: automatic.targetLevel, minAdjustmentSeconds: 30 });
+          if (req.method === 'POST' && route === 'readings' && !commandId) {
+            const value = await body(req);
+            assert(typeof value.temperatureC === 'number' && Number.isFinite(value.temperatureC) && value.temperatureC >= -80 && value.temperatureC <= 150, 'Invalid temperatureC');
+            assert(typeof value.humidity === 'number' && Number.isFinite(value.humidity) && value.humidity >= 0 && value.humidity <= 100, 'Invalid humidity');
+            if (value.readingId !== undefined) assert(typeof value.readingId === 'string' && value.readingId.length > 0 && value.readingId.length <= 100, 'Invalid readingId');
+            if (value.recordedAt !== undefined) assert(typeof value.recordedAt === 'string' && value.recordedAt.length <= 40 && Number.isFinite(Date.parse(value.recordedAt)), 'Invalid recordedAt');
+            const result = store.transaction(() => { touch(); return store.reading(id, value); });
+            return json(res, result.duplicate ? 200 : 201, result);
           }
-          if (!store.setFanState(id, state)) throw new HttpError(409, 'Outdated fan revision');
-          return json(res, 200, { ok: true });
-        }
-        if (req.method === 'POST' && route === 'readings' && !commandId) {
-          const value = await body(req);
-          assert(typeof value.temperatureC === 'number' && Number.isFinite(value.temperatureC) && value.temperatureC >= -80 && value.temperatureC <= 150, 'Invalid temperatureC');
-          assert(typeof value.humidity === 'number' && Number.isFinite(value.humidity) && value.humidity >= 0 && value.humidity <= 100, 'Invalid humidity');
-          if (value.readingId !== undefined) assert(typeof value.readingId === 'string' && value.readingId.length > 0 && value.readingId.length <= 100, 'Invalid readingId');
-          if (value.recordedAt !== undefined) assert(typeof value.recordedAt === 'string' && value.recordedAt.length <= 40 && Number.isFinite(Date.parse(value.recordedAt)), 'Invalid recordedAt');
-          const result = store.reading(id, value);
-          return json(res, result.duplicate ? 200 : 201, result);
-        }
-        if (req.method === 'GET' && route === 'commands' && !commandId) return poll(req, res, id);
-        if (req.method === 'POST' && route === 'commands' && commandId) {
-          const value = await body(req);
-          assert(['succeeded', 'failed'].includes(value.status), 'Status must be succeeded or failed');
-          const saved = store.command(commandId);
-          const persist = () => store.result(id, commandId, value.status, value.result ?? null);
-          const result = observability && saved?.device_id === id && validTraceparent(saved.traceparent)
-            ? observability.run('command.result', { 'command.id': commandId, 'command.type': saved.type, 'command.source': 'manual',
-              ...commandPayloadAttributes(saved.type, JSON.parse(saved.payload)), outcome: value.status }, persist,
-              validTraceparent(req.headers.traceparent) && req.headers.traceparent.slice(3, 35) === saved.traceparent.slice(3, 35)
-                ? undefined : saved.traceparent) : persist();
-          if (result.code === 200) notify(id);
-          return json(res, result.code, result.error ? { error: result.error } : { ok: true, duplicate: result.duplicate });
-        }
-        throw new HttpError(405, 'Method not allowed');
+          if (req.method === 'GET' && route === 'commands' && !commandId) return poll(req, res, id, touch);
+          if (req.method === 'POST' && route === 'commands' && commandId) {
+            const value = await body(req);
+            assert(['succeeded', 'failed'].includes(value.status), 'Status must be succeeded or failed');
+            const saved = store.command(commandId);
+            const persist = () => store.transaction(() => { touch(); return store.result(id, commandId, value.status, value.result ?? null); });
+            const result = observability && saved?.device_id === id && validTraceparent(saved.traceparent)
+              ? observability.run('command.result', { 'command.id': commandId, 'command.type': saved.type, 'command.source': 'manual',
+                ...commandPayloadAttributes(saved.type, JSON.parse(saved.payload)), outcome: value.status }, persist,
+                validTraceparent(req.headers.traceparent) && req.headers.traceparent.slice(3, 35) === saved.traceparent.slice(3, 35)
+                  ? undefined : saved.traceparent) : persist();
+            if (result.code === 200) notify(id);
+            return json(res, result.code, result.error ? { error: result.error } : { ok: true, duplicate: result.duplicate });
+          }
+          throw new HttpError(405, 'Method not allowed');
+        } finally { touch(); }
       }
       if (req.method === 'GET' && assets.has(path)) {
         if (path === '/' && !session(req)) { res.writeHead(303, { location: '/login' }); return res.end(); }

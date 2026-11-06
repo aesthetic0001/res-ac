@@ -341,3 +341,82 @@ test('reading history averages the full window into bounded chronological points
   assert.ok(result.sampleCount > 3500);
   assert.ok(result.readings.every(point => point.temperatureC < 30 && point.humidity < 50));
 });
+
+test('enqueue and waiting claim commit atomically before any device response', async t => {
+  const f = await fixture(t, { pollWaitMs: 5000, leaseMs: 10_000 }), auth = await f.login();
+  let ready;
+  const waiting = new Promise(resolve => { ready = resolve; });
+  const claim = f.store.claim.bind(f.store);
+  f.store.claim = (...args) => { const result = claim(...args); if (!result) ready(); return result; };
+  const poll = f.request('/api/devices/board-1/commands', { headers: f.deviceHeaders });
+  await waiting;
+  const exec = f.store.db.exec.bind(f.store.db), calls = [];
+  let fail = true;
+  f.store.db.exec = sql => {
+    calls.push(sql);
+    if (sql === 'COMMIT' && fail) { fail = false; throw new Error('Injected commit failure'); }
+    return exec(sql);
+  };
+  const post = () => f.request('/api/admin/devices/board-1/commands', { method: 'POST',
+    headers: { cookie: auth.cookie, 'x-csrf-token': auth.csrf, 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'device.ping', payload: {}, ttlSeconds: 60 }) });
+  assert.equal((await post()).status, 500);
+  assert.equal(f.store.db.prepare('SELECT count(*) n FROM commands').get().n, 0);
+  assert.deepEqual(calls, ['BEGIN IMMEDIATE', 'COMMIT', 'ROLLBACK']);
+  assert.equal(await Promise.race([poll.then(() => 'delivered'), sleep(25).then(() => 'waiting')]), 'waiting');
+  calls.length = 0;
+  const queued = await (await post()).json();
+  const delivered = await (await poll).json();
+  assert.equal(delivered.commands[0].id, queued.id);
+  assert.equal(f.store.command(queued.id).status, 'inflight');
+  assert.equal(f.store.command(queued.id).attempts, 1);
+  assert.deepEqual(calls, ['BEGIN IMMEDIATE', 'COMMIT']);
+  assert.equal(f.store.db.prepare('PRAGMA synchronous').get().synchronous, 2);
+});
+
+test('presence and result persistence share one commit and retry safely after rollback', async t => {
+  const f = await fixture(t), auth = await f.login(), queued = await f.enqueue(auth);
+  assert.equal((await f.request('/api/devices/board-1/commands', { headers: f.deviceHeaders })).status, 200);
+  const exec = f.store.db.exec.bind(f.store.db), calls = [];
+  let fail = true;
+  f.store.db.exec = sql => {
+    calls.push(sql);
+    if (sql === 'COMMIT' && fail) { fail = false; throw new Error('Injected commit failure'); }
+    return exec(sql);
+  };
+  const post = () => f.request(`/api/devices/board-1/commands/${queued.id}/result`, {
+    method: 'POST', headers: f.deviceHeaders, body: JSON.stringify({ status: 'succeeded', result: { reply: 'pong' } }) });
+  const before = f.store.device('board-1').last_seen;
+  assert.equal((await post()).status, 500);
+  assert.equal(f.store.command(queued.id).status, 'inflight');
+  assert.equal(f.store.device('board-1').last_seen, before);
+  assert.deepEqual(calls, ['BEGIN IMMEDIATE', 'COMMIT', 'ROLLBACK']);
+  calls.length = 0;
+  assert.equal((await post()).status, 200);
+  assert.equal(f.store.command(queued.id).status, 'succeeded');
+  assert.deepEqual(calls, ['BEGIN IMMEDIATE', 'COMMIT']);
+});
+
+test('transaction observers run only after successful durable commit', () => {
+  const store = new Store(':memory:', [{ id: 'board', token: firstDeviceToken }]);
+  const events = [];
+  store.observability = {
+    currentTraceparent: () => '00-' + 'a'.repeat(32) + '-' + 'b'.repeat(16) + '-01',
+    record: name => events.push(name), queueTime: { observe: () => events.push('queueMetric') }
+  };
+  try {
+    assert.throws(() => store.transaction(() => {
+      store.enqueue('board', 'device.ping', {}, 60); store.claim('board', 10_000);
+      assert.deepEqual(events, []); throw new Error('Rollback');
+    }), /Rollback/);
+    assert.deepEqual(events, []);
+    assert.equal(store.db.prepare('SELECT count(*) n FROM commands').get().n, 0);
+    store.transaction(() => {
+      store.enqueue('board', 'device.ping', {}, 60); store.claim('board', 10_000);
+      assert.deepEqual(events, []);
+    });
+    assert.deepEqual(events, ['command.queue_wait', 'queueMetric', 'command.delivery']);
+    assert.throws(() => store.transaction(async () => {}), /synchronous/);
+    assert.equal(store.db.prepare('PRAGMA synchronous').get().synchronous, 2);
+  } finally { store.close(); }
+});

@@ -12,9 +12,10 @@ export function canonical(value) {
 export class Store {
   constructor(path, devices = [], observability) {
     this.observability = observability;
+    this.commitObservers = null;
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
+    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY, token_hash TEXT NOT NULL, last_seen INTEGER);
       CREATE TABLE IF NOT EXISTS readings(id INTEGER PRIMARY KEY, device_id TEXT NOT NULL REFERENCES devices(id), reading_id TEXT NOT NULL,
         temperature_c REAL NOT NULL, humidity REAL NOT NULL, recorded_at TEXT, received_at INTEGER NOT NULL, UNIQUE(device_id,reading_id));
@@ -28,7 +29,7 @@ export class Store {
     if (!this.db.prepare('PRAGMA table_info(commands)').all().some(column => column.name === 'traceparent'))
       this.db.exec('ALTER TABLE commands ADD COLUMN traceparent TEXT');
     if (observability) {
-      for (const name of ['device', 'seen', 'fanState', 'setFanState', 'reading', 'readingHistory', 'enqueue', 'command', 'claim', 'result', 'expire', 'createSession', 'session', 'logout', 'snapshot']) {
+      for (const name of ['transaction', 'device', 'seen', 'fanState', 'setFanState', 'reading', 'readingHistory', 'enqueue', 'command', 'claim', 'result', 'expire', 'createSession', 'session', 'logout', 'snapshot']) {
         const original = this[name].bind(this);
         this[name] = (...args) => observability.run(`db.${name}`, { 'db.system.name': 'sqlite' }, () => original(...args));
       }
@@ -36,6 +37,33 @@ export class Store {
     for (const device of devices) this.db.prepare('INSERT INTO devices(id,token_hash) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET token_hash=excluded.token_hash').run(device.id, digest(device.token));
   }
   close() { this.db.close(); }
+  transaction(fn) {
+    if (fn.constructor.name === 'AsyncFunction') throw new TypeError('SQLite transactions require synchronous callbacks');
+    const execute = () => {
+      const result = fn();
+      if (result && typeof result.then === 'function') throw new TypeError('SQLite transactions cannot return promises');
+      return result;
+    };
+    if (this.commitObservers !== null) return execute();
+    this.db.exec('BEGIN IMMEDIATE');
+    this.commitObservers = [];
+    let result, observers;
+    try {
+      result = execute();
+      this.db.exec('COMMIT');
+      observers = this.commitObservers;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    } finally { this.commitObservers = null; }
+    // Optional diagnostics must not prevent delivery of a committed command.
+    for (const observe of observers) { try { observe(); } catch {} }
+    return result;
+  }
+  afterCommit(fn) {
+    if (this.commitObservers !== null) this.commitObservers.push(fn);
+    else fn();
+  }
   device(id) { return this.db.prepare('SELECT * FROM devices WHERE id=?').get(id); }
   seen(id) { this.db.prepare('UPDATE devices SET last_seen=? WHERE id=?').run(Date.now(), id); }
   fanState(id) {
@@ -93,12 +121,14 @@ export class Store {
     if (command.traceparent && this.observability) {
       const attributes = { 'command.id': command.id, 'command.type': command.type, 'command.source': 'manual',
         ...commandPayloadAttributes(command.type, JSON.parse(command.payload)), outcome: 'ok' };
-      if (!command.attempts) {
-        this.observability.record('command.queue_wait', command.traceparent, command.created_at, now - command.created_at, attributes);
-        this.observability.queueTime.observe({ device: deviceId }, (now - command.created_at) / 1000);
-      }
-      this.observability.record('command.delivery', command.traceparent, now, 0,
-        { ...attributes, 'delivery.attempt': command.attempts + 1, 'command.age_ms': now - command.created_at });
+      this.afterCommit(() => {
+        if (!command.attempts) {
+          this.observability.record('command.queue_wait', command.traceparent, command.created_at, now - command.created_at, attributes);
+          this.observability.queueTime.observe({ device: deviceId }, (now - command.created_at) / 1000);
+        }
+        this.observability.record('command.delivery', command.traceparent, now, 0,
+          { ...attributes, 'delivery.attempt': command.attempts + 1, 'command.age_ms': now - command.created_at });
+      });
     }
     return { ...(command.traceparent ? { traceparent: command.traceparent } : {}), id: command.id, type: command.type, payload: JSON.parse(command.payload),
       createdAt: new Date(command.created_at).toISOString(), expiresAt: new Date(command.expires_at).toISOString() };

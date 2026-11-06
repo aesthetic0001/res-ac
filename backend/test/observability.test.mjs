@@ -279,7 +279,8 @@ test('device, AVR and backend spans share one trace with server requests nested 
   assert.equal(byName['http.device'].spanContext().spanId, client.slice(36, 52));
   assert.equal(byName['http.device'].parentSpanContext.spanId, root.slice(36, 52));
   assert.equal(byName['http.server'].parentSpanContext.spanId, byName['http.device'].spanContext().spanId);
-  assert.equal(byName['db.reading'].parentSpanContext.spanId, byName['http.server'].spanContext().spanId);
+  assert.equal(byName['db.transaction'].parentSpanContext.spanId, byName['http.server'].spanContext().spanId);
+  assert.equal(byName['db.reading'].parentSpanContext.spanId, byName['db.transaction'].spanContext().spanId);
   assert.equal(byName['http.device'].kind, 2); // CLIENT
   assert.equal(byName['http.server'].kind, 1); // SERVER
   assert.ok(f.logs.some(log => log.operation === 'sensor.read' && log.service === 'res-ac-avr'));
@@ -297,9 +298,11 @@ test('command result persistence remains beneath the result-upload server span',
   const server = spans.find(span => span.name === 'http.server');
   const result = spans.find(span => span.name === 'command.result');
   const db = spans.find(span => span.name === 'db.result');
+  const transaction = spans.find(span => span.name === 'db.transaction' && span.parentSpanContext?.spanId === result.spanContext().spanId);
   assert.equal(server.parentSpanContext.spanId, client.slice(36, 52));
   assert.equal(result.parentSpanContext.spanId, server.spanContext().spanId);
-  assert.equal(db.parentSpanContext.spanId, result.spanContext().spanId);
+  assert.ok(transaction);
+  assert.equal(db.parentSpanContext.spanId, transaction.spanContext().spanId);
   for (const span of spans.filter(span => ['command.queue_wait', 'command.delivery', 'command.result'].includes(span.name))) {
     assert.deepEqual(JSON.parse(span.attributes['command.payload']), payload);
   }
