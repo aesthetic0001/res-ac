@@ -192,6 +192,8 @@ def load_config(path):
         raise ValueError('Invalid reporting interval')
     if not isinstance(config.get('native_bridge', False), bool):
         raise ValueError('native_bridge must be a boolean')
+    if not isinstance(config.get('binary_requests', True), bool):
+        raise ValueError('binary_requests must be a boolean')
     limit = config.get('queue_limit', 100)
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
         raise ValueError('Invalid queue limit')
@@ -839,6 +841,7 @@ class Telemetry(object):
         self.request = None
         self.batch = None
         self.encoding = self.prepared_payload = None
+        self.encoding_binary = False
         self.next_due = 0
         self.backoff = 5
         self.previous_cpu = None
@@ -943,11 +946,17 @@ class Telemetry(object):
         if monotonic() < self.next_due:
             return
         if self.encoding is not None:
+            if self.encoding_binary and not getattr(self.config.get('_http'), 'binary_enabled', False):
+                from cooperative_json import Encoding
+                self.encoding, self.encoding_binary = Encoding(self.prepared_payload), False
             encoded = self.encoding.step()
             if encoded is not None:
                 payload = self.prepared_payload
                 self.encoding = self.prepared_payload = None
-                self.request = CurlUpload(self.config, payload, route='telemetry', timeout=10, encoded_body=encoded)
+                options = dict(route='telemetry', timeout=10, encoded_body=encoded)
+                if self.encoding_binary:
+                    options['binary_body'] = True
+                self.request = CurlUpload(self.config, payload, **options)
             return
         if self.batch is None:
             self.sensor()
@@ -970,7 +979,11 @@ class Telemetry(object):
             metrics['sensor_sample_age_seconds'] = max(0, now - self.last_sample_at)
         payload = dict(self.batch, metrics=metrics, events=[event for event in events if event['ageMs'] <= 604800000])
         if self.config.get('native_bridge', False):
-            from cooperative_json import Encoding
+            self.encoding_binary = getattr(self.config.get('_http'), 'binary_enabled', False)
+            if self.encoding_binary:
+                from request_wire import Encoding
+            else:
+                from cooperative_json import Encoding
             self.encoding, self.prepared_payload = Encoding(payload), payload
             self.next_due = monotonic()  # Ready work on the existing selector, no added timer.
         else:
@@ -1102,6 +1115,11 @@ class HttpTransport(object):
         self.serial = 0
         self.outgoing = b''
         self.incoming = b''
+        self.helper_binary = self.server_binary = False
+
+    @property
+    def binary_enabled(self):
+        return self.config.get('binary_requests', True) and self.helper_binary and self.server_binary
 
     @staticmethod
     def field(value):
@@ -1114,6 +1132,7 @@ class HttpTransport(object):
         self.outgoing += struct.pack('!I', len(message)) + message
 
     def _start(self):
+        self.helper_binary = self.server_binary = False
         parent, child = socket.socketpair()
         try:
             parent.setblocking(False)
@@ -1131,19 +1150,29 @@ class HttpTransport(object):
         finally:
             child.close()
 
-    def submit(self, route, parent, payload, method, timeout, encoded_body=None):
+    def submit(self, route, parent, payload, method, timeout, encoded_body=None, binary_body=False):
+        if binary_body and method != 'POST':
+            raise ValueError('Binary bodies require POST')
         if len(self.pending) >= 4:
             raise IOError('All HTTP request slots are occupied')
         if self.connection is None:
             self._start()
         self.serial = self.serial % 0xffffffff + 1
         result = HttpResult(self.serial)
-        body = encoded_body if encoded_body is not None else (encode_json(payload) if payload is not None else b'')
+        if binary_body and encoded_body is None and self.binary_enabled:
+            from request_wire import encode
+            body, binary_body = encode(payload), True
+        elif binary_body and not self.binary_enabled:
+            # A backend/helper downgrade can arrive while telemetry is prepared.
+            # Retain the original payload and retry identity using JSON.
+            body, binary_body = encode_json(payload), False
+        else:
+            body = encoded_body if encoded_body is not None else (encode_json(payload) if payload is not None else b'')
         if isinstance(body, text_type):
             body = body.encode('utf-8')
-        if len(body) > 32768 or method not in ('GET', 'POST') or not 1 <= timeout <= 60:
+        if len(body) > 32768 or method not in ('GET', 'POST') or not 1 <= timeout <= 60 or (binary_body and method != 'POST'):
             raise ValueError('Invalid HTTP request')
-        message = b'Q' + struct.pack('!II', result.id, timeout) + (b'G' if method == 'GET' else b'P')
+        message = (b'B' if binary_body else b'Q') + struct.pack('!II', result.id, timeout) + (b'G' if method == 'GET' else b'P')
         self._queue(message + self.field(route) + self.field(parent) + self.field(body))
         self.pending[result.id] = result
         # Start network work before the caller runs background telemetry/fan work.
@@ -1190,6 +1219,15 @@ class HttpTransport(object):
             request_id, code, status, connections, reason = fields[:5]
             if fields[10] != len(frame) - 44 or status > 599:
                 raise ValueError('Invalid HTTP completion metadata')
+            if request_id == 0:
+                info = frame[44:]
+                if not any(fields[1:10]) and len(info) == 7 and info[:5] == b'RACF\x01':
+                    helper, server = struct.unpack('!BB', info[5:])
+                    if helper <= 1 and server <= 2:
+                        self.helper_binary = bool(helper)
+                        if server != 2:
+                            self.server_binary = bool(server)
+                continue
             result = self.pending.get(request_id)
             if result is None:
                 continue  # Completion raced with a cancellation.
@@ -1204,6 +1242,7 @@ class HttpTransport(object):
             result.completed = True
 
     def _failed(self):
+        self.helper_binary = self.server_binary = False
         if self.connection is not None:
             self.connection.close()
         self.connection = None
@@ -1267,7 +1306,7 @@ def request_completed(request):
 
 class CurlUpload(object):
     """HTTP attempt backed by the shared helper, or standalone curl for probes."""
-    def __init__(self, config, payload=None, route='readings', method='POST', timeout=25, encoded_body=None, journal_ms=None):
+    def __init__(self, config, payload=None, route='readings', method='POST', timeout=25, encoded_body=None, journal_ms=None, binary_body=False):
         self.process = None
         self.files = []
         self.transport = config.get('_http')
@@ -1292,9 +1331,14 @@ class CurlUpload(object):
         self.request_traceparent = self.parent if self.root_request else traceparent(self.parent)
         try:
             if self.transport is not None:
-                self.result = self.transport.submit(route, self.request_traceparent, payload, method, timeout, encoded_body=encoded_body)
+                options = dict(encoded_body=encoded_body)
+                if binary_body:
+                    options['binary_body'] = True
+                self.result = self.transport.submit(route, self.request_traceparent, payload, method, timeout, **options)
                 self.prepared_at = monotonic()
                 return
+            if binary_body:
+                raise ValueError('Binary requests require the negotiated HTTP helper')
             header_fd, header_path = temporary('res-ac-curl-')
             self.files.append(header_path)
             response_fd, self.response_path = temporary('res-ac-response-')

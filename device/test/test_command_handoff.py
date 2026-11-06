@@ -29,6 +29,22 @@ class Bridge:
 
 
 class HandoffTests(unittest.TestCase):
+    def test_body_format_rejection_keeps_uncertain_ir_journal_and_retries_only_the_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            processor=self.saved(directory)
+            processor.reply.update(status='failed',result={'error':'Arduino IR timed out; transmission uncertain'})
+            processor._save();saved=Path(processor.state_path).read_bytes();clock=[100.0]
+            self.response(processor,b'{"error":"Use application/json"}',status=415)
+            with patch.object(agent,'monotonic',lambda:clock[0]),patch.object(processor,'_arduino',side_effect=AssertionError('Physical command replayed')),patch.object(agent,'CurlUpload',Request):
+                processor.tick()
+                self.assertIsNone(processor.current);self.assertIsNone(processor.request)
+                self.assertTrue(processor.persisted);self.assertEqual(Path(processor.state_path).read_bytes(),saved)
+                clock[0]=processor.retry_at;processor.tick()
+                self.assertEqual(processor.request_kind,'result')
+                self.assertEqual(processor.request.payload['status'],'failed')
+                self.assertEqual(processor.request.payload['result'],processor.reply['result'])
+                self.assertEqual(Path(processor.state_path).read_bytes(),saved)
+
     def saved(self, directory, bridge=None, native=True):
         processor = agent.CommandProcessor(dict(native_bridge=native), bridge or Bridge(),
             state_path=str(Path(directory) / 'journal'))

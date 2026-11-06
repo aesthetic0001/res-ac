@@ -114,6 +114,7 @@ class TransportInstallTests(unittest.TestCase):
         self.assertLess(backup,launcher)
         self.assertEqual(gzip.decompress(self.uploads['/usr/lib/res-ac/bridge.gz']),elf())
         self.assertIn('/usr/lib/res-ac/native_bridge_protocol.py',self.uploads)
+        self.assertIn('/usr/lib/res-ac/request_wire.py',self.uploads)
 
     def test_bad_native_helper_does_not_stop_or_replace_running_agent(self):
         self.native_ok=False

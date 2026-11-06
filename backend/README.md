@@ -138,6 +138,12 @@ to the configured device ID. Retrieve the token locally from the private
 Browser sessions do not authenticate device requests, and device tokens do not
 authenticate administrative requests. All requests and responses use HTTPS.
 
+Updated devices can negotiate a bounded binary request representation to reduce
+telemetry encoding CPU. Existing JSON callers remain supported. See
+[request encoding and compatibility](../device/REQUEST_ENCODING.md). Set
+`BINARY_REQUESTS=false` to stop advertising binary support while accepting
+in-flight binary bodies during a gradual downgrade.
+
 ### Post a reading
 
 `POST /api/devices/seeeduino-cloud/readings`

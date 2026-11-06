@@ -8,8 +8,10 @@ export function loadConfig(env = process.env) {
   if (env.DEVICE_TOKEN.length < 32) throw new Error('DEVICE_TOKEN must have at least 32 characters');
   const port = Number(env.PORT || 3000);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Invalid PORT');
+  if (env.BINARY_REQUESTS !== undefined && !['true', 'false'].includes(env.BINARY_REQUESTS)) throw new Error('Invalid BINARY_REQUESTS');
   return {
     port, host: env.HOST || '0.0.0.0', httpDev: env.HTTP_DEV === 'true',
+    binaryRequests: env.BINARY_REQUESTS !== 'false',
     dbPath: resolve(env.DATA_DIR || './data', 'sensors.sqlite'),
     tlsDir: resolve(env.TLS_DIR || '/run/sensor-tls'),
     adminUsername: env.ADMIN_USERNAME, passwordHash: env.ADMIN_PASSWORD_HASH,

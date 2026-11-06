@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import socket
 import ssl
+import struct
 import subprocess
 import tempfile
 import threading
@@ -14,6 +15,22 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from test_agent import agent
+import command_wire
+import request_wire
+
+
+class CapabilityFrameTests(unittest.TestCase):
+    def test_reserved_frames_negotiate_only_known_flags_and_reset_with_helper_failure(self):
+        transport=agent.HttpTransport({})
+        def frame(body,code=0):return struct.pack('!12I',44+len(body),0,code,0,0,0,0,0,0,0,0,len(body))+body
+        for body in [b'RACF\x02\x01\x01',b'RACF\x01\x02\x01',b'RACF\x01\x01\x03',b'other']:
+            transport._receive(frame(body));self.assertFalse(transport.binary_enabled)
+        transport._receive(frame(b'RACF\x01\x01\x01',code=1));self.assertFalse(transport.binary_enabled)
+        packet=frame(b'RACF\x01\x01\x01')
+        transport._receive(packet[:13]);self.assertFalse(transport.binary_enabled)
+        transport._receive(packet[13:]);self.assertTrue(transport.binary_enabled)
+        transport._receive(frame(b'RACF\x01\x01\x02'));self.assertTrue(transport.binary_enabled)
+        transport._failed();self.assertFalse(transport.binary_enabled)
 
 
 class PersistentHttpTests(unittest.TestCase):
@@ -41,6 +58,7 @@ class PersistentHttpTests(unittest.TestCase):
         self.received = []
         self.held = threading.Event()
         self.release = threading.Event()
+        self.advertise_binary = self.accept_binary = False
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -53,7 +71,15 @@ class PersistentHttpTests(unittest.TestCase):
                 self.reply(204, b'')
 
             def do_POST(self):
-                value = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                raw = self.rfile.read(int(self.headers['Content-Length']))
+                if self.headers['Content-Type'] == 'application/vnd.res-ac.value.v1':
+                    if not outer.accept_binary:
+                        outer.received.append((self.path, self.client_address, self.headers, raw))
+                        self.reply(415, b'{"error":"Use application/json"}')
+                        return
+                    value = command_wire.decode(raw)
+                else:
+                    value = json.loads(raw)
                 outer.received.append((self.path, self.client_address, self.headers, value))
                 if value.get('hold'):
                     outer.held.set()
@@ -64,6 +90,8 @@ class PersistentHttpTests(unittest.TestCase):
             def reply(self, status, body, close=False, chunked=False):
                 try:
                     self.send_response(status)
+                    if outer.advertise_binary:
+                        self.send_header('X-Resac-Request-Body', 'binary-v1')
                     self.send_header('Transfer-Encoding' if chunked else 'Content-Length',
                                      'chunked' if chunked else str(len(body)))
                     if close:
@@ -153,6 +181,64 @@ class PersistentHttpTests(unittest.TestCase):
             self.completed(request)
             self.assertEqual(request.finish()[0],201)
         self.assertEqual(self.received[0][3],payload)
+
+    def test_binary_requests_negotiate_reuse_tls_and_preserve_nul_unicode_and_numbers(self):
+        self.advertise_binary = self.accept_binary = True
+        first = self.upload({'negotiate': True}); self.completed(first); first.finish(); first.close()
+        self.assertTrue(self.http.binary_enabled)
+        payload = {'text': '\0é😀', 'number': 1.234567890123456, 'values': [None, True, False, -0.0]}
+        with patch.object(agent, 'encode_json', side_effect=AssertionError('Binary request serialized as JSON')):
+            request = self.upload(payload,binary_body=True); self.completed(request)
+            self.assertEqual(request.finish()[0], 201)
+        self.assertEqual(self.received[-1][3], payload)
+        self.assertEqual(self.received[-1][2]['Content-Type'], 'application/vnd.res-ac.value.v1')
+        self.assertEqual(request.result.connections, 0)
+
+    def test_server_downgrade_disables_binary_before_same_payload_retry(self):
+        self.advertise_binary = self.accept_binary = True
+        first = self.upload({}); self.completed(first); first.finish(); first.close()
+        payload = {'readingId': 'stable-retry-id', 'number': 1.25}
+        self.advertise_binary = self.accept_binary = False
+        rejected = self.upload(payload,binary_body=True); self.completed(rejected)
+        self.assertEqual(rejected.finish()[0], 415)
+        self.assertFalse(self.http.binary_enabled); rejected.close()
+        retry = self.upload(payload,binary_body=True); self.completed(retry)
+        self.assertEqual(retry.finish()[0], 201)
+        self.assertEqual(self.received[-1][3], payload)
+        self.assertEqual(self.received[-1][2]['Content-Type'], 'application/json')
+
+    def test_json_control_and_legacy_server_do_not_enable_binary(self):
+        for _ in range(2):
+            request = self.upload({}); self.completed(request); request.finish(); request.close()
+        self.assertFalse(self.http.binary_enabled)
+        self.advertise_binary = self.accept_binary = True
+        self.config['binary_requests'] = False
+        for _ in range(2):
+            request = self.upload({}); self.completed(request); request.finish(); request.close()
+        self.assertFalse(self.http.binary_enabled)
+        self.assertTrue(all(row[2]['Content-Type'] == 'application/json' for row in self.received))
+
+    def test_small_bodies_keep_the_vendor_json_path_after_negotiation(self):
+        self.advertise_binary = self.accept_binary = True
+        first = self.upload({}); self.completed(first); first.finish(); first.close()
+        self.assertTrue(self.http.binary_enabled)
+        with patch.object(request_wire, 'encode', side_effect=AssertionError('Small body switched to binary')):
+            request = self.upload({'readingId': 'small', 'temperatureC': 22.5})
+            self.completed(request); self.assertEqual(request.finish()[0], 201)
+        self.assertEqual(self.received[-1][2]['Content-Type'], 'application/json')
+
+    def test_prepared_binary_payload_avoids_reencoding_and_falls_back_after_downgrade(self):
+        self.advertise_binary = self.accept_binary = True
+        first = self.upload({}); self.completed(first); first.finish(); first.close()
+        payload = {'readingId': 'prepared-binary', 'number': 1.25}
+        encoded = request_wire.encode(payload)
+        with patch.object(request_wire, 'encode', side_effect=AssertionError('Prepared body encoded twice')):
+            request = self.upload(payload, encoded_body=encoded, binary_body=True)
+            self.completed(request); self.assertEqual(request.finish()[0], 201); request.close()
+        self.http.server_binary = False
+        request = self.upload(payload, encoded_body=encoded, binary_body=True)
+        self.completed(request); self.assertEqual(request.finish()[0], 201)
+        self.assertEqual(self.received[-1][2]['Content-Type'], 'application/json')
 
     def test_native_completion_keeps_binary_timings_without_text_roundtrip(self):
         telemetry=agent.Telemetry(self.config);self.config['_telemetry']=telemetry

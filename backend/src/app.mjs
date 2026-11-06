@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { token, digest, equal, verifyPassword, cookieToken } from './auth.mjs';
 import { curveSettings } from './fan-curve.mjs';
 import { commandMediaType, encodeCommand } from './command-wire.mjs';
+import { requestMediaType, decodeRequest } from './request-wire.mjs';
 
 class HttpError extends Error { constructor(status, message) { super(message); this.status = status; } }
 const assert = (test, message) => { if (!test) throw new HttpError(400, message); };
@@ -20,8 +21,9 @@ function commandResponse(req, res, status, value) {
     res.end(encoded);
   } else json(res, status, value);
 }
-async function body(req) {
-  if (!/^application\/json(?:;|$)/i.test(req.headers['content-type'] || '')) throw new HttpError(415, 'Use application/json');
+async function body(req, allowBinary = false) {
+  const binary = allowBinary && (req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase() === requestMediaType;
+  if (!binary && !/^application\/json(?:;|$)/i.test(req.headers['content-type'] || '')) throw new HttpError(415, 'Use application/json');
   let size = 0;
   const chunks = [];
   await new Promise((resolve, reject) => {
@@ -41,12 +43,13 @@ async function body(req) {
     req.once('aborted', () => reject(new HttpError(400, 'Request was aborted')));
   });
   try {
-    const value = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const data = Buffer.concat(chunks);
+    const value = binary ? decodeRequest(data) : JSON.parse(data.toString('utf8'));
     assert(value && typeof value === 'object' && !Array.isArray(value), 'Expected a JSON object');
     return value;
   } catch (error) {
     if (error instanceof HttpError) throw error;
-    throw new HttpError(400, 'Invalid JSON');
+    throw new HttpError(400, binary ? 'Invalid binary request' : 'Invalid JSON');
   }
 }
 function sameOrigin(req, config) {
@@ -214,18 +217,19 @@ export function createApp(config, store, observability) {
       if (deviceRoute) {
         const [, id, route, commandId] = deviceRoute;
         requireDevice(req, id);
+        if (config.binaryRequests !== false) res.setHeader('x-resac-request-body', 'binary-v1');
         let touched = false;
         const touch = () => { if (!touched) { store.seen(id); touched = true; } };
         try {
           if (req.method === 'POST' && route === 'telemetry' && !commandId) {
             touch();
-            const value = await body(req);
+            const value = await body(req, true);
             assert(validateTelemetry(value), 'Invalid telemetry');
             observability?.ingest(id, value);
             return json(res, 200, { ok: true });
           }
           if (req.method === 'POST' && route === 'fan-state' && !commandId) {
-            const value = await body(req);
+            const value = await body(req, true);
             assert(value.sessionId === null || (typeof value.sessionId === 'string' && /^[a-f0-9]{32}$/.test(value.sessionId)), 'Invalid fan session');
             assert(typeof value.calibrated === 'boolean' && ['on', 'off', 'unknown'].includes(value.power), 'Invalid fan estimate');
             assert(Number.isInteger(value.revision) && value.revision >= 0 && value.revision <= 0xffffffff, 'Invalid fan revision');
@@ -254,7 +258,7 @@ export function createApp(config, store, observability) {
             return json(res, 200, { ok: true });
           }
           if (req.method === 'POST' && route === 'readings' && !commandId) {
-            const value = await body(req);
+            const value = await body(req, true);
             assert(typeof value.temperatureC === 'number' && Number.isFinite(value.temperatureC) && value.temperatureC >= -80 && value.temperatureC <= 150, 'Invalid temperatureC');
             assert(typeof value.humidity === 'number' && Number.isFinite(value.humidity) && value.humidity >= 0 && value.humidity <= 100, 'Invalid humidity');
             if (value.readingId !== undefined) assert(typeof value.readingId === 'string' && value.readingId.length > 0 && value.readingId.length <= 100, 'Invalid readingId');
@@ -264,7 +268,7 @@ export function createApp(config, store, observability) {
           }
           if (req.method === 'GET' && route === 'commands' && !commandId) return poll(req, res, id, touch);
           if (req.method === 'POST' && route === 'commands' && commandId) {
-            const value = await body(req);
+            const value = await body(req, true);
             assert(['succeeded', 'failed'].includes(value.status), 'Status must be succeeded or failed');
             const saved = store.command(commandId);
             const handoff = url.searchParams.get('next') === '1';

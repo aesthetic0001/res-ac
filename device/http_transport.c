@@ -12,12 +12,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #define SLOTS 4
 #define BODY_LIMIT 32768U
 #define FRAME_LIMIT 37000U
 #define QUEUE_LIMIT (SLOTS * (BODY_LIMIT + 256U))
+#define CAPABILITY_FRAME (4U + 44U + 7U)
 
 struct request {
   CURL *easy;
@@ -25,7 +27,8 @@ struct request {
   uint32_t id;
   unsigned char *payload;
   unsigned char body[BODY_LIMIT];
-  size_t used;
+  size_t used, payload_length;
+  int server_binary;
   char error[CURL_ERROR_SIZE];
 };
 static struct request requests[SLOTS];
@@ -47,14 +50,39 @@ static void release(struct request *r) {
   free(r->payload);
   memset(r, 0, sizeof(*r));
 }
-static char *field(const unsigned char **p, size_t *remaining, size_t limit) {
+static char *data_field(const unsigned char **p, size_t *remaining, size_t limit, size_t *length, int binary) {
   if (*remaining < 4) return NULL;
   uint32_t n = u32(*p); *p += 4; *remaining -= 4;
-  if (n > limit || n > *remaining || memchr(*p, 0, n)) return NULL;
+  if (n > limit || n > *remaining || (!binary && memchr(*p, 0, n))) return NULL;
   char *s = malloc(n + 1);
   if (!s) return NULL;
   memcpy(s, *p, n); s[n] = 0; *p += n; *remaining -= n;
+  if (length) *length=n;
   return s;
+}
+static char *field(const unsigned char **p, size_t *remaining, size_t limit) {
+  return data_field(p,remaining,limit,NULL,0);
+}
+static size_t receive_header(char *data, size_t size, size_t count, void *context) {
+  struct request *r=context;
+  if (size && count > SIZE_MAX/size) return 0;
+  size_t n=size*count;
+  if (n>=5 && !memcmp(data,"HTTP/",5)) r->server_binary=0;
+  const char name[]="x-resac-request-body:";
+  if (n>=sizeof(name)-1 && !strncasecmp(data,name,sizeof(name)-1)) {
+    size_t start=sizeof(name)-1,end=n;
+    while (start<end && (data[start]==' ' || data[start]=='\t')) start++;
+    while (end>start && (data[end-1]==' ' || data[end-1]=='\t' || data[end-1]=='\r' || data[end-1]=='\n')) end--;
+    r->server_binary=end-start==9 && !memcmp(data+start,"binary-v1",9);
+  }
+  return n;
+}
+static int capabilities(unsigned server) {
+  if (output_used+CAPABILITY_FRAME>sizeof(output)) return -1;
+  unsigned char *p=output+output_used;
+  put32(p,51); memset(p+4,0,44); put32(p+44,7);
+  memcpy(p+48,"RACF",4);p[52]=1;p[53]=1;p[54]=(unsigned char)server;
+  output_used+=CAPABILITY_FRAME;return 0;
 }
 static size_t receive_body(char *data, size_t size, size_t count, void *context) {
   struct request *r = context;
@@ -76,12 +104,15 @@ static int complete(struct request *r, CURLcode code) {
   /* Response: id, curl code, HTTP status, new connections, safe error category,
    * five cumulative times in microseconds, body length, body. No raw errors. */
   const size_t metadata = 44, length = metadata + r->used;
-  if (output_used + length + 4 > sizeof(output)) return -1;
-  unsigned char *p = output + output_used;
-  put32(p, (uint32_t)length); p += 4;
+  if (output_used + length + 4 + CAPABILITY_FRAME > sizeof(output)) return -1;
   long status = 0, connections = 0;
   curl_easy_getinfo(r->easy, CURLINFO_RESPONSE_CODE, &status);
   curl_easy_getinfo(r->easy, CURLINFO_NUM_CONNECTS, &connections);
+  /* Reserved id0 frames are ignored by legacy agents. Unknown (2) preserves
+   * the last server capability when an attempt received no HTTP response. */
+  if (capabilities(status ? (unsigned)r->server_binary : 2)) return -1;
+  unsigned char *p = output + output_used;
+  put32(p, (uint32_t)length); p += 4;
   put32(p, r->id); put32(p + 4, code); put32(p + 8, (uint32_t)status);
   put32(p + 12, (uint32_t)connections); put32(p + 16, reason(r->error));
   const CURLINFO phases[] = {CURLINFO_NAMELOOKUP_TIME, CURLINFO_CONNECT_TIME,
@@ -108,13 +139,13 @@ static int configure(const unsigned char *p, size_t n) {
   if (!authorization) { free(token); return -1; }
   sprintf(authorization, "Authorization: Bearer %s", token);
   memset(token, 0, strlen(token)); free(token);
-  return 0;
+  return capabilities(2);
 }
-static int submit(const unsigned char *p, size_t n) {
+static int submit(const unsigned char *p, size_t n, int binary) {
   if (!base_url || n < 9) return -1;
   uint32_t id = u32(p), timeout = u32(p + 4);
   unsigned char method = p[8]; p += 9; n -= 9;
-  if (!id || timeout < 1 || timeout > 60 || (method != 'G' && method != 'P')) return -1;
+  if (!id || timeout < 1 || timeout > 60 || (method != 'G' && method != 'P') || (binary && method!='P')) return -1;
   struct request *r = NULL;
   for (size_t i = 0; i < SLOTS; ++i) {
     if (requests[i].easy && requests[i].id == id) return -1;
@@ -122,7 +153,8 @@ static int submit(const unsigned char *p, size_t n) {
   }
   if (!r) return -1;
   char *route = field(&p, &n, 128), *parent = field(&p, &n, 55);
-  unsigned char *payload = (unsigned char *)field(&p, &n, BODY_LIMIT);
+  size_t payload_length=0;
+  unsigned char *payload = (unsigned char *)data_field(&p, &n, BODY_LIMIT, &payload_length, binary);
   if (!route || !parent || !payload || n || strlen(parent) != 55 ||
       strchr(parent, '\r') || strchr(parent, '\n') || route[0] == '/' || strstr(route, "..")) {
     free(route); free(parent); free(payload); return -1;
@@ -133,9 +165,10 @@ static int submit(const unsigned char *p, size_t n) {
   }
   snprintf(trace_header, sizeof(trace_header), "traceparent: %s", parent);
   free(route); free(parent);
-  r->easy = curl_easy_init(); r->id = id; r->payload = payload;
+  r->easy = curl_easy_init(); r->id = id; r->payload = payload;r->payload_length=payload_length;
   if (!r->easy) { release(r); return -1; }
-  const char *headers[] = {authorization, trace_header, "Content-Type: application/json", "Expect:"};
+  const char *headers[] = {authorization, trace_header,
+    binary ? "Content-Type: application/vnd.res-ac.value.v1" : "Content-Type: application/json", "Expect:"};
   for (size_t i = 0; i < sizeof(headers) / sizeof(headers[0]); ++i) {
     struct curl_slist *next = curl_slist_append(r->headers, headers[i]);
     if (!next) { release(r); return -1; }
@@ -156,13 +189,15 @@ static int submit(const unsigned char *p, size_t n) {
   OPTION(CURLOPT_NOSIGNAL, 1L);
   OPTION(CURLOPT_WRITEFUNCTION, receive_body);
   OPTION(CURLOPT_WRITEDATA, r);
+  OPTION(CURLOPT_HEADERFUNCTION, receive_header);
+  OPTION(CURLOPT_HEADERDATA, r);
   OPTION(CURLOPT_ERRORBUFFER, r->error);
   OPTION(CURLOPT_PRIVATE, r);
   OPTION(CURLOPT_SHARE, shared);
   if (method == 'P') {
     OPTION(CURLOPT_POST, 1L);
     OPTION(CURLOPT_POSTFIELDS, r->payload);
-    OPTION(CURLOPT_POSTFIELDSIZE, (long)strlen((const char *)r->payload));
+    OPTION(CURLOPT_POSTFIELDSIZE, (long)r->payload_length);
   }
 #undef OPTION
   if (curl_multi_add_handle(multi, r->easy) != CURLM_OK) { release(r); return -1; }
@@ -172,7 +207,7 @@ static int command(const unsigned char *p, size_t n) {
   if (!n) return -1;
   unsigned char kind = *p++; --n;
   if (kind == 'I') return configure(p, n);
-  if (kind == 'Q') return submit(p, n);
+  if (kind == 'Q' || kind == 'B') return submit(p, n, kind=='B');
   if (kind == 'C' && n == 4) {
     for (size_t i = 0; i < SLOTS; ++i)
       if (requests[i].easy && requests[i].id == u32(p)) release(&requests[i]);
@@ -197,7 +232,7 @@ static int receive_commands(void) {
 }
 int main(int argc, char **argv) {
   if (argc == 2 && !strcmp(argv[1], "--version")) {
-    printf("res-ac-http protocol=1 libcurl=%s\n", curl_version_info(CURLVERSION_NOW)->version);
+    printf("res-ac-http protocol=1 libcurl=%s features=binary-requests\n", curl_version_info(CURLVERSION_NOW)->version);
     return 0;
   }
   if (argc != 1) return 2;

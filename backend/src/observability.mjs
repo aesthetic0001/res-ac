@@ -10,6 +10,7 @@ import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import { Registry, Counter, Gauge, Histogram, collectDefaultMetrics } from 'prom-client';
 import { validHysteresis } from './fan-curve.mjs';
+import { requestMediaType } from './request-wire.mjs';
 
 export const validTraceparent = value => typeof value === 'string' && /^00-(?!0{32})[a-f0-9]{32}-(?!0{16})[a-f0-9]{16}-01$/.test(value);
 const serviceNames = { backend: 'res-ac-backend', agent: 'res-ac-agent', avr: 'res-ac-avr' };
@@ -217,7 +218,11 @@ export class Observability {
   request(req, res, fn) {
     const route = routeTemplate((req.url || '').split('?')[0]);
     const method = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'].includes(req.method) ? req.method : 'OTHER';
-    const span = this.span('http.server', { 'http.route': route, 'http.request.method': method }, !route.endsWith('/telemetry') && validTraceparent(req.headers.traceparent) ? req.headers.traceparent : undefined, undefined, SpanKind.SERVER);
+    const type = (req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase();
+    const bodyFormat = method === 'POST' && route.startsWith('/api/devices/')
+      ? type === requestMediaType ? 'binary-v1' : type === 'application/json' ? 'json' : 'other' : undefined;
+    const formatAttributes = bodyFormat ? { 'http.request.body.format': bodyFormat } : {};
+    const span = this.span('http.server', { 'http.route': route, 'http.request.method': method, ...formatAttributes }, !route.endsWith('/telemetry') && validTraceparent(req.headers.traceparent) ? req.headers.traceparent : undefined, undefined, SpanKind.SERVER);
     const started = performance.now(); let finished = false;
     const end = aborted => {
       if (finished) return; finished = true;
@@ -225,7 +230,7 @@ export class Observability {
       this.requests.inc({ route, method, status }); this.latency.observe({ route, method }, (performance.now() - started) / 1000);
       span.setAttribute('http.response.status_code', res.statusCode);
       span.setStatus({ code: aborted || res.statusCode >= 500 ? SpanStatusCode.ERROR : SpanStatusCode.OK }); span.end();
-      this.log({ time: new Date().toISOString(), service: 'res-ac-backend', operation: 'http.server', route, method, status, trace_id: span.spanContext().traceId, span_id: span.spanContext().spanId });
+      this.log({ time: new Date().toISOString(), service: 'res-ac-backend', operation: 'http.server', route, method, status, trace_id: span.spanContext().traceId, span_id: span.spanContext().spanId, ...formatAttributes });
     };
     res.once('finish', () => end(false)); res.once('close', () => end(!res.writableFinished));
     return this.local.run(span, fn);

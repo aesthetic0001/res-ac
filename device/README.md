@@ -279,6 +279,10 @@ requires a Linux C compiler and shared libcurl 7.85+.
 
 ## Observability
 
+The agent can negotiate [cooperative binary telemetry requests](REQUEST_ENCODING.md)
+to reduce diagnostic encoding CPU on the old Linux processor. JSON clients remain
+supported, and small reading/result/fan-state requests retain their JSON path.
+
 The firmware publishes versioned `resac_sensor_diagnostic` and
 `resac_command_diagnostic` Bridge frames with elapsed milliseconds and outcomes.
 The agent forwards bounded diagnostics using the existing HTTPS device token,

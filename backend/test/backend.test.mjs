@@ -11,6 +11,7 @@ import { createApp } from '../src/app.mjs';
 import { hashPassword } from '../src/auth.mjs';
 import { publicIp } from '../deploy/setup.mjs';
 import { encodeCommand, commandMediaType } from '../src/command-wire.mjs';
+import { requestMediaType } from '../src/request-wire.mjs';
 
 let passwordHash;
 // Ephemeral test-only credentials: nothing usable is embedded in the repository.
@@ -76,6 +77,41 @@ test('device tokens are scoped and readings are validated and deduplicated', asy
   const snapshot = await (await f.request('/api/admin/state', { headers: { cookie: auth.cookie } })).json();
   assert.equal(snapshot.devices[0].latest.temperatureC, 21.5);
   assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM readings').get().n, 1);
+});
+
+test('authenticated device binary bodies keep validation, reading deduplication and result handoff semantics', async t => {
+  const f=await fixture(t),auth=await f.login();
+  const post=(route,value,headers=f.deviceHeaders)=>f.request(route,{method:'POST',headers:{...headers,'content-type':requestMediaType},body:encodeCommand(value)});
+  const reading={readingId:'binary-reading',temperatureC:21.1234567890123,humidity:48};
+  assert.equal((await post('/api/devices/board-1/readings',reading,{})).status,401);
+  const first=await post('/api/devices/board-1/readings',reading);
+  assert.equal(first.status,201);assert.equal(first.headers.get('x-resac-request-body'),'binary-v1');
+  assert.equal((await post('/api/devices/board-1/readings',reading)).status,200);
+  assert.equal((await post('/api/devices/board-1/readings',{...reading,temperatureC:'wrong'})).status,400);
+  assert.equal(f.store.db.prepare('SELECT count(*) n FROM readings').get().n,1);
+  assert.equal(f.store.snapshot().devices[0].latest.temperatureC,reading.temperatureC);
+  const fan={sessionId:randomBytes(16).toString('hex'),calibrated:true,power:'off',speed:0,revision:1,firmwareVersion:'v4'};
+  assert.equal((await post('/api/devices/board-1/fan-state',fan)).status,200);
+  assert.equal(f.store.fanState('board-1').sessionId,fan.sessionId);
+  const a=await f.enqueue(auth),b=await f.enqueue(auth);
+  assert.equal((await f.request('/api/devices/board-1/commands',{headers:f.deviceHeaders})).status,200);
+  const complete=()=>post(`/api/devices/board-1/commands/${a.id}/result?next=1`,{status:'succeeded',result:{reply:'pong'}});
+  const result=await (await complete()).json();assert.equal(result.commands[0].id,b.id);
+  const retry=await (await complete()).json();assert.equal(retry.duplicate,true);assert.equal(retry.commands[0].id,b.id);
+  assert.equal(f.store.command(b.id).attempts,1);
+  assert.equal((await post('/api/devices/board-1/telemetry',{session:'1'.repeat(32),batchId:'2'.repeat(32),events:[],metrics:{}})).status,200);
+  assert.equal((await f.request('/api/login',{method:'POST',headers:{'content-type':requestMediaType},body:encodeCommand({username:'admin',password:testPassword})})).status,415);
+  assert.equal((await f.request('/api/devices/board-1/readings',{method:'POST',headers:{...f.deviceHeaders,'content-type':requestMediaType},body:Buffer.from('RAC1o')})).status,400);
+});
+
+test('disabling binary advertisement keeps in-flight binary bodies and JSON clients compatible',async t=>{
+  const f=await fixture(t,{binaryRequests:false});
+  const value={readingId:'inflight-binary',temperatureC:22,humidity:50};
+  const response=await f.request('/api/devices/board-1/readings',{method:'POST',
+    headers:{...f.deviceHeaders,'content-type':requestMediaType},body:encodeCommand(value)});
+  assert.equal(response.status,201);assert.equal(response.headers.get('x-resac-request-body'),null);
+  const retry=await f.request('/api/devices/board-1/readings',{method:'POST',headers:f.deviceHeaders,body:JSON.stringify(value)});
+  assert.equal(retry.status,200);assert.equal(f.store.db.prepare('SELECT count(*) n FROM readings').get().n,1);
 });
 
 test('fan remote buttons queue short-lived commands and expose transmission results without inferred state', async t => {

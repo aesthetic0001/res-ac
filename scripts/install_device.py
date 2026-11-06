@@ -160,7 +160,7 @@ def main():
         else:
             console.run('if test -f /usr/bin/run-bridge.res-ac-original; then '
                         'cp -p /usr/bin/run-bridge.res-ac-original /usr/bin/run-bridge; fi')
-        for name in ('timing_trace.py', 'bridge_timing.py', 'run_bridge_timing.py', 'native_bridge_protocol.py', 'cooperative_json.py', 'command_wire.py'):
+        for name in ('timing_trace.py', 'bridge_timing.py', 'run_bridge_timing.py', 'native_bridge_protocol.py', 'cooperative_json.py', 'command_wire.py', 'request_wire.py'):
             console.upload((root / 'device' / name).read_bytes(), '/usr/lib/res-ac/' + name)
         console.upload((root / 'device/dhcp_route_repair.py').read_bytes(), '/usr/lib/res-ac/dhcp_route_repair.py')
         console.upload((root / 'device/network_watchdog.py').read_bytes(), '/usr/lib/res-ac/network_watchdog.py')
