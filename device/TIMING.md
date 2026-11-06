@@ -8,9 +8,8 @@ or periodic datastore reads are introduced.
 Use a controlled deployment of the matching agent/sketch and backend telemetry
 support. Do not launch a second Bridge alongside the running service. Preserve
 the current firmware, agent, and `run-bridge` launcher for restoration. The
-draft batching candidate is not cleared for permanent production rollout.
-Start with ping-only commands; a previous uncertain IR action must be physically
-checked before further fan tests.
+diagnostic build is for temporary captures only. Start with ping-only commands;
+an uncertain IR action must be physically checked before further fan tests.
 
 ## AVR capture
 

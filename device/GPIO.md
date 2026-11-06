@@ -180,3 +180,9 @@ before the matching agent/sketch so complete telemetry batches remain valid.
 
 For opt-in IRQ, UART, socket-flush, and agent-consumption capture, see
 [TIMING.md](TIMING.md). Diagnostic rows stay outside normal telemetry.
+
+Under command bursts, a full 32-event telemetry batch becomes eligible immediately.
+Only one telemetry request runs at a time; successful requests drain full waiting
+batches, while partial batches keep the 15-second heartbeat. Failed batches retain
+their identity and backoff deadline even when more events arrive. This uses the
+existing event-loop wake-up deadline and preserves the 128-event RAM bound.
