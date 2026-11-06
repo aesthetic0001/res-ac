@@ -690,7 +690,7 @@ class BridgeEvents(object):
             if len(self.incoming) > MAX_FRAME + 4 + 4096:
                 raise ValueError('Native Bridge receive queue too large')
             while len(self.incoming) >= 4:
-                length = struct.unpack('!I', self.incoming[:4])[0]
+                length = struct.unpack('!I', bytes(self.incoming[:4]))[0]
                 if not 0 < length <= MAX_FRAME:
                     raise ValueError('Native Bridge frame too large')
                 if len(self.incoming) < 4 + length:
