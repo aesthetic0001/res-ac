@@ -135,3 +135,60 @@ TCP Nagle and avoiding buffered stdin did not materially reduce that hardware
 latency. Electrical voltage measurements, physical IR behavior, and worst-case
 boot/programming timing were not measured by these tests. The tests used temporary firmware and agent code; the permanent device
 configuration was preserved.
+
+## Batched command protocol
+
+The default sketch advertises `resac_command_protocol=batched-v2` and requires
+this version of the agent. Build with `-DRESAC_BATCHED_COMMANDS=0` for the previous
+safety/completion format; the new agent also supports older event sketches.
+
+The agent writes one `resac_fan_control` snapshot:
+`v1,<32-hex-session>,<nonzero-uint32-heartbeat>`. Its session rotates on agent
+initialization, Bridge reconnect, or invalidation. The AVR reads that snapshot
+once before fan commands and during housekeeping. A different session clears
+calibration. Re-reading an unchanged heartbeat never refreshes the watchdog,
+and a timed-out session cannot be reinstated by re-reading its old snapshot.
+Missing/malformed snapshots reject actions. Linux requires the AVR to confirm
+its new session before accepting physical commands. The 10-second heartbeat
+limit, session checks, command journal, duplicate IDs, and IR dwell remain.
+
+A completion retains and pushes a single `resac_command_result` value:
+`v6,<fetch-ms>,<safety-ms>,<execution-ms>,<revision>,<flags>,<speed>,<source>,<legacy-reply>`. This carries the matching
+command ID in the embedded reply, cutting diagnostic/result publication from
+four UART exchanges to two. The compact flags and source code carry the final
+fan state. Linux applies it with the matching successful completion; intermediate
+fan state publications are coalesced, and the separate recovery snapshot follows
+the acknowledgment. Reconnects retain the same reply and duplicate
+notifications do not repeat an action. Old unwrapped replies are rejected when
+the batched capability is present.
+
+Sensor publication advances through bounded stages, returning to the command
+loop between ordered diagnostic, status, sample, and console-status exchanges.
+Commands are also checked between configuration and safety housekeeping. Each
+retained value and its pushed event remain together. Commands never run inside
+a background publication stack frame, during setup, or recursively.
+
+Phase telemetry carries numeric fields on the existing command event; the backend
+expands them without multiplying the device queue. It adds `command.journal`, `command.notify` (queue to confirmed GPIO
+assertion), `bridge.roundtrip` (assertion to Linux completion), `avr.fetch`, and
+`avr.safety`. `avr.execute` now measures the action before deferred fan-state publication.
+The agent also accepts the previous batched-v1 completion format.
+Round-trip duration includes the AVR phases; these overlapping spans must not be
+summed. AVR span placement is reconstructed from Linux receipt time and does not
+provide synchronized hardware timestamps. Install backend telemetry support
+before the matching agent/sketch so complete telemetry batches remain valid.
+
+For opt-in IRQ, UART, socket-flush, and agent-consumption capture, see
+[TIMING.md](TIMING.md). Diagnostic rows stay outside normal telemetry.
+
+Under command bursts, a full 32-event telemetry batch becomes eligible immediately.
+Only one telemetry request runs at a time; successful requests drain full waiting
+batches, while partial batches keep the 15-second heartbeat. Failed batches retain
+their identity and backoff deadline even when more events arrive. This uses the
+existing event-loop wake-up deadline and preserves the 128-event RAM bound.
+
+The UART wait helper reads at most 64 available bytes at once, then supplies the
+vendor packet reader one byte at a time from RAM. This removes per-byte system
+calls without changing packet parsing, CRC checks, ACKs, or the 50 ms deadline
+when waiting for a new byte. Read-ahead belongs to one processor/stream and UART
+readiness retains priority over TCP work.

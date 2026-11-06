@@ -35,6 +35,44 @@ class BridgeSocketWaitTests(unittest.TestCase):
             self.assertEqual(wait.read_byte(stream, processor), b'A')
             self.assertEqual(wait.read_byte(stream, processor), b'B')
 
+    def test_chunked_read_preserves_frame_bytes_without_per_byte_syscalls(self):
+        uart_read, uart_write = os.pipe()
+        stream = os.fdopen(uart_read, 'rb', 0)
+        self.addCleanup(stream.close)
+        self.addCleanup(os.close, uart_write)
+        server = SimpleNamespace(sockets=[], clients=[], clients_sendbuffer={}, available=lambda: 0)
+        processor = SimpleNamespace(run=lambda: None)
+        # Two frames plus a partial next frame; no bytes may be lost at boundaries.
+        data = b'\xff\x01\x00\x04testCRC' * 9
+        os.write(uart_write, data)
+        with patch.dict(sys.modules, {'mailbox': SimpleNamespace(json_server=server)}), \
+                patch.object(wait.os, 'read', wraps=os.read) as read, \
+                patch.object(wait.select, 'select', wraps=wait.select.select) as select:
+            received = b''.join(wait.read_byte(stream, processor) for _ in data)
+            self.assertEqual(received, data)
+            self.assertEqual(read.call_count, 2)
+            self.assertEqual(select.call_count, 2)
+            self.assertTrue(all(call.args[1] == wait.UART_CHUNK for call in read.call_args_list))
+        # A partial chunk has no effect on the next actual UART deadline.
+        os.write(uart_write, b'Z')
+        with patch.dict(sys.modules, {'mailbox': SimpleNamespace(json_server=server)}):
+            self.assertEqual(wait.read_byte(stream, processor), b'Z')
+
+    def test_uart_buffer_is_not_carried_to_a_replacement_stream(self):
+        streams = []
+        for payload in [b'old', b'new']:
+            read, write = os.pipe()
+            stream = os.fdopen(read, 'rb', 0)
+            streams.append(stream)
+            self.addCleanup(stream.close)
+            self.addCleanup(os.close, write)
+            os.write(write, payload)
+        processor = SimpleNamespace(run=lambda: None)
+        server = SimpleNamespace(sockets=[], clients=[], clients_sendbuffer={}, available=lambda: 0)
+        with patch.dict(sys.modules, {'mailbox': SimpleNamespace(json_server=server)}):
+            self.assertEqual(wait.read_byte(streams[0], processor), b'o')
+            self.assertEqual(wait.read_byte(streams[1], processor), b'n')
+
     def test_patch_is_narrow_idempotent_and_rejects_unknown_source(self):
         source = ('prefix\n' + prepare.ORIGINAL + '\nsuffix\n').encode()
         result = prepare.prepare(source)

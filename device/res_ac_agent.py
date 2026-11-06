@@ -453,9 +453,10 @@ class BridgeEvents(object):
                       'resac_command_result', 'resac_command_diagnostic', 'resac_fan_state',
                       'resac_fan_session', 'resac_fan_heartbeat', 'resac_fan_invalidate',
                       'resac_command', 'resac_command_status', 'resac_upload_status',
-                      'resac_command_notify'])
+                      'resac_command_notify', 'resac_command_protocol', 'resac_fan_control',
+                      'resac_timing_arm', 'resac_timing_dump'])
 
-    def __init__(self, host='127.0.0.1', port=5700, command_gpio=None):
+    def __init__(self, host='127.0.0.1', port=5700, command_gpio=None, timing=None):
         self.host, self.port = host, port
         self.connection = None
         self.connecting = False
@@ -478,7 +479,12 @@ class BridgeEvents(object):
         self.quoted = False
         self.escaped = False
         self.command_gpio = command_gpio
+        self.timing = timing
+        self.receive_sequence = 0
         self.notification = None
+        self.control_session = None
+        self.control_confirmed = False
+        self.control_heartbeat = 1
 
     def version(self, *keys):
         return (self.generation,) + tuple(self.revisions.get(key, 0) for key in keys)
@@ -494,7 +500,23 @@ class BridgeEvents(object):
         self._queue(dict(command='put', key=key, value=value))
         self._update(key, value)
 
-    def dispatch_command(self, frame, deadline):
+    def fan_control(self, heartbeat=None, invalidate=False):
+        if self.get('resac_command_protocol') not in ('batched-v1', 'batched-v2'):
+            raise IOError('Batched fan context is not supported')
+        if invalidate or self.control_session is None:
+            self.control_session = binascii.hexlify(os.urandom(16)).decode('ascii')
+            self.control_confirmed = False
+        if heartbeat is not None:
+            self.control_heartbeat = heartbeat
+        self.put('resac_fan_control', 'v1,%s,%d' % (self.control_session, self.control_heartbeat))
+
+    def invalidate_fan(self):
+        if self.get('resac_command_protocol') in ('batched-v1', 'batched-v2'):
+            self.fan_control(invalidate=True)
+        else:
+            self.put('resac_fan_invalidate', '1')
+
+    def dispatch_command(self, frame, deadline, on_signal=None):
         capability = self.get('resac_command_notify')
         if capability and capability != COMMAND_GPIO_PROTOCOL:
             raise IOError('Unsupported command GPIO wiring profile')
@@ -507,12 +529,15 @@ class BridgeEvents(object):
             raise IOError('An AVR command notification is already pending')
         if monotonic() >= deadline:
             raise IOError('Command expired before Bridge dispatch')
+        queued_at = monotonic()
         self.command_gpio.open()
         self.command_gpio.set(False)
         self.put('resac_command', frame)
+        if self.timing:
+            self.timing.record('agent.command_queue', command=frame.split(',')[1])
         # Wait for this exact put confirmation before asserting the wire. TCP
         # send completion alone does not establish that the datastore was updated.
-        self.notification = dict(frame=frame, deadline=deadline, signaled=False)
+        self.notification = dict(frame=frame, deadline=deadline, signaled=False, queued_at=queued_at, on_signal=on_signal)
 
     def cancel_command(self, command_id=None):
         pending = self.notification
@@ -563,6 +588,8 @@ class BridgeEvents(object):
         return samples
 
     def _snapshot(self):
+        self.control_session = None
+        self.control_confirmed = False
         self._close_command_gpio()
         self.ready = False
         self.snapshot_pending = True
@@ -577,8 +604,17 @@ class BridgeEvents(object):
                 message.get('key') == 'resac_command' and message.get('value') == pending['frame']):
             self._expire_notification()
             if self.notification is not None and not pending['signaled']:
+                if self.timing:
+                    ident = pending['frame'].split(',')[1]
+                    self.timing.record('agent.put_confirm', command=ident)
+                    self.timing.record('agent.gpio_begin', command=ident)
                 self.command_gpio.set(True)
+                if self.timing:
+                    self.timing.record('agent.gpio_assert', command=ident)
                 pending['signaled'] = True
+                pending['signaled_at'] = monotonic()
+                if pending.get('on_signal'):
+                    pending['on_signal'](pending['signaled_at'] - pending['queued_at'])
             return
         if message.get('response') == 'get' and 'key' not in message and self.snapshot_pending:
             values = message.get('value')
@@ -607,6 +643,16 @@ class BridgeEvents(object):
         if len(fields) != 3 or fields[0] != 'v1' or fields[1] not in self.keys:
             return
         key, value = fields[1:]
+        if self.timing and value == '1' and key in ('resac_timing_arm', 'resac_timing_dump'):
+            if key == 'resac_timing_arm':
+                self.timing.arm()
+            else:
+                self.timing.request_dump()
+            return
+        if self.timing and key == 'resac_command_result':
+            from timing_trace import command_id
+            self.timing.record('agent.completion_received', packet=self.receive_sequence,
+                               command=command_id(value))
         if key == 'resac_events':
             if value == '':
                 # AVR restart: discard old state and unsent actions immediately.
@@ -623,6 +669,8 @@ class BridgeEvents(object):
             return
         if self.ready:
             self._update(key, value)
+            if key == 'resac_fan_session' and value == self.control_session:
+                self.control_confirmed = True
             if key == 'resac_sample':
                 self._sample(True)
 
@@ -652,7 +700,11 @@ class BridgeEvents(object):
             elif number in (125, 93):
                 self.depth -= 1
             if self.depth == 0:
+                if self.timing:
+                    self.timing.record('agent.json_begin', packet=self.receive_sequence)
                 message = decode_json(self.incoming.decode('utf-8'))
+                if self.timing:
+                    self.timing.record('agent.json_end', packet=self.receive_sequence)
                 self.incoming = bytearray()
                 self._message(message)
 
@@ -707,7 +759,12 @@ class BridgeEvents(object):
                         raise IOError('Bridge closed while sending')
                     self.outgoing = self.outgoing[sent:]
             if self.connection in reads:
+                self.receive_sequence += 1
+                if self.timing:
+                    self.timing.record('agent.recv_begin', packet=self.receive_sequence)
                 block = self.connection.recv(4096)
+                if self.timing:
+                    self.timing.record('agent.recv_end', packet=self.receive_sequence, value=len(block))
                 if not block:
                     raise IOError('Bridge closed')
                 self._receive(block)
@@ -772,6 +829,10 @@ class Telemetry(object):
                                     attributes=attributes or dict(outcome='ok'), ended=monotonic()))
             if span_id is not None:
                 self.events[-1]['spanId'] = span_id
+            # A full batch is work, not a reason to wait for the idle heartbeat.
+            # Failed batches retain their retry deadline and identity.
+            if self.request is None and self.batch is None and len(self.events) >= 32:
+                self.next_due = min(self.next_due, monotonic())
         except Exception:
             self.dropped += 1
 
@@ -847,7 +908,7 @@ class Telemetry(object):
                     raise UploadError(status=status)
                 self.batch = None
                 self.backoff = 5
-                self.next_due = monotonic() + 15
+                self.next_due = monotonic() + (0 if len(self.events) >= 32 else 15)
             finally:
                 self.request.close()
                 self.request = None
@@ -1467,15 +1528,28 @@ class FanReporter(object):
             if ready not in ('v3', 'v4'):
                 self.initialized = False
                 return
-            if not self.initialized:
-                self.bridge.put('resac_fan_invalidate', '1')
+            if isinstance(self.bridge, BridgeEvents) and self.bridge.get('resac_command_protocol') in ('batched-v1', 'batched-v2'):
+                if heartbeat_due:
+                    self.heartbeat = self.heartbeat % 0xffffffff + 1
+                invalidate = (not self.initialized or self.bridge.control_session is None or
+                              (self.bridge.control_confirmed and
+                               self.bridge.get('resac_fan_session') != self.bridge.control_session))
+                if heartbeat_due or invalidate:
+                    self.bridge.fan_control(heartbeat=max(1, self.heartbeat), invalidate=invalidate)
                 self.initialized = True
-            if heartbeat_due:
-                self.heartbeat += 1
-                self.bridge.put('resac_fan_heartbeat', str(self.heartbeat))
-            session = self.bridge.get('resac_fan_session') or ''
-            if not re.match(r'^[a-f0-9]{32}$', session):
-                self.bridge.put('resac_fan_session', binascii.hexlify(os.urandom(16)).decode('ascii'))
+            else:
+                if not self.initialized:
+                    if isinstance(self.bridge, BridgeEvents):
+                        self.bridge.invalidate_fan()
+                    else:
+                        self.bridge.put('resac_fan_invalidate', '1')
+                    self.initialized = True
+                if heartbeat_due:
+                    self.heartbeat += 1
+                    self.bridge.put('resac_fan_heartbeat', str(self.heartbeat))
+                session = self.bridge.get('resac_fan_session') or ''
+                if not re.match(r'^[a-f0-9]{32}$', session):
+                    self.bridge.put('resac_fan_session', binascii.hexlify(os.urandom(16)).decode('ascii'))
             state = parse_fan_state(self.bridge.get('resac_fan_state'))
             state['firmwareVersion'] = ready
             if self.automation is not None:
@@ -1557,19 +1631,41 @@ class CommandProcessor(object):
         return attributes
 
     def _complete(self, status, result):
+        timing = self.config.get('_timing_trace')
+        if timing:
+            timing.record('agent.completion_consumed', command=self.current['id'])
+        signaled_at = None
+        if isinstance(self.bridge, BridgeEvents) and self.bridge.notification:
+            signaled_at = self.bridge.notification.get('signaled_at')
         if isinstance(self.bridge, BridgeEvents):
             try:
                 self.bridge.cancel_command(self.current['id'])
             except (IOError, OSError):
                 log('Command notification could not be cleared; GPIO will be reopened before reuse')
+        if (status == 'succeeded' and getattr(self, 'avr_state', None) is not None and self.session_id and
+                isinstance(self.bridge, BridgeEvents) and self.bridge.control_session == self.session_id and
+                self.bridge.get('resac_fan_session') == self.session_id):
+            revision, flags, speed, source = self.avr_state
+            self.bridge._update('resac_fan_state', 'v2,%s,%d,%d,%d,%d,%s' %
+                                (self.session_id, flags & 1, (flags >> 1) & 1, speed, revision, source))
         parent = self.current.get('traceparent') or traceparent()
         telemetry = self.config.get('_telemetry')
         if telemetry:
-            telemetry.event('command.execute', parent, monotonic() - self.execution_started,
-                            self._command_attributes(status, 'avr_timeout' if 'timed out' in result.get('error', '') else 'command_rejected' if status == 'failed' else 'none'))
+            attributes = self._command_attributes(status, 'avr_timeout' if 'timed out' in result.get('error', '') else 'command_rejected' if status == 'failed' else 'none')
+            attributes.update(self.phase_timings)
+            if signaled_at is not None:
+                attributes['command.timing.roundtrip_ms'] = max(0, (monotonic() - signaled_at) * 1000)
+            if getattr(self, 'avr_phases', None) is not None:
+                attributes['command.timing.fetch_ms'] = self.avr_phases[0] * 1000
+                attributes['command.timing.safety_ms'] = self.avr_phases[1] * 1000
+            # Carry compact fields on the existing event. The backend expands
+            # phases so bursts do not multiply the board's bounded event queue.
+            telemetry.event('command.execute', parent, monotonic() - self.execution_started, attributes)
+            if getattr(self, 'avr_phases', None) is not None:
+                telemetry.event('avr.execute', parent, self.avr_phases[2], self._command_attributes(status))
             try:
                 fields = (self.bridge.get('resac_command_diagnostic') or '').split(',')
-                if (len(fields) == 4 and fields[:2] == ['v1', self.current['id']] and
+                if (getattr(self, 'avr_phases', None) is None and len(fields) == 4 and fields[:2] == ['v1', self.current['id']] and
                         re.match(r'^\d{1,10}$', fields[2]) and fields[3] in ('ok', 'failed')):
                     telemetry.event('avr.execute', parent, int(fields[2]) / 1000.0,
                                     self._command_attributes(fields[3]))
@@ -1615,6 +1711,9 @@ class CommandProcessor(object):
             self.persisted = True
             return
         self.current = command
+        self.avr_phases = None
+        self.avr_state = None
+        self.phase_timings = {}
         self.execution_started = monotonic()
         self.bridge_failed_reported = False
         if not re.match(TRACEPARENT, command.get('traceparent', '')):
@@ -1648,12 +1747,18 @@ class CommandProcessor(object):
                 self.expires_at = command_expiry(command)
                 if time.gmtime().tm_year < 2025 or time.time() >= self.expires_at:
                     raise ValueError('IR command expired or device clock invalid')
+                if (isinstance(self.bridge, BridgeEvents) and
+                        self.bridge.get('resac_command_protocol') not in (None, '', 'batched-v1', 'batched-v2')):
+                    raise ValueError('Unsupported command safety protocol')
                 ready = self.bridge.get('resac_command_ready')
                 if ready not in ('v3', 'v4'):
                     raise ValueError('Arduino firmware does not support calibration; upgrade sketch')
                 if command['type'] in ('fan.level', 'fan.curve') and ready != 'v4':
                     raise ValueError('Upgrade firmware for target levels and automatic curves')
                 self.session_id = command['payload'].get('sessionId')
+                if (isinstance(self.bridge, BridgeEvents) and self.bridge.get('resac_command_protocol') in ('batched-v1', 'batched-v2') and
+                        (not self.bridge.control_confirmed or self.session_id != self.bridge.control_session)):
+                    raise ValueError('Fan control epoch changed; wait for fresh status and recalibrate')
                 state = parse_fan_state(self.bridge.get('resac_fan_state'))
                 if (not isinstance(self.session_id, (str, text_type)) or
                         not re.match(r'^[a-f0-9]{32}$', self.session_id) or state['sessionId'] != self.session_id):
@@ -1680,12 +1785,17 @@ class CommandProcessor(object):
         self.deadline = monotonic() + 10
         self.bridge_due = 0
         self.ping_dispatched = False
-        self._status('command received; waiting for Arduino')
+        if not isinstance(self.bridge, BridgeEvents):
+            self._status('command received; waiting for Arduino')
 
     def _dispatch(self, frame):
         started = monotonic()
         if isinstance(self.bridge, BridgeEvents):
-            self.bridge.dispatch_command(frame, self.deadline)
+            timings = self.phase_timings
+            def signaled(elapsed):
+                timings['command.timing.notify_ms'] = max(0, elapsed * 1000)
+                self._status('command sent; waiting for Arduino')
+            self.bridge.dispatch_command(frame, self.deadline, on_signal=signaled)
         else:
             self.bridge.put('resac_command', frame)
         telemetry = self.config.get('_telemetry')
@@ -1697,7 +1807,10 @@ class CommandProcessor(object):
         if monotonic() >= self.deadline:
             if (self.ir or self.target_level is not None) and self.prepared:
                 try:
-                    self.bridge.put('resac_fan_invalidate', '1')
+                    if isinstance(self.bridge, BridgeEvents):
+                        self.bridge.invalidate_fan()
+                    else:
+                        self.bridge.put('resac_fan_invalidate', '1')
                 except Exception:
                     pass
             self._complete('failed', dict(error='Arduino IR timed out; transmission uncertain' if self.ir or self.target_level is not None else
@@ -1709,6 +1822,26 @@ class CommandProcessor(object):
         self.bridge_due = monotonic() + 0.5
         try:
             frame = self.bridge.get('resac_command_result') or ''
+            if isinstance(self.bridge, BridgeEvents) and self.bridge.get('resac_command_protocol') in ('batched-v1', 'batched-v2'):
+                modern = self.bridge.get('resac_command_protocol') == 'batched-v2'
+                envelope = frame.split(',', 8 if modern else 4)
+                valid = (len(envelope) == (9 if modern else 5) and envelope[0] == ('v6' if modern else 'v5') and
+                         all(re.match(r'^\d{1,10}$', item) and int(item) <= 0xffffffff for item in envelope[1:4]))
+                self.avr_phases = self.avr_state = None
+                if valid and modern:
+                    valid = (re.match(r'^\d{1,10}$', envelope[4]) and int(envelope[4]) <= 0xffffffff and
+                             envelope[5] in ('0', '1', '3') and envelope[6] in ('0', '1', '2', '3', '4', '5') and
+                             envelope[7] in ('r', 'c', 'm', 'a') and
+                             ((envelope[5] == '3' and envelope[6] != '0') or
+                              (envelope[5] != '3' and envelope[6] == '0')))
+                if valid and envelope[-1].split(',')[1:2] == [self.current['id']]:
+                    self.avr_phases = tuple(int(item) / 1000.0 for item in envelope[1:4])
+                    if modern:
+                        self.avr_state = (int(envelope[4]), int(envelope[5]), int(envelope[6]),
+                                          dict(r='reset', c='calibration', m='manual', a='automatic')[envelope[7]])
+                    frame = envelope[-1]
+                else:
+                    frame = ''
             fields = frame.split(',')
             if (not self.ir and self.target_level is None and not self.calibrating and len(fields) == 4 and fields[:3] == ['v1', self.current['id'], 'pong'] and
                     re.match(r'^\d{1,10}$', fields[3]) and int(fields[3]) <= 0xffffffff):
@@ -1739,8 +1872,10 @@ class CommandProcessor(object):
                     if time.time() >= self.expires_at:
                         self._complete('failed', dict(error='IR command expired before dispatch'))
                         return
+                    journal_started = monotonic()
                     self._write_state(dict(id=self.current['id'], traceparent=self.current.get('traceparent'), status='failed', result=dict(
                         error='IR execution interrupted; transmission uncertain; verify fan before retrying')))
+                    self.phase_timings['command.timing.journal_ms'] = max(0, (monotonic() - journal_started) * 1000)
                     self.prepared = True
                     if self.calibrating:
                         self._dispatch('v3,%s,calibrate,%s' % (self.current['id'], self.session_id))
@@ -2002,7 +2137,7 @@ def next_wakeup(bridge, telemetry, commands, automation, fan_reporter, pending, 
 
 
 def run(config):
-    bridge = config.get('_bridge') or BridgeEvents(command_gpio=CommandGPIO())
+    bridge = config.get('_bridge') or BridgeEvents(command_gpio=CommandGPIO(), timing=config.get('_timing_trace'))
     config['_bridge'] = bridge
     http = config.get('_http') or HttpTransport(config)
     config['_http'] = http
@@ -2019,6 +2154,9 @@ def run(config):
     sample = None
     try:
         while True:
+            timing = config.get('_timing_trace')
+            if timing and timing.dump_requested and commands.current is None and not automation.busy:
+                timing.write(config['_timing_path'])
             http.wait(bridge, 0)
             collector.tick()
             commands.tick(allow_execution=not automation.busy)
@@ -2065,6 +2203,10 @@ def run(config):
             upload.close()
         bridge.close()
         http.close()
+        timing = config.get('_timing_trace')
+        if timing and not timing.exported:
+            timing.request_dump()
+            timing.write(config['_timing_path'])
 
 
 def main():
@@ -2079,6 +2221,13 @@ def main():
         print(__doc__)
         return 0
     config = load_config(path)
+    if '--timing-trace' in sys.argv:
+        from timing_trace import TimingTrace
+        output = sys.argv[sys.argv.index('--timing-trace') + 1]
+        TimingTrace.validate_output(output)
+        timing = TimingTrace()
+        config['_timing_trace'], config['_timing_path'] = timing, output
+        signal.signal(signal.SIGUSR1, lambda *_: timing.request_dump())
     if '--probe' in sys.argv:
         status, response = post(config, {})
         # An authenticated, intentionally invalid sample verifies the route without

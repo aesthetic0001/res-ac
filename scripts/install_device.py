@@ -136,6 +136,8 @@ def main():
                     'rm -f /tmp/res-ac-http.pending.gz /tmp/res_ac_agent.pending.py '
                     '/tmp/res-ac-curl /tmp/res-ac-curl.new')
         console.upload(agent_source, '/usr/lib/res-ac/res_ac_agent.py')
+        for name in ('timing_trace.py', 'bridge_timing.py', 'run_bridge_timing.py'):
+            console.upload((root / 'device' / name).read_bytes(), '/usr/lib/res-ac/' + name)
         console.upload((root / 'device/dhcp_route_repair.py').read_bytes(), '/usr/lib/res-ac/dhcp_route_repair.py')
         console.upload((root / 'device/network_watchdog.py').read_bytes(), '/usr/lib/res-ac/network_watchdog.py')
         console.upload(data, staged)

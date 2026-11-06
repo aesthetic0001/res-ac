@@ -34,12 +34,17 @@ class FirmwareSchedulingTests(unittest.TestCase):
                 using std::isnan;
                 using std::lround;
                 #define F(s) s
+                #define PSTR(s) s
+                #define snprintf_P snprintf
                 #define HEX 16
                 #define _BV(bit) (1U << (bit))
                 enum {PB2=2, DDB2=2, PCIF0=0, PCINT2=2, PCIE0=0};
                 extern uint8_t PINB, DDRB, PORTB, PCIFR, PCMSK0, PCICR;
                 extern unsigned long testClock;
+                extern void (*readHook)(const char *);
+                extern void (*mailboxHook)();
                 inline unsigned long millis() { return testClock; }
+                inline unsigned long micros() { return testClock * 1000; }
                 inline void delay(unsigned long ms) { testClock += ms; }
                 struct TestSerial {
                   void begin(int) {}
@@ -62,6 +67,7 @@ class FirmwareSchedulingTests(unittest.TestCase):
                   void put(const char *key, const char *value) { values[key] = value; }
                   unsigned int get(const char *key, char *buffer, unsigned int length) {
                     ++reads[key];
+                    if (readHook) readHook(key);
                     std::strncpy(buffer, values[key].c_str(), length);
                     return values[key].size() < length ? values[key].size() : length;
                   }
@@ -75,6 +81,7 @@ class FirmwareSchedulingTests(unittest.TestCase):
                   void begin() {}
                   void writeMessage(const uint8_t *data, unsigned int size) {
                     messages.emplace_back(reinterpret_cast<const char *>(data), size);
+                    if (mailboxHook) mailboxHook();
                   }
                 };
                 extern TestMailbox Mailbox;
@@ -111,6 +118,8 @@ class FirmwareSchedulingTests(unittest.TestCase):
             #include "IRremote.hpp"
             uint8_t PINB=0, DDRB=0xff, PORTB=0xff, PCIFR=0, PCMSK0=0, PCICR=0;
             unsigned long testClock = 0;
+            void (*readHook)(const char *) = nullptr;
+            void (*mailboxHook)() = nullptr;
             TestSerial Serial;
             TestBridge Bridge;
             TestMailbox Mailbox;
@@ -121,6 +130,11 @@ class FirmwareSchedulingTests(unittest.TestCase):
             const char *id2 = "22222222-2222-4222-8222-222222222222";
             void reset() {
               testClock = lastSampleMs = lastHousekeepingMs = 0;
+              commandNotificationsReady = true; commandExecuting = false; fanStatePending = false; fanRevision=0; readHook = nullptr; mailboxHook = nullptr;
+              #if RESAC_BATCHED_COMMANDS
+              sensorPublication.stage=0;
+              #endif
+              controlSession[0] = 0; fanControlValid = false; fanControlSource="reset";
               #if RESAC_COMMAND_GPIO
               PINB = _BV(PB2); commandWake = commandLowHandled = false;
               #else
@@ -135,6 +149,7 @@ class FirmwareSchedulingTests(unittest.TestCase):
               Bridge.values["resac_fan_session"] = session;
               Bridge.values["resac_fan_heartbeat"] = "1";
               Bridge.values["resac_interval_ms"] = "10000";
+              Bridge.values["resac_epoch"] = session;
             }
             void notify() {
               #if RESAC_COMMAND_GPIO
@@ -230,6 +245,113 @@ class FirmwareSchedulingTests(unittest.TestCase):
                 assert(testClock == 620); // Original power/step dwell is preserved.
                 assert(lastHousekeepingMs == testClock);
                 assert(Bridge.reads["resac_interval_ms"] == 1);
+
+              } else if (mode == "batch") {
+                std::strcpy(controlSession, session);
+                Bridge.values["resac_fan_control"] = std::string("v1,") + session + ",1";
+                power(); testClock = 20; loop();
+                assert(IrSender.sends == 1 && fan.power());
+                assert(Bridge.reads["resac_fan_control"] == 1);
+                assert(Bridge.reads["resac_fan_invalidate"] == 0);
+                assert(Bridge.reads["resac_fan_heartbeat"] == 0);
+                assert(Bridge.values["resac_command_result"].find("v6,0,0,0,1,3,1,m,v3,") == 0);
+                assert(Bridge.values["resac_command_diagnostic"].empty());
+                assert(Mailbox.messages.size() == 2); // State pair + one combined completion.
+                reset(); std::strcpy(controlSession, session);
+                Bridge.values["resac_fan_control"] = std::string("v1,") + session + ",1";
+                Bridge.values["resac_command"] = std::string("v3,") + id1 + ",calibrate," + session;
+                readHook=[](const char *) { testClock+=100; };
+                notify(); testClock=20; loop();
+                assert(Bridge.values["resac_command_result"].find("v6,100,100,0,")==0);
+                reset(); std::strcpy(controlSession, session);
+                Bridge.values["resac_fan_control"] = std::string("v1,") + session + ",1";
+                power(); testClock = lastSampleMs = 10001; lastHousekeepingMs = 10000;
+                loop(); assert(IrSender.sends == 0 && !fan.calibrated());
+                Bridge.values["resac_command"] = std::string("v3,") + id2 + ",calibrate," + session;
+                notify(); loop(); assert(!fan.calibrated()); // Re-reading a stale snapshot cannot refresh it.
+                Bridge.values["resac_fan_control"] = std::string("v1,") + session + ",2";
+                lastCommandId[0]=0; notify(); loop(); assert(!fan.calibrated()); // Invalidated epoch stays invalid.
+                const char *fresh="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+                Bridge.values["resac_fan_control"] = std::string("v1,") + fresh + ",1";
+                Bridge.values["resac_command"] = std::string("v3,") + id1 + ",calibrate," + fresh;
+                notify(); loop(); assert(fan.calibrated() && strcmp(fanSession,fresh)==0);
+                for (const char *bad : {"", "v1,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,0",
+                     "v1,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,1,extra", "v9,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,1",
+                     "v1,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,4294967296"}) {
+                  reset(); std::strcpy(controlSession, session);
+                  Bridge.values["resac_fan_control"] = bad;
+                  Bridge.values["resac_command"] = std::string("v3,") + id1 + ",calibrate," + session;
+                  notify(); testClock=20; loop(); assert(!fan.calibrated());
+                  assert(Bridge.values["resac_command_result"].find(",rejected,")!=std::string::npos);
+                }
+                reset(); std::strcpy(controlSession, session);
+                Bridge.values["resac_fan_control"] = std::string("v1,") + session + ",1";
+                Bridge.values["resac_command"] = std::string("v4,") + id1 + ",level," + session + ",5";
+                notify(); testClock=20; loop();
+                assert(IrSender.sends==5 && fan.speed()==5 && testClock==620);
+              } else if (mode == "priority") {
+                fan.reset();
+                Bridge.values["resac_command"] = std::string("v1,") + id1 + ",ping";
+                readHook=[](const char *key) {
+                  if (strcmp(key,"resac_interval_ms")==0) notify();
+                  if (strcmp(key,"resac_fan_control")==0) assert(Bridge.reads["resac_command"]==1);
+                };
+                testClock=lastSampleMs=250; loop();
+                assert(Bridge.reads["resac_command"]==1);
+                assert(Mailbox.messages.size()==1); // Single combined completion, no recursive handling.
+                assert(Bridge.values["resac_command_result"].find("v6,0,0,0,0,0,0,r,v1,")==0);
+
+              } else if (mode == "sensor-priority") {
+                #if RESAC_BATCHED_COMMANDS
+                fan.reset();
+                Bridge.values["resac_command"] = std::string("v1,") + id1 + ",ping";
+                testClock=10000; lastHousekeepingMs=testClock;
+                loop(); assert(sensorPublication.stage==1 && Bridge.reads["resac_command"]==0);
+                mailboxHook=[]() {
+                  if (Mailbox.messages.back().find("v1,resac_sensor_diagnostic,")==0) notify();
+                };
+                loop(); assert(sensorPublication.stage==2 && Bridge.reads["resac_command"]==0);
+                readHook=[](const char *key) {
+                  if (strcmp(key,"resac_command")==0) assert(sensorPublication.stage==2);
+                };
+                loop(); assert(Bridge.reads["resac_command"]==1);
+                assert(Bridge.values["resac_sensor_status"]=="ok");
+                loop(); assert(Bridge.values["resac_sample"].find(std::string("v1,")+session+",1,22000,50000,")==0);
+                loop(); loop(); assert(sensorPublication.stage==0);
+                #endif
+
+              } else if (mode == "timing") {
+                #if RESAC_COMMAND_TIMING
+                commandTiming.arm();
+                Bridge.values["resac_command"] = std::string("v1,") + id1 + ",ping";
+                testClock=10; notify(); testClock=40;
+                readHook=[](const char *) { testClock+=5; };
+                loop();
+                assert(!commandTiming.active && !commandTiming.armed && commandTiming.dropped==0);
+                assert(commandTiming.count >= 9);
+                assert(commandTiming.rows[0].event==CommandTiming::IRQ);
+                assert(commandTiming.rows[0].us==10000);
+                assert(commandTiming.rows[1].event==CommandTiming::ENTER);
+                assert(commandTiming.rows[1].us==40000);
+                assert(commandTiming.rows[2].event==CommandTiming::UART_BEGIN);
+                assert(commandTiming.rows[2].tag==CommandTiming::COMMAND);
+                assert(commandTiming.rows[3].event==CommandTiming::UART_END);
+                assert(commandTiming.rows[3].us-commandTiming.rows[2].us==5000);
+                assert(commandTiming.rows[commandTiming.count-1].event==CommandTiming::COMPLETE);
+                assert(commandTiming.idHash!=0);
+                const uint8_t frozen=commandTiming.count;
+                commandTiming.record(CommandTiming::ENTER); assert(commandTiming.count==frozen);
+                reset(); commandTiming.arm(); PINB=0; testClock=1; loop();
+                assert(commandTiming.rows[0].event==CommandTiming::ENTER); // Masked IRQ is unknown, never fabricated.
+                commandTiming.arm(); commandTiming.begin();
+                for(int i=0;i<100;++i) commandTiming.record(CommandTiming::ENTER);
+                assert(commandTiming.count==CommandTiming::capacity && commandTiming.dropped>0);
+                commandTiming.stop();
+                reset(); commandTiming.arm();
+                Bridge.values["resac_command"] = std::string("v1,") + id1 + ",ping";
+                testClock=4294967UL; notify(); testClock+=10; loop();
+                assert(static_cast<uint32_t>(commandTiming.rows[1].us-commandTiming.rows[0].us)==10000);
+                #endif
               } else { assert(false); }
             }
         '''
@@ -238,10 +360,16 @@ class FirmwareSchedulingTests(unittest.TestCase):
         cls.binaries = []
         for enabled in (0, 1):
             binary = str(directory / ('sketch-test-' + str(enabled)))
-            subprocess.run([shutil.which('g++') or 'g++', '-std=c++11', '-DRESAC_COMMAND_GPIO=' + str(enabled),
+            subprocess.run([shutil.which('g++') or 'g++', '-std=c++11', '-DRESAC_BATCHED_COMMANDS=0', '-DRESAC_COMMAND_GPIO=' + str(enabled),
                             '-I' + str(directory), '-I' + str(root / 'include'), str(path), '-o', binary], check=True)
             cls.binaries.append(binary)
         cls.binary = cls.binaries[0]
+        cls.timing_binary = str(directory / 'timing-test')
+        subprocess.run([shutil.which('g++') or 'g++', '-std=c++11', '-DRESAC_COMMAND_GPIO=1', '-DRESAC_COMMAND_TIMING=1',
+                        '-I' + str(directory), '-I' + str(root / 'include'), str(path), '-o', cls.timing_binary], check=True)
+        cls.batched_binary = str(directory / 'batched-test')
+        subprocess.run([shutil.which('g++') or 'g++', '-std=c++11', '-DRESAC_COMMAND_GPIO=1',
+                        '-I' + str(directory), '-I' + str(root / 'include'), str(path), '-o', cls.batched_binary], check=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -268,3 +396,18 @@ class FirmwareSchedulingTests(unittest.TestCase):
 
     def test_gpio_boot_discards_stale_command_and_held_signal(self):
         subprocess.run([self.binaries[1], 'boot'], check=True)
+
+    def test_batched_completion_and_atomic_safety_remain_fail_closed(self):
+        subprocess.run([self.batched_binary, 'batch'], check=True)
+
+    def test_commands_preempt_between_housekeeping_transactions(self):
+        subprocess.run([self.batched_binary, 'priority'], check=True)
+
+    def test_batched_boot_still_discards_stale_commands(self):
+        subprocess.run([self.batched_binary, 'boot'], check=True)
+
+    def test_sensor_publication_returns_to_command_loop_between_ordered_stages(self):
+        subprocess.run([self.batched_binary, 'sensor-priority'], check=True)
+
+    def test_opt_in_timing_captures_irq_handler_and_uart_without_recursive_work(self):
+        subprocess.run([self.timing_binary, 'timing'], check=True)
