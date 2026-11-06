@@ -14,6 +14,15 @@ cooperative=importlib.util.module_from_spec(spec);spec.loader.exec_module(cooper
 
 
 class CooperativeJsonTests(unittest.TestCase):
+    def test_fast_scalars_escape_controls_and_preserve_unicode_and_numeric_precision(self):
+        payload = {'text': ''.join(chr(i) for i in range(128)) + '\u00e9\u96ea\U0001f600',
+                   'numbers': [1.234567890123456, -0.0, 1e-200, 1e200, 2147483648],
+                   'values': [True, False, None, {}, []]}
+        self.assertEqual(json.loads(cooperative.dumps(payload)), payload)
+        self.assertIn(b'1.234567890123456', cooperative.dumps(payload))
+        for value in [float('inf'), float('nan'), set(), '\ud800']:
+            with self.assertRaises((ValueError, UnicodeError)): cooperative.scalar(value)
+
     def test_large_nested_json_yields_between_bounded_steps_and_preserves_values(self):
         payload={'events':[{'name':'command.execute','attributes':{'text':'quote " \\ \u00e9','number':1.25,'ok':True},'n':i} for i in range(32)],'nothing':None}
         encoding=cooperative.Encoding(payload,agent.encode_json)

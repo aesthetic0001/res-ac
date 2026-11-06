@@ -78,4 +78,17 @@ safety validation still run. Legacy clients receive JSON. Older servers may
 ignore the format request and return JSON, which the native client still
 accepts. No HTTP helper protocol change, polling timer or new connection is
 required. `command.timing.decode_ms` measures both decoding paths on the
-existing command event. Live binary-format validation is pending.
+existing command event. The board benchmark measured 33.4 ms per JSON decode
+versus 6.0 ms per binary decode over 100 iterations. A subsequent live 100-ping
+run recorded 169/268 ms to the stored timestamp and 206.67/309.00 ms through
+durable server completion. Its paired transport estimate was 49.44/95.75 ms.
+All pings succeeded on the first attempt. Five calibration and four level
+commands also succeeded once each, rejected a stale session, reported state
+and ended with the fan off. This remains above the network-bound target.
+
+The next device candidate replaces the vendor JSON writer with a bounded
+encoder on old Python installations. Scalars use direct UTF-8 escaping and
+finite round-tripping numeric representations; telemetry keeps its 512-byte
+cooperative steps. This avoids constructing the vendor writer repeatedly for
+every field. Native Bridge clients also disable Nagle buffering, matching the
+server side. Live validation of these changes is pending.

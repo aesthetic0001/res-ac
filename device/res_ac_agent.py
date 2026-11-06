@@ -153,7 +153,11 @@ def log(message):
 def encode_json(value):
     if hasattr(json, 'dumps'):
         return json.dumps(value, separators=(',', ':'), allow_nan=False)
-    return json.write(value)
+    # Avoid the vendor writer per field and its six-decimal float formatting.
+    # Keep UTF-8 and round-tripping numeric precision with bounded output.
+    from cooperative_json import dumps
+    encoded = dumps(value)
+    return encoded if sys.version_info[0] == 2 else encoded.decode('utf-8')
 
 
 def decode_json(text):
@@ -759,6 +763,8 @@ class BridgeEvents(object):
                         select.select([], [], [], max(0, min(timeout, self.retry_at - monotonic())))
                     return
                 self.connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                if self.native:
+                    self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.connection.setblocking(False)
                 code = self.connection.connect_ex((self.host, self.port))
                 if code not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
@@ -969,7 +975,7 @@ class Telemetry(object):
         payload = dict(self.batch, metrics=metrics, events=[event for event in events if event['ageMs'] <= 604800000])
         if self.config.get('native_bridge', False):
             from cooperative_json import Encoding
-            self.encoding, self.prepared_payload = Encoding(payload, encode_json), payload
+            self.encoding, self.prepared_payload = Encoding(payload), payload
             self.next_due = monotonic()  # Ready work on the existing selector, no added timer.
         else:
             self.request = CurlUpload(self.config, payload, route='telemetry', timeout=10)
