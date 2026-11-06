@@ -208,6 +208,7 @@ test('a result handoff keeps the next command context and observes its delivery 
   assert.equal(delivered[0].spanContext().traceId,second.traceparent.slice(3,35));
   const result=f.exporter.getFinishedSpans().find(s=>s.name==='command.result');
   assert.equal(result.spanContext().traceId,first.traceparent.slice(3,35));
+  assert.equal(f.exporter.getFinishedSpans().filter(s=>s.name==='db.transaction'&&s.spanContext().traceId===first.traceparent.slice(3,35)).length,2);
 });
 
 test('reading uploads propagate trace context and database errors are measured without SQL values', async t => {

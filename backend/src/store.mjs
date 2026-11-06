@@ -184,7 +184,7 @@ export class Store {
     return { code: 200, duplicate: false };
   }
   resultAndClaim(deviceId, id, status, value, leaseMs, allowClaim = true) {
-    return this.transaction(() => {
+    const execute = () => {
       const result = this.result(deviceId, id, status, value);
       if (result.code !== 200) return result;
       const previous = this.db.prepare('SELECT next_id FROM command_handoffs WHERE previous_id=?').get(id);
@@ -202,7 +202,10 @@ export class Store {
         if (next) this.db.prepare('INSERT INTO command_handoffs(previous_id,next_id) VALUES(?,?)').run(id, next.id);
       }
       return { ...result, resultId: id, commands: next ? [next] : [] };
-    });
+    };
+    // The route already groups presence with this operation. Avoid recording
+    // an inner transaction span that did not perform another durable commit.
+    return this.commitObservers !== null ? execute() : this.transaction(execute);
   }
   createSession(key, csrf, expiresAt, authVersion) { this.db.prepare('INSERT INTO sessions VALUES(?,?,?,?)').run(digest(key), csrf, expiresAt, authVersion); }
   session(key) { return this.db.prepare('SELECT * FROM sessions WHERE token_hash=? AND expires_at>?').get(digest(key), Date.now()); }
