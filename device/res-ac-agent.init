@@ -11,7 +11,7 @@ start() {
     chmod 700 /tmp/res-ac-http.new
     mv /tmp/res-ac-http.new /tmp/res-ac-http
     /tmp/res-ac-http --version | grep -q '^res-ac-http protocol=1 ' || return 1
-    start-stop-daemon -S -b -m -p /var/run/res-ac-agent.pid -x /usr/bin/python -- -u /usr/lib/res-ac/res_ac_agent.py >> /tmp/res-ac-agent.log 2>&1
+    start-stop-daemon -S -b -m -p /var/run/res-ac-agent.pid -x /bin/sh -- -c 'exec /usr/bin/python -u /usr/lib/res-ac/res_ac_agent.py >> /tmp/res-ac-agent.log 2>&1'
 }
 stop() {
     start-stop-daemon -K -p /var/run/res-ac-agent.pid

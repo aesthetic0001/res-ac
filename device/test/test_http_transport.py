@@ -136,6 +136,15 @@ class PersistentHttpTests(unittest.TestCase):
             self.assertEqual(request[2]['Authorization'], 'Bearer PRIVATE_TOKEN')
             self.assertRegex(request[2]['traceparent'], agent.TRACEPARENT)
 
+    def test_prepared_json_body_uses_existing_native_http_protocol_without_reencoding(self):
+        payload=dict(readingId='prepared',traceparent=agent.traceparent(),label='\u00e9')
+        encoded=json.dumps(payload,separators=(',',':')).encode('utf-8')
+        with patch.object(agent,'encode_json',side_effect=AssertionError('Prepared body encoded twice')):
+            request=self.upload(payload,encoded_body=encoded)
+            self.completed(request)
+            self.assertEqual(request.finish()[0],201)
+        self.assertEqual(self.received[0][3],payload)
+
     def test_held_poll_does_not_block_upload_and_completion_wakes_wait(self):
         poll = self.upload(route='commands', method='GET', timeout=5)
         reading = self.upload(dict(readingId='concurrent', traceparent=agent.traceparent()))

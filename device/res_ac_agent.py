@@ -836,6 +836,7 @@ class Telemetry(object):
         self.dropped = 0
         self.request = None
         self.batch = None
+        self.encoding = self.prepared_payload = None
         self.next_due = 0
         self.backoff = 5
         self.previous_cpu = None
@@ -919,6 +920,7 @@ class Telemetry(object):
             if self.request is not None:
                 self.request.close()
             self.request = None
+            self.encoding = self.prepared_payload = None
             self.next_due = monotonic() + self.backoff
             self.backoff = min(self.backoff * 2, 60)
 
@@ -937,6 +939,13 @@ class Telemetry(object):
                 self.request.close()
                 self.request = None
         if monotonic() < self.next_due:
+            return
+        if self.encoding is not None:
+            encoded = self.encoding.step()
+            if encoded is not None:
+                payload = self.prepared_payload
+                self.encoding = self.prepared_payload = None
+                self.request = CurlUpload(self.config, payload, route='telemetry', timeout=10, encoded_body=encoded)
             return
         if self.batch is None:
             self.sensor()
@@ -958,9 +967,15 @@ class Telemetry(object):
         if self.last_sample_at is not None:
             metrics['sensor_sample_age_seconds'] = max(0, now - self.last_sample_at)
         payload = dict(self.batch, metrics=metrics, events=[event for event in events if event['ageMs'] <= 604800000])
-        self.request = CurlUpload(self.config, payload, route='telemetry', timeout=10)
+        if self.config.get('native_bridge', False):
+            from cooperative_json import Encoding
+            self.encoding, self.prepared_payload = Encoding(payload, encode_json), payload
+            self.next_due = monotonic()  # Ready work on the existing selector, no added timer.
+        else:
+            self.request = CurlUpload(self.config, payload, route='telemetry', timeout=10)
 
     def close(self):
+        self.encoding = self.prepared_payload = None
         if self.request is not None:
             self.request.close()
 
@@ -1108,14 +1123,14 @@ class HttpTransport(object):
         finally:
             child.close()
 
-    def submit(self, route, parent, payload, method, timeout):
+    def submit(self, route, parent, payload, method, timeout, encoded_body=None):
         if len(self.pending) >= 4:
             raise IOError('All HTTP request slots are occupied')
         if self.connection is None:
             self._start()
         self.serial = self.serial % 0xffffffff + 1
         result = HttpResult(self.serial)
-        body = encode_json(payload) if payload is not None else b''
+        body = encoded_body if encoded_body is not None else (encode_json(payload) if payload is not None else b'')
         if isinstance(body, text_type):
             body = body.encode('utf-8')
         if len(body) > 32768 or method not in ('GET', 'POST') or not 1 <= timeout <= 60:
@@ -1228,7 +1243,7 @@ def request_completed(request):
 
 class CurlUpload(object):
     """HTTP attempt backed by the shared helper, or standalone curl for probes."""
-    def __init__(self, config, payload=None, route='readings', method='POST', timeout=25):
+    def __init__(self, config, payload=None, route='readings', method='POST', timeout=25, encoded_body=None):
         self.process = None
         self.files = []
         self.transport = config.get('_http')
@@ -1251,7 +1266,7 @@ class CurlUpload(object):
         self.request_traceparent = self.parent if self.root_request else traceparent(self.parent)
         try:
             if self.transport is not None:
-                self.result = self.transport.submit(route, self.request_traceparent, payload, method, timeout)
+                self.result = self.transport.submit(route, self.request_traceparent, payload, method, timeout, encoded_body=encoded_body)
                 return
             header_fd, header_path = temporary('res-ac-curl-')
             self.files.append(header_path)
@@ -1273,8 +1288,10 @@ class CurlUpload(object):
             if payload is not None:
                 payload_fd, payload_path = temporary('res-ac-payload-')
                 self.files.append(payload_path)
-                with os.fdopen(payload_fd, 'w') as stream:
-                    stream.write(encode_json(payload))
+                with os.fdopen(payload_fd, 'wb') as stream:
+                    body = encoded_body if encoded_body is not None else encode_json(payload)
+                    if isinstance(body, text_type): body = body.encode('utf-8')
+                    stream.write(body)
                 arguments += ['--data-binary', '@' + payload_path]
             self.process = subprocess.Popen(arguments,
                                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1538,7 +1555,7 @@ class FanReporter(object):
         heartbeat_due = monotonic() >= self.next_due
         if isinstance(self.bridge, BridgeEvents):
             version = (self.bridge.version('resac_command_ready', 'resac_fan_session', 'resac_fan_state'),
-                       encode_json(self.automation.snapshot()) if self.automation else None)
+                       self.automation.snapshot() if self.automation else None)
             changed = finished or version != self.bridge_version
             self.bridge_version = version
         else:
@@ -2017,7 +2034,8 @@ class AutoController(object):
         return self.runner is not None
 
     def snapshot(self):
-        return dict(self.settings, status=self.status, targetLevel=self.target, minAdjustmentSeconds=30)
+        return dict(self.settings, thresholdsC=list(self.settings['thresholdsC']),
+                    status=self.status, targetLevel=self.target, minAdjustmentSeconds=30)
 
     def configure(self, payload):
         settings = validate_curve(payload)
