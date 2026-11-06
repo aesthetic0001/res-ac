@@ -352,11 +352,12 @@ test('compact command timing fields expand only on the backend and deduplicate a
   const f=await fixture(t), value=batch();
   value.events=[{name:'command.execute',traceparent:newTraceparent(),durationMs:400,ageMs:0,
     attributes:{'command.type':'device.ping',outcome:'succeeded','command.timing.fetch_ms':30,
-      'command.timing.safety_ms':0,'command.timing.notify_ms':80,'command.timing.roundtrip_ms':300}}];
+      'command.timing.safety_ms':0,'command.timing.notify_ms':80,'command.timing.roundtrip_ms':300,
+      'command.timing.decode_ms':20}}];
   assert.equal((await f.request('/api/devices/board/telemetry',value)).status,200);
   assert.equal((await f.request('/api/devices/board/telemetry',value)).status,200);
   await Promise.all(Object.values(f.obs.providers).map(provider=>provider.forceFlush()));
-  for(const name of ['command.execute','avr.fetch','avr.safety','command.notify','bridge.roundtrip'])
+  for(const name of ['command.execute','command.decode','avr.fetch','avr.safety','command.notify','bridge.roundtrip'])
     assert.equal(f.exporter.getFinishedSpans().filter(span=>span.name===name).length,1);
   for(const invalid of [-1,86400_001,NaN,'30'])
     assert.equal(validateTelemetry({...value,events:[{...value.events[0],attributes:{'command.timing.fetch_ms':invalid}}]}),false);

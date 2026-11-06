@@ -1258,7 +1258,8 @@ class CurlUpload(object):
         self.started = monotonic()
         self.prepared_at, self.journal_ms = None, journal_ms
         self.reported = False
-        self.kind = 'result' if route.endswith('/result') else route
+        path = route.split('?', 1)[0]
+        self.kind = 'result' if path.endswith('/result') else path
         self.network_start = {}
         if self.telemetry is not None:
             try:
@@ -1988,11 +1989,18 @@ class CommandProcessor(object):
                         self._status('result rejected HTTP=%d' % status)
                 elif status == 200:
                     accepted_at = monotonic()
-                    value = decode_json(body.decode('utf-8'))
+                    if self.config.get('native_bridge', False) and body.startswith(b'RAC1'):
+                        from command_wire import decode
+                        value = decode(body)
+                    else:
+                        value = decode_json(body.decode('utf-8'))
+                    decoded_at = monotonic()
                     commands = value.get('commands')
                     if not isinstance(commands, list) or len(commands) != 1:
                         raise ValueError('Expected one command')
                     self._accept(commands[0], started_at=accepted_at)
+                    if self.current is not None:
+                        self.phase_timings['command.timing.decode_ms'] = max(0, (decoded_at - accepted_at) * 1000)
                 elif status == 204:
                     self.backoff = 1
                 else:
@@ -2019,7 +2027,8 @@ class CommandProcessor(object):
                     self.retry_at = monotonic() + 2
                     return
                 # Server waits 30 seconds; leave 5 seconds for transport overhead.
-                self.request = CurlUpload(self.config, route='commands', method='GET', timeout=35)
+                route = 'commands?format=binary-v1' if self.config.get('native_bridge', False) else 'commands'
+                self.request = CurlUpload(self.config, route=route, method='GET', timeout=35)
                 self.request_kind = 'poll'
         except Exception as error:
             self._failed_request(error)

@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { token, digest, equal, verifyPassword, cookieToken } from './auth.mjs';
 import { curveSettings } from './fan-curve.mjs';
+import { commandMediaType, encodeCommand } from './command-wire.mjs';
 
 class HttpError extends Error { constructor(status, message) { super(message); this.status = status; } }
 const assert = (test, message) => { if (!test) throw new HttpError(400, message); };
@@ -88,7 +89,13 @@ export function createApp(config, store, observability) {
       // Preparation can run in an enqueue transaction. Send only after commit.
       return () => {
         if (stopped || res.destroyed) return cleanup();
-        cleanup(); json(res, 200, { commands: [command] });
+        cleanup();
+        const value = { commands: [command] };
+        if (new URL(req.url, 'http://local').searchParams.get('format') === 'binary-v1') {
+          const encoded = encodeCommand(value);
+          res.writeHead(200, { 'content-type': commandMediaType, 'cache-control': 'no-store' });
+          res.end(encoded);
+        } else json(res, 200, value);
       };
     };
     const wake = () => {

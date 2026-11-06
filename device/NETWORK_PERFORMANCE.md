@@ -55,3 +55,27 @@ clean shutdown; after a crash that noncritical timestamp can lag by up to five
 seconds. Command enqueue/claim/result durability and fan-state freshness are
 unchanged. Native HTTP completions retain their integer timing fields rather than
 formatting them as curl output and parsing them back to floats.
+
+The 100-ping run on the presence-coalescing backend and instrumented device
+recorded 199/279 ms median/p95 to the stored completion timestamp, or
+224.74/322.05 ms through the final server response (including commit). The
+paired result curl duration minus server processing was 50.80/95.55 ms. This is
+a transport estimate, not an exact packet measurement. Command handling,
+including body decoding, measured 80/120 ms; earlier execution-only captures
+excluded that decoding and are not directly comparable. Each of the two durable
+backend transactions measured 21.69/60.07 ms. A separate syscall capture measured
+22 WAL fsyncs at 23.87 ms median, 66.94 ms maximum. FULL durability is preserved.
+
+Native-mode command polls request `commands?format=binary-v1`. The optional
+`application/vnd.res-ac.command.v1` representation starts with `RAC1`, then a
+bounded typed value: null/true/false (`n/t/f`), signed big-endian int32 (`i`),
+finite big-endian float64 (`d`), UTF-8 string (`s` + u16 byte length), array
+(`a` + u16 item count), or object (`o` + u16 pair count, string keys). Limits
+are 32768 bytes, depth 16, and 1024 values including keys. Duplicate keys,
+invalid UTF-8, truncation, unknown types and trailing data fail closed. This
+only replaces response decoding; the existing command envelope and physical
+safety validation still run. Legacy clients receive JSON. Older servers may
+ignore the format request and return JSON, which the native client still
+accepts. No HTTP helper protocol change, polling timer or new connection is
+required. `command.timing.decode_ms` measures both decoding paths on the
+existing command event. Live binary-format validation is pending.

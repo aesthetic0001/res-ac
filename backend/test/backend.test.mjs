@@ -10,6 +10,7 @@ import { Store } from '../src/store.mjs';
 import { createApp } from '../src/app.mjs';
 import { hashPassword } from '../src/auth.mjs';
 import { publicIp } from '../deploy/setup.mjs';
+import { encodeCommand, commandMediaType } from '../src/command-wire.mjs';
 
 let passwordHash;
 // Ephemeral test-only credentials: nothing usable is embedded in the repository.
@@ -342,13 +343,13 @@ test('reading history averages the full window into bounded chronological points
   assert.ok(result.readings.every(point => point.temperatureC < 30 && point.humidity < 50));
 });
 
-test('enqueue and waiting claim commit atomically before any device response', async t => {
+for (const format of ['', '?format=binary-v1']) test('enqueue and waiting claim commit atomically before any device response ' + format, async t => {
   const f = await fixture(t, { pollWaitMs: 5000, leaseMs: 10_000 }), auth = await f.login();
   let ready;
   const waiting = new Promise(resolve => { ready = resolve; });
   const claim = f.store.claim.bind(f.store);
   f.store.claim = (...args) => { const result = claim(...args); if (!result) ready(); return result; };
-  const poll = f.request('/api/devices/board-1/commands', { headers: f.deviceHeaders });
+  const poll = f.request('/api/devices/board-1/commands' + format, { headers: f.deviceHeaders });
   await waiting;
   const exec = f.store.db.exec.bind(f.store.db), calls = [];
   let fail = true;
@@ -366,8 +367,14 @@ test('enqueue and waiting claim commit atomically before any device response', a
   assert.equal(await Promise.race([poll.then(() => 'delivered'), sleep(25).then(() => 'waiting')]), 'waiting');
   calls.length = 0;
   const queued = await (await post()).json();
-  const delivered = await (await poll).json();
-  assert.equal(delivered.commands[0].id, queued.id);
+  const response = await poll;
+  if (format) {
+    assert.equal(response.headers.get('content-type'), commandMediaType);
+    const saved = f.store.command(queued.id);
+    const expected = { commands: [{ id: saved.id, type: saved.type, payload: JSON.parse(saved.payload),
+      createdAt: new Date(saved.created_at).toISOString(), expiresAt: new Date(saved.expires_at).toISOString() }] };
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), encodeCommand(expected));
+  } else assert.equal((await response.json()).commands[0].id, queued.id);
   assert.equal(f.store.command(queued.id).status, 'inflight');
   assert.equal(f.store.command(queued.id).attempts, 1);
   assert.deepEqual(calls, ['BEGIN IMMEDIATE', 'COMMIT']);
