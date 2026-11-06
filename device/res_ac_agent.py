@@ -498,7 +498,7 @@ class BridgeEvents(object):
         self._update(key, value)
 
     def fan_control(self, heartbeat=None, invalidate=False):
-        if self.get('resac_command_protocol') != 'batched-v1':
+        if self.get('resac_command_protocol') not in ('batched-v1', 'batched-v2'):
             raise IOError('Batched fan context is not supported')
         if invalidate or self.control_session is None:
             self.control_session = binascii.hexlify(os.urandom(16)).decode('ascii')
@@ -508,7 +508,7 @@ class BridgeEvents(object):
         self.put('resac_fan_control', 'v1,%s,%d' % (self.control_session, self.control_heartbeat))
 
     def invalidate_fan(self):
-        if self.get('resac_command_protocol') == 'batched-v1':
+        if self.get('resac_command_protocol') in ('batched-v1', 'batched-v2'):
             self.fan_control(invalidate=True)
         else:
             self.put('resac_fan_invalidate', '1')
@@ -1494,7 +1494,7 @@ class FanReporter(object):
             if ready not in ('v3', 'v4'):
                 self.initialized = False
                 return
-            if isinstance(self.bridge, BridgeEvents) and self.bridge.get('resac_command_protocol') == 'batched-v1':
+            if isinstance(self.bridge, BridgeEvents) and self.bridge.get('resac_command_protocol') in ('batched-v1', 'batched-v2'):
                 if heartbeat_due:
                     self.heartbeat = self.heartbeat % 0xffffffff + 1
                 invalidate = (not self.initialized or self.bridge.control_session is None or
@@ -1605,6 +1605,12 @@ class CommandProcessor(object):
                 self.bridge.cancel_command(self.current['id'])
             except (IOError, OSError):
                 log('Command notification could not be cleared; GPIO will be reopened before reuse')
+        if (status == 'succeeded' and getattr(self, 'avr_state', None) is not None and self.session_id and
+                isinstance(self.bridge, BridgeEvents) and self.bridge.control_session == self.session_id and
+                self.bridge.get('resac_fan_session') == self.session_id):
+            revision, flags, speed, source = self.avr_state
+            self.bridge._update('resac_fan_state', 'v2,%s,%d,%d,%d,%d,%s' %
+                                (self.session_id, flags & 1, (flags >> 1) & 1, speed, revision, source))
         parent = self.current.get('traceparent') or traceparent()
         telemetry = self.config.get('_telemetry')
         if telemetry:
@@ -1669,6 +1675,7 @@ class CommandProcessor(object):
             return
         self.current = command
         self.avr_phases = None
+        self.avr_state = None
         self.phase_timings = {}
         self.execution_started = monotonic()
         self.bridge_failed_reported = False
@@ -1704,7 +1711,7 @@ class CommandProcessor(object):
                 if time.gmtime().tm_year < 2025 or time.time() >= self.expires_at:
                     raise ValueError('IR command expired or device clock invalid')
                 if (isinstance(self.bridge, BridgeEvents) and
-                        self.bridge.get('resac_command_protocol') not in (None, '', 'batched-v1')):
+                        self.bridge.get('resac_command_protocol') not in (None, '', 'batched-v1', 'batched-v2')):
                     raise ValueError('Unsupported command safety protocol')
                 ready = self.bridge.get('resac_command_ready')
                 if ready not in ('v3', 'v4'):
@@ -1712,7 +1719,7 @@ class CommandProcessor(object):
                 if command['type'] in ('fan.level', 'fan.curve') and ready != 'v4':
                     raise ValueError('Upgrade firmware for target levels and automatic curves')
                 self.session_id = command['payload'].get('sessionId')
-                if (isinstance(self.bridge, BridgeEvents) and self.bridge.get('resac_command_protocol') == 'batched-v1' and
+                if (isinstance(self.bridge, BridgeEvents) and self.bridge.get('resac_command_protocol') in ('batched-v1', 'batched-v2') and
                         (not self.bridge.control_confirmed or self.session_id != self.bridge.control_session)):
                     raise ValueError('Fan control epoch changed; wait for fresh status and recalibrate')
                 state = parse_fan_state(self.bridge.get('resac_fan_state'))
@@ -1741,7 +1748,8 @@ class CommandProcessor(object):
         self.deadline = monotonic() + 10
         self.bridge_due = 0
         self.ping_dispatched = False
-        self._status('command received; waiting for Arduino')
+        if not isinstance(self.bridge, BridgeEvents):
+            self._status('command received; waiting for Arduino')
 
     def _dispatch(self, frame):
         started = monotonic()
@@ -1749,6 +1757,7 @@ class CommandProcessor(object):
             timings = self.phase_timings
             def signaled(elapsed):
                 timings['command.timing.notify_ms'] = max(0, elapsed * 1000)
+                self._status('command sent; waiting for Arduino')
             self.bridge.dispatch_command(frame, self.deadline, on_signal=signaled)
         else:
             self.bridge.put('resac_command', frame)
@@ -1776,15 +1785,24 @@ class CommandProcessor(object):
         self.bridge_due = monotonic() + 0.5
         try:
             frame = self.bridge.get('resac_command_result') or ''
-            if isinstance(self.bridge, BridgeEvents) and self.bridge.get('resac_command_protocol') == 'batched-v1':
-                envelope = frame.split(',', 4)
-                if (len(envelope) != 5 or envelope[0] != 'v5' or
-                        any(not re.match(r'^\d{1,10}$', item) or int(item) > 0xffffffff for item in envelope[1:4])):
-                    envelope = None
-                self.avr_phases = None
-                if envelope is not None and envelope[4].split(',')[1:2] == [self.current['id']]:
+            if isinstance(self.bridge, BridgeEvents) and self.bridge.get('resac_command_protocol') in ('batched-v1', 'batched-v2'):
+                modern = self.bridge.get('resac_command_protocol') == 'batched-v2'
+                envelope = frame.split(',', 8 if modern else 4)
+                valid = (len(envelope) == (9 if modern else 5) and envelope[0] == ('v6' if modern else 'v5') and
+                         all(re.match(r'^\d{1,10}$', item) and int(item) <= 0xffffffff for item in envelope[1:4]))
+                self.avr_phases = self.avr_state = None
+                if valid and modern:
+                    valid = (re.match(r'^\d{1,10}$', envelope[4]) and int(envelope[4]) <= 0xffffffff and
+                             envelope[5] in ('0', '1', '3') and envelope[6] in ('0', '1', '2', '3', '4', '5') and
+                             envelope[7] in ('r', 'c', 'm', 'a') and
+                             ((envelope[5] == '3' and envelope[6] != '0') or
+                              (envelope[5] != '3' and envelope[6] == '0')))
+                if valid and envelope[-1].split(',')[1:2] == [self.current['id']]:
                     self.avr_phases = tuple(int(item) / 1000.0 for item in envelope[1:4])
-                    frame = envelope[4]
+                    if modern:
+                        self.avr_state = (int(envelope[4]), int(envelope[5]), int(envelope[6]),
+                                          dict(r='reset', c='calibration', m='manual', a='automatic')[envelope[7]])
+                    frame = envelope[-1]
                 else:
                     frame = ''
             fields = frame.split(',')

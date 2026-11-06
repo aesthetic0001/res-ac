@@ -127,11 +127,11 @@ class FirmwareSchedulingTests(unittest.TestCase):
             const char *id2 = "22222222-2222-4222-8222-222222222222";
             void reset() {
               testClock = lastSampleMs = lastHousekeepingMs = 0;
-              commandNotificationsReady = true; commandExecuting = false; readHook = nullptr; mailboxHook = nullptr;
+              commandNotificationsReady = true; commandExecuting = false; fanStatePending = false; fanRevision=0; readHook = nullptr; mailboxHook = nullptr;
               #if RESAC_BATCHED_COMMANDS
               sensorPublication.stage=0;
               #endif
-              controlSession[0] = 0; fanControlValid = false;
+              controlSession[0] = 0; fanControlValid = false; fanControlSource="reset";
               #if RESAC_COMMAND_GPIO
               PINB = _BV(PB2); commandWake = commandLowHandled = false;
               #else
@@ -251,7 +251,7 @@ class FirmwareSchedulingTests(unittest.TestCase):
                 assert(Bridge.reads["resac_fan_control"] == 1);
                 assert(Bridge.reads["resac_fan_invalidate"] == 0);
                 assert(Bridge.reads["resac_fan_heartbeat"] == 0);
-                assert(Bridge.values["resac_command_result"].find("v5,0,0,0,v3,") == 0);
+                assert(Bridge.values["resac_command_result"].find("v6,0,0,0,1,3,1,m,v3,") == 0);
                 assert(Bridge.values["resac_command_diagnostic"].empty());
                 assert(Mailbox.messages.size() == 2); // State pair + one combined completion.
                 reset(); std::strcpy(controlSession, session);
@@ -259,7 +259,7 @@ class FirmwareSchedulingTests(unittest.TestCase):
                 Bridge.values["resac_command"] = std::string("v3,") + id1 + ",calibrate," + session;
                 readHook=[](const char *) { testClock+=100; };
                 notify(); testClock=20; loop();
-                assert(Bridge.values["resac_command_result"].find("v5,100,100,0,v3,")==0);
+                assert(Bridge.values["resac_command_result"].find("v6,100,100,0,")==0);
                 reset(); std::strcpy(controlSession, session);
                 Bridge.values["resac_fan_control"] = std::string("v1,") + session + ",1";
                 power(); testClock = lastSampleMs = 10001; lastHousekeepingMs = 10000;
@@ -296,7 +296,7 @@ class FirmwareSchedulingTests(unittest.TestCase):
                 testClock=lastSampleMs=250; loop();
                 assert(Bridge.reads["resac_command"]==1);
                 assert(Mailbox.messages.size()==1); // Single combined completion, no recursive handling.
-                assert(Bridge.values["resac_command_result"].find("v5,0,0,0,v1,")==0);
+                assert(Bridge.values["resac_command_result"].find("v6,0,0,0,0,0,0,r,v1,")==0);
 
               } else if (mode == "sensor-priority") {
                 #if RESAC_BATCHED_COMMANDS

@@ -9,7 +9,7 @@
 // Seeeduino Cloud v1.0: Linux GPIO21 -> TXS0102 -> PB2/MOSI (PCINT2).
 // This is NOT the D7 handshake connection found on the original Arduino Yun.
 #ifndef RESAC_BATCHED_COMMANDS
-#define RESAC_BATCHED_COMMANDS 1
+#define RESAC_BATCHED_COMMANDS 2
 #endif
 
 #ifndef RESAC_COMMAND_GPIO
@@ -66,6 +66,7 @@ bool parseNumber(const char *, unsigned long, unsigned long &, uint8_t base = 10
 void serviceCommandNotification();
 bool commandExecuting = false;
 bool commandNotificationsReady = false;
+bool fanStatePending = false;
 
 void publishValue(const char *key, const char *value) {
   // Retain a snapshot for reconnects, then notify connected Linux clients.
@@ -77,6 +78,10 @@ void publishValue(const char *key, const char *value) {
 }
 
 void publishFanState() {
+#if RESAC_BATCHED_COMMANDS >= 2
+  if (commandExecuting) { fanStatePending = true; return; }
+#endif
+  fanStatePending = false;
   char frame[96];
   snprintf(frame, sizeof(frame), "v2,%s,%u,%u,%u,%lu,%s", fanSession[0] ? fanSession : "none",
            fan.calibrated(), fan.power(), fan.speed(), fanRevision, fanControlSource);
@@ -281,9 +286,18 @@ void processCommand() {
 #if RESAC_BATCHED_COMMANDS
     // Retain and push one versioned completion, including the legacy reply and
     // bounded phase durations. No separate diagnostic round trips delay success.
-    char prefix[48];
+    char prefix[64];
+#if RESAC_BATCHED_COMMANDS >= 2
+    const char source = strcmp(fanControlSource, "automatic") == 0 ? 'a' :
+                        strcmp(fanControlSource, "manual") == 0 ? 'm' :
+                        strcmp(fanControlSource, "calibration") == 0 ? 'c' : 'r';
+    const int size = snprintf(prefix, sizeof(prefix), "v6,%lu,%lu,%lu,%lu,%u,%u,%c,", fetchDuration,
+                              safetyDuration, static_cast<unsigned long>(millis() - executionStarted),
+                              fanRevision, (fan.calibrated() ? 1 : 0) | (fan.power() ? 2 : 0), fan.speed(), source);
+#else
     const int size = snprintf(prefix, sizeof(prefix), "v5,%lu,%lu,%lu,", fetchDuration,
                               safetyDuration, static_cast<unsigned long>(millis() - executionStarted));
+#endif
     const size_t replyLength = strlen(lastCommandReply);
     if (size <= 0 || static_cast<size_t>(size) >= sizeof(prefix) ||
         static_cast<size_t>(size) + replyLength >= sizeof(lastCommandReply)) return;
@@ -511,7 +525,9 @@ void setup() {
   }
   publishValue("resac_command_notify", "gpio21-pb2-v1");
 #endif
-#if RESAC_BATCHED_COMMANDS
+#if RESAC_BATCHED_COMMANDS >= 2
+  publishValue("resac_command_protocol", "batched-v2");
+#elif RESAC_BATCHED_COMMANDS
   publishValue("resac_command_protocol", "batched-v1");
 #else
   publishValue("resac_command_protocol", "");
@@ -559,6 +575,7 @@ void serviceCommandNotification() {
 void loop() {
   processSerial();
   serviceCommandNotification();
+  if (fanStatePending) { publishFanState(); serviceCommandNotification(); }
   // Recheck time after command execution, which can include physical IR dwell.
   const unsigned long now = millis();
   if (static_cast<unsigned long>(now - lastHousekeepingMs) >= HOUSEKEEPING_MS) {

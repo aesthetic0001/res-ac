@@ -101,5 +101,32 @@ class CommandBatchingTests(unittest.TestCase):
             self.assertEqual(processor.reply['status'], 'failed')
 
 
+    def test_v2_completion_updates_final_state_atomically_before_background_report(self):
+        bridge = self.bridge()
+        bridge._update('resac_command_protocol', 'batched-v2')
+        bridge.control_session = SESSION
+        bridge.control_confirmed = True
+        ident = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as directory:
+            processor = agent.CommandProcessor(dict(_bridge=bridge), state_path=str(Path(directory) / 'journal.json'))
+            processor._accept(dict(id=ident, type='fan.level', payload=dict(level=2, sessionId=SESSION),
+                                   expiresAt='2099-01-01T00:00:00Z'))
+            processor._arduino()
+            frame = bridge.notification['frame']
+            deliver(bridge, dict(response='put', key='resac_command', value=frame))
+            reply = 'v4,%s,level_set,%s,2,1,1234' % (ident, SESSION)
+            for fields in ['2,3,0,m', '2,2,2,m', '2,3,2,z']:
+                deliver(bridge, event('resac_command_result', 'v6,40,35,70,%s,%s' % (fields, reply)))
+                processor._arduino()
+                self.assertIsNotNone(processor.current)
+            deliver(bridge, event('resac_command_result', 'v6,40,35,70,2,3,2,m,' + reply))
+            processor._arduino()
+            self.assertEqual(processor.reply['status'], 'succeeded')
+            state = agent.parse_fan_state(bridge.get('resac_fan_state'))
+            self.assertEqual(state['speed'], 2)
+            self.assertEqual(state['revision'], 2)
+            self.assertEqual(state['controlSource'], 'manual')
+
+
 if __name__ == '__main__':
     unittest.main()

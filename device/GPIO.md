@@ -138,7 +138,7 @@ configuration was preserved.
 
 ## Batched command protocol
 
-The default sketch advertises `resac_command_protocol=batched-v1` and requires
+The default sketch advertises `resac_command_protocol=batched-v2` and requires
 this version of the agent. Build with `-DRESAC_BATCHED_COMMANDS=0` for the previous
 safety/completion format; the new agent also supports older event sketches.
 
@@ -153,9 +153,12 @@ its new session before accepting physical commands. The 10-second heartbeat
 limit, session checks, command journal, duplicate IDs, and IR dwell remain.
 
 A completion retains and pushes a single `resac_command_result` value:
-`v5,<fetch-ms>,<safety-ms>,<execution-ms>,<legacy-reply>`. This carries the matching
+`v6,<fetch-ms>,<safety-ms>,<execution-ms>,<revision>,<flags>,<speed>,<source>,<legacy-reply>`. This carries the matching
 command ID in the embedded reply, cutting diagnostic/result publication from
-four UART exchanges to two. Reconnects retain the same reply and duplicate
+four UART exchanges to two. The compact flags and source code carry the final
+fan state. Linux applies it with the matching successful completion; intermediate
+fan state publications are coalesced, and the separate recovery snapshot follows
+the acknowledgment. Reconnects retain the same reply and duplicate
 notifications do not repeat an action. Old unwrapped replies are rejected when
 the batched capability is present.
 
@@ -168,7 +171,8 @@ a background publication stack frame, during setup, or recursively.
 Phase telemetry carries numeric fields on the existing command event; the backend
 expands them without multiplying the device queue. It adds `command.journal`, `command.notify` (queue to confirmed GPIO
 assertion), `bridge.roundtrip` (assertion to Linux completion), `avr.fetch`, and
-`avr.safety`. `avr.execute` retains its existing action/state-publication scope.
+`avr.safety`. `avr.execute` now measures the action before deferred fan-state publication.
+The agent also accepts the previous batched-v1 completion format.
 Round-trip duration includes the AVR phases; these overlapping spans must not be
 summed. AVR span placement is reconstructed from Linux receipt time and does not
 provide synchronized hardware timestamps. Install backend telemetry support
