@@ -328,3 +328,19 @@ test('three providers share one bounded exporter with one shutdown', async () =>
   assert.equal(shutdowns, 1);
   assert.deepEqual(new Set(spans.map(span => span.resource.attributes['service.name'])), new Set(['res-ac-backend', 'res-ac-agent', 'res-ac-avr']));
 });
+
+
+test('batched command phase durations validate and retain the correct component', async t => {
+  const f = await fixture(t), value = batch();
+  const names = ['command.journal', 'command.notify', 'bridge.roundtrip', 'avr.fetch', 'avr.safety'];
+  value.events = names.map(name => ({name, traceparent: newTraceparent(), durationMs: 17, ageMs: 0,
+    attributes: {'command.type': 'device.ping', 'command.source': 'manual', outcome: 'ok'}}));
+  assert.equal((await f.request('/api/devices/board/telemetry', value)).status, 200);
+  await Promise.all(Object.values(f.obs.providers).map(provider => provider.forceFlush()));
+  for (const name of names) {
+    const span = f.exporter.getFinishedSpans().find(span => span.name === name);
+    assert.ok(span);
+    assert.equal(span.resource.attributes['service.name'], name.startsWith('avr.') ? 'res-ac-avr' : 'res-ac-agent');
+    assert.ok(f.logs.some(log => log.operation === name));
+  }
+});

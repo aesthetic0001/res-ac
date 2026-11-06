@@ -20,7 +20,7 @@ const parentContext = value => validTraceparent(value) ? trace.setSpanContext(RO
   traceId: value.slice(3, 35), spanId: value.slice(36, 52), traceFlags: 1, isRemote: true
 }) : ROOT_CONTEXT;
 export const eventNames = new Set(['reading.collect', 'command.local', 'http.request', 'sensor.read', 'bridge.dispatch', 'bridge.collect', 'bridge.error', 'reading.buffer', 'reading.drop',
-  'http.device', 'command.execute', 'avr.execute', 'telemetry.drop']);
+  'http.device', 'command.execute', 'command.journal', 'command.notify', 'bridge.roundtrip', 'avr.fetch', 'avr.safety', 'avr.execute', 'telemetry.drop']);
 const attributeNames = new Set(['reading.id', 'command.id', 'command.type', 'command.source', 'outcome', 'curl.code', 'http.status_code', 'request.kind', 'error.kind', 'avr.uptime_ms']);
 const validCommandType = value => typeof value === 'string' && /^[a-zA-Z][a-zA-Z0-9_.-]{0,63}$/.test(value);
 const commandPayloadFields = {
@@ -230,7 +230,7 @@ export class Observability {
     for (const metric of deviceMetricNames) this.deviceValues.remove({ device, metric });
     for (const [metric, number] of Object.entries(value.metrics)) this.deviceValues.set({ device, metric }, number);
     for (const event of value.events) {
-      const attributes = { ...event.attributes, 'device.id': device, 'device.session': value.session, 'timing.approximate': true, component: ['sensor.read', 'avr.execute'].includes(event.name) ? 'avr' : 'agent' };
+      const attributes = { ...event.attributes, 'device.id': device, 'device.session': value.session, 'timing.approximate': true, component: ['sensor.read', 'avr.execute', 'avr.fetch', 'avr.safety'].includes(event.name) ? 'avr' : 'agent' };
       this.record(event.name, event.traceparent, Date.now() - event.ageMs - event.durationMs, event.durationMs, attributes, event.spanId);
       const outcome = deviceOutcomes.includes(attributes.outcome) ? attributes.outcome : 'other';
       this.deviceEvents.inc({ device, operation: event.name, outcome });

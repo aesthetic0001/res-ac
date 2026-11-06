@@ -8,6 +8,10 @@
 
 // Seeeduino Cloud v1.0: Linux GPIO21 -> TXS0102 -> PB2/MOSI (PCINT2).
 // This is NOT the D7 handshake connection found on the original Arduino Yun.
+#ifndef RESAC_BATCHED_COMMANDS
+#define RESAC_BATCHED_COMMANDS 1
+#endif
+
 #ifndef RESAC_COMMAND_GPIO
 #define RESAC_COMMAND_GPIO 1
 #endif
@@ -47,20 +51,26 @@ unsigned long sensorAttempts = 0;
 unsigned long sensorErrors = 0;
 unsigned long lastHousekeepingMs = 0;
 char lastCommandId[37] = {0};
-char lastCommandReply[128] = {0};
+char lastCommandReply[176] = {0};
 FanState fan;
 const char *fanControlSource = "reset";
 char fanSession[33] = {0};
 unsigned long fanRevision = 0;
 unsigned long lastFanHeartbeatMs = 0;
 char fanHeartbeat[16] = {0};
+char controlSession[33] = {0};
+bool fanControlValid = false;
 
 bool validEpoch(const char *epoch);
+bool parseNumber(const char *, unsigned long, unsigned long &, uint8_t base = 10);
+void serviceCommandNotification();
+bool commandExecuting = false;
+bool commandNotificationsReady = false;
 
 void publishValue(const char *key, const char *value) {
   // Retain a snapshot for reconnects, then notify connected Linux clients.
   Bridge.put(key, value);
-  char event[176];
+  char event[224];
   const int length = snprintf(event, sizeof(event), "v1,%s,%s", key, value);
   if (length > 0 && static_cast<size_t>(length) < sizeof(event))
     Mailbox.writeMessage(reinterpret_cast<const uint8_t *>(event), length);
@@ -74,6 +84,7 @@ void publishFanState() {
 }
 
 void invalidateFan() {
+  fanControlValid = false;
   fan.reset();
   fanControlSource = "reset";
   fanSession[0] = '\0';
@@ -84,6 +95,37 @@ void invalidateFan() {
 }
 
 void updateFan() {
+#if RESAC_BATCHED_COMMANDS
+  // One atomic, agent-owned context replaces independent safety/session reads.
+  char context[56] = {0};
+  const unsigned int length = Bridge.get("resac_fan_control", context, sizeof(context) - 1);
+  char *save = nullptr;
+  char *version = strtok_r(context, ",", &save);
+  char *session = strtok_r(nullptr, ",", &save);
+  char *heartbeat = strtok_r(nullptr, ",", &save);
+  unsigned long number;
+  if (length >= sizeof(context) - 1 || !version || strcmp(version, "v1") != 0 ||
+      !session || !validEpoch(session) || !parseNumber(heartbeat, 0xffffffffUL, number) ||
+      !number || strlen(heartbeat) > 10 ||
+      (strlen(heartbeat) == 10 && strcmp(heartbeat, "4294967295") > 0) ||
+      strspn(heartbeat, "0123456789") != strlen(heartbeat) || strtok_r(nullptr, ",", &save)) {
+    fanControlValid = false;
+    if (fan.calibrated()) invalidateFan();
+    return;
+  }
+  const bool changed = strcmp(session, controlSession) != 0;
+  if (changed) {
+    // A new agent epoch invalidates calibration and all commands from the old one.
+    fan.reset(); fanControlSource = "reset"; ++fanRevision;
+    strcpy(controlSession, session); strcpy(fanSession, session); fanHeartbeat[0] = '\0';
+  }
+  if (strcmp(heartbeat, fanHeartbeat) != 0) {
+    strcpy(fanHeartbeat, heartbeat); lastFanHeartbeatMs = millis();
+  }
+  fanControlValid = fanSession[0] && static_cast<unsigned long>(millis() - lastFanHeartbeatMs) <= 10000;
+  if (!fanControlValid && fan.calibrated()) { invalidateFan(); return; }
+  if (changed) { publishValue("resac_fan_session", fanSession); publishFanState(); }
+#else
   char invalidate[4] = {0};
   Bridge.get("resac_fan_invalidate", invalidate, sizeof(invalidate) - 1);
   if (strcmp(invalidate, "1") == 0) {
@@ -102,9 +144,10 @@ void updateFan() {
     Bridge.get("resac_fan_session", session, sizeof(session) - 1);
     if (validEpoch(session)) { strcpy(fanSession, session); ++fanRevision; publishFanState(); }
   }
+#endif
 }
 
-bool parseNumber(const char *text, unsigned long limit, unsigned long &value, uint8_t base = 10) {
+bool parseNumber(const char *text, unsigned long limit, unsigned long &value, uint8_t base) {
   if (!text || !*text || *text == '-' || *text == '+' || *text == ' ') return false;
   char *end = nullptr;
   value = strtoul(text, &end, base);
@@ -166,9 +209,11 @@ bool validCommandId(const char *id) {
 }
 
 void processCommand() {
+  const unsigned long fetchStarted = millis();
   char frame[128] = {0};
   Bridge.get("resac_command", frame, sizeof(frame) - 1);
-  // One atomic request; v1 ping remains compatible with the original agent.
+  const unsigned long fetchDuration = millis() - fetchStarted;
+  // One atomic request; the batched completion requires the matching agent.
   const bool control = strncmp(frame, "v3,", 3) == 0;
   const bool levelControl = strncmp(frame, "v4,", 3) == 0;
   if (!control && !levelControl && strncmp(frame, "v1,", 3) != 0) return;
@@ -200,10 +245,16 @@ void processCommand() {
   if (strcmp(id, lastCommandId) != 0) {
     // Fast command checks must still see pending invalidation and fresh agent
     // heartbeats before authorizing an action, independently of housekeeping.
+    const unsigned long safetyStarted = millis();
     if (control || levelControl) updateFan();
+    const unsigned long safetyDuration = millis() - safetyStarted;
     const unsigned long executionStarted = millis();
     if (control || levelControl) {
-      if (!fanSession[0] || strcmp(session, fanSession) != 0 ||
+      if (
+#if RESAC_BATCHED_COMMANDS
+          !fanControlValid ||
+#endif
+          !fanSession[0] || strcmp(session, fanSession) != 0 ||
           !fanHeartbeat[0] || static_cast<unsigned long>(millis() - lastFanHeartbeatMs) > 10000 ||
           (!calibrate && !fan.calibrated())) {
         snprintf(lastCommandReply, sizeof(lastCommandReply), "v3,%s,rejected,%s", id, session);
@@ -227,12 +278,24 @@ void processCommand() {
       Serial.println(F("Ping handled by Arduino; replying pong"));
     }
     strcpy(lastCommandId, id);
+#if RESAC_BATCHED_COMMANDS
+    // Retain and push one versioned completion, including the legacy reply and
+    // bounded phase durations. No separate diagnostic round trips delay success.
+    char prefix[48];
+    const int size = snprintf(prefix, sizeof(prefix), "v5,%lu,%lu,%lu,", fetchDuration,
+                              safetyDuration, static_cast<unsigned long>(millis() - executionStarted));
+    const size_t replyLength = strlen(lastCommandReply);
+    if (size <= 0 || static_cast<size_t>(size) >= sizeof(prefix) ||
+        static_cast<size_t>(size) + replyLength >= sizeof(lastCommandReply)) return;
+    memmove(lastCommandReply + size, lastCommandReply, replyLength + 1);
+    memcpy(lastCommandReply, prefix, size);
+#else
     char diagnostic[72];
     snprintf(diagnostic, sizeof(diagnostic), "v1,%s,%lu,%s", id,
              static_cast<unsigned long>(millis() - executionStarted),
              strstr(lastCommandReply, ",rejected,") ? "failed" : "ok");
-    // Publish diagnostics before the acknowledgment; retries retain both.
     publishValue("resac_command_diagnostic", diagnostic);
+#endif
     publishValue("resac_command_result", lastCommandReply);
   }
   // Repeated deliveries keep the original retained response without executing
@@ -301,6 +364,67 @@ void publishSensorDiagnostic(const char *epoch, unsigned long duration, bool ok)
   publishValue("resac_sensor_diagnostic", frame);
 }
 
+#if RESAC_BATCHED_COMMANDS
+struct SensorPublication {
+  char epoch[33];
+  unsigned long duration, sampledAt;
+  long temperatureMilli, humidityMilli;
+  uint8_t stage;
+  bool valid;
+} sensorPublication = {};
+
+void publishSample() {
+  // Each stage returns to the main loop. Commands run between background
+  // exchanges without nested command execution or retaining large stack frames.
+  SensorPublication &sample = sensorPublication;
+  switch (sample.stage) {
+    case 0: {
+      memset(sample.epoch, 0, sizeof(sample.epoch));
+      Bridge.get("resac_epoch", sample.epoch, sizeof(sample.epoch) - 1);
+      const unsigned long started = millis();
+      ++sensorAttempts;
+      const float humidity = dht.readHumidity(), temperature = dht.readTemperature();
+      sample.duration = millis() - started; sample.sampledAt = millis();
+      sample.valid = !isnan(humidity) && !isnan(temperature) && humidity >= 0 && humidity <= 100 &&
+                     temperature >= -80 && temperature <= 150;
+      if (!sample.valid) ++sensorErrors;
+      else {
+        sample.temperatureMilli = lround(temperature * 1000.0f);
+        sample.humidityMilli = lround(humidity * 1000.0f);
+        if (validEpoch(sample.epoch)) ++sequence;
+        Serial.print(F("Temperature: ")); Serial.print(temperature, 1);
+        Serial.print(F(" C; humidity: ")); Serial.print(humidity, 1); Serial.println(F(" %"));
+      }
+      sample.stage = 1;
+      break;
+    }
+    case 1:
+      publishSensorDiagnostic(sample.epoch, sample.duration, sample.valid);
+      sample.stage = 2;
+      break;
+    case 2:
+      publishValue("resac_sensor_status", !sample.valid ? "read_error" :
+                   validEpoch(sample.epoch) ? "ok" : "waiting_for_agent");
+      sample.stage = sample.valid && validEpoch(sample.epoch) ? 3 : 0;
+      break;
+    case 3: {
+      char frame[112];
+      snprintf(frame, sizeof(frame), "v1,%s,%lu,%ld,%ld,%lu", sample.epoch, sequence,
+               sample.temperatureMilli, sample.humidityMilli, sample.sampledAt);
+      publishValue("resac_sample", frame);
+      sample.stage = 4;
+      break;
+    }
+    default: {
+      char status[48] = {0};
+      Bridge.get(sample.stage == 4 ? "resac_upload_status" : "resac_command_status", status, sizeof(status) - 1);
+      if (status[0]) { Serial.print(sample.stage == 4 ? F("Uploader: ") : F("Commands: ")); Serial.println(status); }
+      sample.stage = sample.stage == 4 ? 5 : 0;
+      break;
+    }
+  }
+}
+#else
 void publishSample() {
   char epoch[33] = {0};
   Bridge.get("resac_epoch", epoch, sizeof(epoch) - 1);
@@ -347,9 +471,12 @@ void publishSample() {
     Serial.println(commandStatus);
   }
 }
+#endif
 } // namespace
 
 void setup() {
+  commandNotificationsReady = false;
+  controlSession[0] = 0;
   Serial.begin(115200);
   dht.begin();
   IrSender.begin();
@@ -384,15 +511,22 @@ void setup() {
   }
   publishValue("resac_command_notify", "gpio21-pb2-v1");
 #endif
+#if RESAC_BATCHED_COMMANDS
+  publishValue("resac_command_protocol", "batched-v1");
+#else
+  publishValue("resac_command_protocol", "");
+#endif
   publishValue("resac_command_ready", "v4");
   publishValue("resac_events", "v1");
   Serial.println(F("Bridge ready; DHT11 on digital pin 3"));
   Serial.println(F("IR on digital pin 9; calibration required before sending"));
   lastSampleMs = millis() - DEFAULT_INTERVAL_MS;
+  commandNotificationsReady = true;
 }
 
-void loop() {
-  processSerial();
+namespace {
+void serviceCommandNotification() {
+  if (commandExecuting || !commandNotificationsReady) return;
 #if RESAC_COMMAND_GPIO
   bool wake;
   bool pending;
@@ -406,24 +540,43 @@ void loop() {
   if (!pending) commandLowHandled = false;
   if (pending && (wake || !commandLowHandled)) {
     commandLowHandled = pending;
+    commandExecuting = true;
     processCommand();
+    commandExecuting = false;
   }
 #else
   const unsigned long commandNow = millis();
   if (static_cast<unsigned long>(commandNow - lastCommandCheckMs) >= COMMAND_CHECK_MS) {
     lastCommandCheckMs = commandNow;
+    commandExecuting = true;
     processCommand();
+    commandExecuting = false;
   }
 #endif
+}
+} // namespace
+
+void loop() {
+  processSerial();
+  serviceCommandNotification();
   // Recheck time after command execution, which can include physical IR dwell.
   const unsigned long now = millis();
   if (static_cast<unsigned long>(now - lastHousekeepingMs) >= HOUSEKEEPING_MS) {
     lastHousekeepingMs = now;
     updateInterval();
+    serviceCommandNotification();
     updateFan();
+    serviceCommandNotification();
   }
+#if RESAC_BATCHED_COMMANDS
+  if (sensorPublication.stage || static_cast<unsigned long>(millis() - lastSampleMs) >= intervalMs) {
+    if (!sensorPublication.stage) lastSampleMs = millis();
+    publishSample();
+  }
+#else
   if (static_cast<unsigned long>(now - lastSampleMs) >= intervalMs) {
     lastSampleMs = now;
     publishSample();
   }
+#endif
 }

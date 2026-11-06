@@ -135,3 +135,40 @@ TCP Nagle and avoiding buffered stdin did not materially reduce that hardware
 latency. Electrical voltage measurements, physical IR behavior, and worst-case
 boot/programming timing were not measured by these tests. The tests used temporary firmware and agent code; the permanent device
 configuration was preserved.
+
+## Batched command protocol
+
+The default sketch advertises `resac_command_protocol=batched-v1` and requires
+this version of the agent. Build with `-DRESAC_BATCHED_COMMANDS=0` for the previous
+safety/completion format; the new agent also supports older event sketches.
+
+The agent writes one `resac_fan_control` snapshot:
+`v1,<32-hex-session>,<nonzero-uint32-heartbeat>`. Its session rotates on agent
+initialization, Bridge reconnect, or invalidation. The AVR reads that snapshot
+once before fan commands and during housekeeping. A different session clears
+calibration. Re-reading an unchanged heartbeat never refreshes the watchdog,
+and a timed-out session cannot be reinstated by re-reading its old snapshot.
+Missing/malformed snapshots reject actions. Linux requires the AVR to confirm
+its new session before accepting physical commands. The 10-second heartbeat
+limit, session checks, command journal, duplicate IDs, and IR dwell remain.
+
+A completion retains and pushes a single `resac_command_result` value:
+`v5,<fetch-ms>,<safety-ms>,<execution-ms>,<legacy-reply>`. This carries the matching
+command ID in the embedded reply, cutting diagnostic/result publication from
+four UART exchanges to two. Reconnects retain the same reply and duplicate
+notifications do not repeat an action. Old unwrapped replies are rejected when
+the batched capability is present.
+
+Sensor publication advances through bounded stages, returning to the command
+loop between ordered diagnostic, status, sample, and console-status exchanges.
+Commands are also checked between configuration and safety housekeeping. Each
+retained value and its pushed event remain together. Commands never run inside
+a background publication stack frame, during setup, or recursively.
+
+Phase telemetry adds `command.journal`, `command.notify` (queue to confirmed GPIO
+assertion), `bridge.roundtrip` (assertion to Linux completion), `avr.fetch`, and
+`avr.safety`. `avr.execute` retains its existing action/state-publication scope.
+Round-trip duration includes the AVR phases; these overlapping spans must not be
+summed. AVR span placement is reconstructed from Linux receipt time and does not
+provide synchronized hardware timestamps. Install backend telemetry support
+before the matching agent/sketch so complete telemetry batches remain valid.
