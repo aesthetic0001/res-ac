@@ -136,15 +136,15 @@ export class Store {
     return this.command(id);
   }
   command(id) { return this.db.prepare('SELECT * FROM commands WHERE id=?').get(id); }
-  claim(deviceId, leaseMs) {
+  claim(deviceId, leaseMs, transport = 'poll') {
     const now = Date.now();
     this.expire(now);
     // Preserve device command order until the first command completes or expires.
     const command = this.db.prepare("SELECT * FROM commands WHERE device_id=? AND status IN ('pending','inflight') ORDER BY created_at,rowid LIMIT 1").get(deviceId);
     if (!command || (command.status === 'inflight' && command.lease_until > now)) return null;
-    return this.lease(command, leaseMs, now);
+    return this.lease(command, leaseMs, now, transport);
   }
-  lease(command, leaseMs, now) {
+  lease(command, leaseMs, now, transport = 'poll') {
     if (!command.traceparent && this.observability) {
       command.traceparent = this.observability.currentTraceparent();
       this.db.prepare('UPDATE commands SET traceparent=? WHERE id=?').run(command.traceparent, command.id);
@@ -160,7 +160,8 @@ export class Store {
           this.observability.queueTime.observe({ device: command.device_id }, (now - command.created_at) / 1000);
         }
         this.observability.record('command.delivery', command.traceparent, now, 0,
-          { ...attributes, 'delivery.attempt': command.attempts + 1, 'command.age_ms': now - command.created_at });
+          { ...attributes, 'delivery.attempt': command.attempts + 1, 'delivery.transport': transport,
+            'command.age_ms': now - command.created_at });
       });
     }
     return this.commandValue(command);
@@ -192,10 +193,10 @@ export class Store {
         // A lost response must recover this same handoff, including after restart.
         const command = this.command(previous.next_id), now = Date.now();
         if (command?.device_id === deviceId && command.status === 'inflight' && command.expires_at > now) {
-          next = command.lease_until > now ? this.commandValue(command) : this.lease(command, leaseMs, now);
+          next = command.lease_until > now ? this.commandValue(command) : this.lease(command, leaseMs, now, 'result_retry');
         }
       } else if (!previous && !result.duplicate) {
-        next = allowClaim ? this.claim(deviceId, leaseMs) : null;
+        next = allowClaim ? this.claim(deviceId, leaseMs, 'result') : null;
         // Persist an empty decision too: a duplicate must not claim another action.
         this.db.prepare('INSERT INTO command_handoffs(previous_id,next_id) VALUES(?,?)').run(id, next?.id ?? null);
       }

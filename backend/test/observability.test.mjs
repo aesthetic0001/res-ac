@@ -204,6 +204,7 @@ test('a result handoff keeps the next command context and observes its delivery 
   await f.obs.provider.forceFlush();
   const delivered=f.exporter.getFinishedSpans().filter(s=>s.name==='command.delivery'&&s.attributes['command.id']===second.id);
   assert.equal(delivered.length,1);
+  assert.equal(delivered[0].attributes['delivery.transport'],'result');
   assert.equal(delivered[0].spanContext().traceId,second.traceparent.slice(3,35));
   const result=f.exporter.getFinishedSpans().find(s=>s.name==='command.result');
   assert.equal(result.spanContext().traceId,first.traceparent.slice(3,35));
