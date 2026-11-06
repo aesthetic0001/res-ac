@@ -105,6 +105,11 @@ class BridgeTiming(object):
         def stored(original):
             def put(key, value):
                 result = original(key, value)
+                if key == 'resac_timing_arm' and value == '1':
+                    owner.sent.clear(); owner.pending.clear(); owner.command = None
+                    owner.trace.arm()
+                elif key == 'resac_timing_dump' and value == '1':
+                    owner.trace.request_dump()
                 if owner.trace.active and key == 'resac_command':
                     ident = command_id(value)
                     if ident:

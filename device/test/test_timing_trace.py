@@ -123,6 +123,15 @@ reader.process()
             self.assertEqual(result.stdout,b'FRAME\n')
             self.assertEqual(json.loads(output.read_text()),{'vendorJson':True})
 
+    def test_uart_control_markers_arm_and_freeze_both_capture_endpoints(self):
+        trace=timing.TimingTrace()
+        trace.record('uart.frame_end')
+        trace.request_dump()
+        self.assertTrue(trace.arm())
+        self.assertFalse(trace.dump_requested)
+        self.assertFalse(trace.events)
+        self.assertTrue(trace.active)
+
     def test_clock_failure_freezes_diagnostics_without_raising_into_control(self):
         def failed():
             raise OSError('clock unavailable')
@@ -230,6 +239,15 @@ class BridgeTimingTests(unittest.TestCase):
         self.assertTrue(self.events('bridge.client_closed'))
         self.assertFalse(self.events('bridge.socket_flushed'))
         self.assertFalse(self.hooks.pending)
+
+    def test_explicit_uart_markers_reset_and_freeze_bridge_capture(self):
+        self.trace.record('uart.frame_end')
+        self.mailbox.data_store_put('resac_timing_arm','1')
+        self.assertTrue(self.trace.active)
+        self.assertFalse(self.trace.events)
+        self.mailbox.data_store_put('resac_timing_dump','1')
+        self.assertFalse(self.trace.active)
+        self.assertTrue(self.trace.dump_requested)
 
     def test_bad_crc_is_reported_without_changing_original_result(self):
         self.assertFalse(self.packet.CRC().check(False))

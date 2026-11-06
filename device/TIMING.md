@@ -19,9 +19,12 @@ diagnostic firmware image; rebuild without that flag before a normal release.
 The build records sixteen fixed-size rows in SRAM with no dynamic allocation.
 Serial output occurs only on an explicit dump, outside command execution.
 
-1. After startup, send `timing arm` over USB serial.
+1. After startup, send `timing arm` over USB serial. It resets both Linux RAM
+   captures through an explicit diagnostic marker and arms the AVR buffer.
 2. Submit one normal backend `device.ping` command and wait for its result.
-3. Send `timing dump` before arming another capture.
+3. Send `timing dump`. It freezes both Linux captures and prints the AVR rows.
+   Export is once per process/output path; restart the diagnostic processes with
+   new paths before another full capture.
 
 The header identifies the FNV-1a 32-bit hash of the accepted command UUID, count,
 and dropped trace rows. Rows are `T <event> <tag> <micros32>`. A hash is a capture

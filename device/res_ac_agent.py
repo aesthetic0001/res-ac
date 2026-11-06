@@ -453,7 +453,8 @@ class BridgeEvents(object):
                       'resac_command_result', 'resac_command_diagnostic', 'resac_fan_state',
                       'resac_fan_session', 'resac_fan_heartbeat', 'resac_fan_invalidate',
                       'resac_command', 'resac_command_status', 'resac_upload_status',
-                      'resac_command_notify', 'resac_command_protocol', 'resac_fan_control'])
+                      'resac_command_notify', 'resac_command_protocol', 'resac_fan_control',
+                      'resac_timing_arm', 'resac_timing_dump'])
 
     def __init__(self, host='127.0.0.1', port=5700, command_gpio=None, timing=None):
         self.host, self.port = host, port
@@ -642,6 +643,12 @@ class BridgeEvents(object):
         if len(fields) != 3 or fields[0] != 'v1' or fields[1] not in self.keys:
             return
         key, value = fields[1:]
+        if self.timing and value == '1' and key in ('resac_timing_arm', 'resac_timing_dump'):
+            if key == 'resac_timing_arm':
+                self.timing.arm()
+            else:
+                self.timing.request_dump()
+            return
         if self.timing and key == 'resac_command_result':
             from timing_trace import command_id
             self.timing.record('agent.completion_received', packet=self.receive_sequence,

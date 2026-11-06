@@ -95,6 +95,15 @@ class TimingTrace(object):
             return
         self.events.append((stamp, event, packet, tag, value, command))
 
+    def arm(self):
+        if self.exported:
+            return False
+        self.events.clear()
+        self.dropped = self.clock_errors = 0
+        self.dump_requested = False
+        self.active = True
+        return True
+
     def request_dump(self):
         # Signal handlers only freeze the buffer; no I/O or serialization here.
         self.active = False

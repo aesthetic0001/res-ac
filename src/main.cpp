@@ -383,10 +383,11 @@ void processSerial() {
     line[used] = '\0';
 #if RESAC_COMMAND_TIMING
     if (strcmp(line, "timing arm") == 0) {
-      commandTiming.arm(); Serial.println(F("TIMING armed")); used = 0; overflow = false; continue;
+      commandTiming.arm(); publishValue("resac_timing_arm", "1"); Serial.println(F("TIMING armed")); used = 0; overflow = false; continue;
     }
     if (strcmp(line, "timing dump") == 0) {
       commandTiming.stop();
+      publishValue("resac_timing_dump", "1");
       // Dump only on operator request, after execution; never write from the ISR.
       Serial.print(F("TIMING v1 micros32 resolution_us=4 id_hash=")); Serial.print(commandTiming.idHash);
       Serial.print(F(" count=")); Serial.print(commandTiming.count);
