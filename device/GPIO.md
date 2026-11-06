@@ -186,3 +186,9 @@ Only one telemetry request runs at a time; successful requests drain full waitin
 batches, while partial batches keep the 15-second heartbeat. Failed batches retain
 their identity and backoff deadline even when more events arrive. This uses the
 existing event-loop wake-up deadline and preserves the 128-event RAM bound.
+
+The UART wait helper reads at most 64 available bytes at once, then supplies the
+vendor packet reader one byte at a time from RAM. This removes per-byte system
+calls without changing packet parsing, CRC checks, ACKs, or the 50 ms deadline
+when waiting for a new byte. Read-ahead belongs to one processor/stream and UART
+readiness retains priority over TCP work.
