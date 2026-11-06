@@ -20,7 +20,7 @@ const parentContext = value => validTraceparent(value) ? trace.setSpanContext(RO
   traceId: value.slice(3, 35), spanId: value.slice(36, 52), traceFlags: 1, isRemote: true
 }) : ROOT_CONTEXT;
 export const eventNames = new Set(['reading.collect', 'command.local', 'http.request', 'sensor.read', 'bridge.dispatch', 'bridge.collect', 'bridge.error', 'reading.buffer', 'reading.drop',
-  'http.device', 'command.execute', 'command.journal', 'command.notify', 'bridge.roundtrip', 'avr.fetch', 'avr.safety', 'avr.execute', 'telemetry.drop']);
+  'http.device', 'command.execute', 'command.decode', 'command.journal', 'command.notify', 'bridge.roundtrip', 'avr.fetch', 'avr.safety', 'avr.execute', 'telemetry.drop']);
 const attributeNames = new Set(['reading.id', 'command.id', 'command.type', 'command.source', 'outcome', 'curl.code', 'http.status_code', 'request.kind', 'error.kind', 'avr.uptime_ms']);
 const validCommandType = value => typeof value === 'string' && /^[a-zA-Z][a-zA-Z0-9_.-]{0,63}$/.test(value);
 const commandPayloadFields = {
@@ -40,6 +40,8 @@ const diagnosticRules = {
 };
 for (const phase of ['dns', 'connect', 'tls', 'first_byte', 'total'])
   diagnosticRules[`http.timing.${phase}_ms`] = value => payloadNumber(value, 0, 86400_000);
+for (const phase of ['http.agent.prepare_ms', 'http.agent.consume_ms', 'http.agent.ipc_wait_ms', 'command.final_journal_ms'])
+  diagnosticRules[phase] = value => payloadNumber(value, 0, 86400_000);
 for (const prefix of ['network.', 'network.start.']) {
   diagnosticRules[`${prefix}ipv4_default_route`] = value => ['present', 'absent', 'unknown'].includes(value);
   diagnosticRules[`${prefix}interface_state`] = value => ['up', 'down', 'dormant', 'notpresent', 'lowerlayerdown', 'testing', 'unknown'].includes(value);
@@ -77,6 +79,7 @@ function logLevel(value) {
 export const deviceMetricNames = new Set(['cpu_ratio', 'memory_available_bytes', 'memory_total_bytes', 'agent_rss_bytes',
   'uptime_seconds', 'disk_free_bytes', 'sensor_errors_total', 'sensor_sample_age_seconds', 'buffer_depth', 'readings_dropped_total', 'telemetry_dropped_total', 'telemetry_queue_depth']);
 const commandPhases = {
+  'command.timing.decode_ms': 'command.decode',
   'command.timing.journal_ms': 'command.journal', 'command.timing.notify_ms': 'command.notify',
   'command.timing.roundtrip_ms': 'bridge.roundtrip', 'command.timing.fetch_ms': 'avr.fetch',
   'command.timing.safety_ms': 'avr.safety'

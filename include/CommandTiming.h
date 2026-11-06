@@ -10,7 +10,7 @@
 
 struct CommandTiming {
   enum Event : uint8_t { IRQ = 1, ENTER, UART_BEGIN, UART_END, ACTION_BEGIN, ACTION_END, COMPLETE };
-  enum Tag : uint8_t { OTHER = 0, COMMAND, SAFETY, RESULT, DIAGNOSTIC, MAILBOX };
+  enum Tag : uint8_t { OTHER = 0, COMMAND, SAFETY, RESULT, DIAGNOSTIC, MAILBOX, ATOMIC_PUBLICATION };
   struct Row { uint32_t us; uint8_t event, tag; } __attribute__((packed));
   static const uint8_t capacity = 16;
   Row rows[capacity];

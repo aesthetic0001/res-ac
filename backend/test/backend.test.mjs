@@ -10,6 +10,7 @@ import { Store } from '../src/store.mjs';
 import { createApp } from '../src/app.mjs';
 import { hashPassword } from '../src/auth.mjs';
 import { publicIp } from '../deploy/setup.mjs';
+import { encodeCommand, commandMediaType } from '../src/command-wire.mjs';
 
 let passwordHash;
 // Ephemeral test-only credentials: nothing usable is embedded in the repository.
@@ -340,4 +341,126 @@ test('reading history averages the full window into bounded chronological points
   assert.ok(result.readings.length <= 600);
   assert.ok(result.sampleCount > 3500);
   assert.ok(result.readings.every(point => point.temperatureC < 30 && point.humidity < 50));
+});
+
+for (const format of ['', '?format=binary-v1']) test('enqueue and waiting claim commit atomically before any device response ' + format, async t => {
+  const f = await fixture(t, { pollWaitMs: 5000, leaseMs: 10_000 }), auth = await f.login();
+  let ready;
+  const waiting = new Promise(resolve => { ready = resolve; });
+  const claim = f.store.claim.bind(f.store);
+  f.store.claim = (...args) => { const result = claim(...args); if (!result) ready(); return result; };
+  const poll = f.request('/api/devices/board-1/commands' + format, { headers: f.deviceHeaders });
+  await waiting;
+  const exec = f.store.db.exec.bind(f.store.db), calls = [];
+  let fail = true;
+  f.store.db.exec = sql => {
+    calls.push(sql);
+    if (sql === 'COMMIT' && fail) { fail = false; throw new Error('Injected commit failure'); }
+    return exec(sql);
+  };
+  const post = () => f.request('/api/admin/devices/board-1/commands', { method: 'POST',
+    headers: { cookie: auth.cookie, 'x-csrf-token': auth.csrf, 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'device.ping', payload: {}, ttlSeconds: 60 }) });
+  assert.equal((await post()).status, 500);
+  assert.equal(f.store.db.prepare('SELECT count(*) n FROM commands').get().n, 0);
+  assert.deepEqual(calls, ['BEGIN IMMEDIATE', 'COMMIT', 'ROLLBACK']);
+  assert.equal(await Promise.race([poll.then(() => 'delivered'), sleep(25).then(() => 'waiting')]), 'waiting');
+  calls.length = 0;
+  const queued = await (await post()).json();
+  const response = await poll;
+  if (format) {
+    assert.equal(response.headers.get('content-type'), commandMediaType);
+    const saved = f.store.command(queued.id);
+    const expected = { commands: [{ id: saved.id, type: saved.type, payload: JSON.parse(saved.payload),
+      createdAt: new Date(saved.created_at).toISOString(), expiresAt: new Date(saved.expires_at).toISOString() }] };
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), encodeCommand(expected));
+  } else assert.equal((await response.json()).commands[0].id, queued.id);
+  assert.equal(f.store.command(queued.id).status, 'inflight');
+  assert.equal(f.store.command(queued.id).attempts, 1);
+  assert.deepEqual(calls, ['BEGIN IMMEDIATE', 'COMMIT']);
+  assert.equal(f.store.db.prepare('PRAGMA synchronous').get().synchronous, 2);
+});
+
+test('presence and result persistence share one commit and retry safely after rollback', async t => {
+  const f = await fixture(t), auth = await f.login(), queued = await f.enqueue(auth);
+  assert.equal((await f.request('/api/devices/board-1/commands', { headers: f.deviceHeaders })).status, 200);
+  const exec = f.store.db.exec.bind(f.store.db), calls = [];
+  let fail = true;
+  f.store.db.exec = sql => {
+    calls.push(sql);
+    if (sql === 'COMMIT' && fail) { fail = false; throw new Error('Injected commit failure'); }
+    return exec(sql);
+  };
+  const post = () => f.request(`/api/devices/board-1/commands/${queued.id}/result`, {
+    method: 'POST', headers: f.deviceHeaders, body: JSON.stringify({ status: 'succeeded', result: { reply: 'pong' } }) });
+  const before = f.store.db.prepare('SELECT last_seen FROM devices WHERE id=?').get('board-1').last_seen;
+  const now = Date.now() + 5001;
+  t.mock.method(Date, 'now', () => now);
+  assert.equal((await post()).status, 500);
+  assert.equal(f.store.command(queued.id).status, 'inflight');
+  assert.equal(f.store.db.prepare('SELECT last_seen FROM devices WHERE id=?').get('board-1').last_seen, before);
+  assert.equal(f.store.device('board-1').last_seen, now);
+  assert.deepEqual(calls, ['BEGIN IMMEDIATE', 'COMMIT', 'ROLLBACK']);
+  calls.length = 0;
+  assert.equal((await post()).status, 200);
+  assert.equal(f.store.command(queued.id).status, 'succeeded');
+  assert.deepEqual(calls, ['BEGIN IMMEDIATE', 'COMMIT']);
+});
+
+test('transaction observers run only after successful durable commit', () => {
+  const store = new Store(':memory:', [{ id: 'board', token: firstDeviceToken }]);
+  const events = [];
+  store.observability = {
+    currentTraceparent: () => '00-' + 'a'.repeat(32) + '-' + 'b'.repeat(16) + '-01',
+    record: name => events.push(name), queueTime: { observe: () => events.push('queueMetric') }
+  };
+  try {
+    assert.throws(() => store.transaction(() => {
+      store.enqueue('board', 'device.ping', {}, 60); store.claim('board', 10_000);
+      assert.deepEqual(events, []); throw new Error('Rollback');
+    }), /Rollback/);
+    assert.deepEqual(events, []);
+    assert.equal(store.db.prepare('SELECT count(*) n FROM commands').get().n, 0);
+    store.transaction(() => {
+      store.enqueue('board', 'device.ping', {}, 60); store.claim('board', 10_000);
+      assert.deepEqual(events, []);
+    });
+    assert.deepEqual(events, ['command.queue_wait', 'queueMetric', 'command.delivery']);
+    assert.throws(() => store.transaction(async () => {}), /synchronous/);
+    assert.equal(store.db.prepare('PRAGMA synchronous').get().synchronous, 2);
+  } finally { store.close(); }
+});
+
+test('presence remains live while disk writes coalesce, roll back, and handle clock changes', t => {
+  let now=100_000;
+  t.mock.method(Date,'now',()=>now);
+  const store=new Store(':memory:',[{id:'board',token:firstDeviceToken}]);
+  const persisted=()=>store.db.prepare('SELECT last_seen FROM devices WHERE id=?').get('board').last_seen;
+  const changes=()=>store.db.prepare('SELECT total_changes() n').get().n;
+  try {
+    store.seen('board');assert.equal(persisted(),100_000);
+    const before=changes();
+    now+=100;store.seen('board');
+    assert.equal(changes(),before);
+    assert.equal(store.device('board').last_seen,now);
+    assert.equal(store.snapshot().devices[0].lastSeen,new Date(now).toISOString());
+    now=105_000;store.seen('board');assert.equal(persisted(),105_000);
+    now=110_000;
+    assert.throws(()=>store.transaction(()=>{store.seen('board');throw new Error('rollback');}),/rollback/);
+    assert.equal(persisted(),105_000);assert.equal(store.device('board').last_seen,110_000);
+    now=110_001;store.seen('board');assert.equal(persisted(),now);
+    now=109_000;store.seen('board');assert.equal(persisted(),now);
+  } finally {store.close();}
+});
+
+test('clean shutdown persists the latest coalesced presence without changing command durability', t => {
+  let now=100_000;t.mock.method(Date,'now',()=>now);
+  const directory=mkdtempSync(join(tmpdir(),'presence-test-')),path=join(directory,'state.sqlite');
+  const store=new Store(path,[{id:'board',token:firstDeviceToken}]);
+  store.seen('board');now+=10;store.seen('board');store.close();
+  const reopened=new Store(path);
+  try {
+    assert.equal(reopened.device('board').last_seen,now);
+    assert.equal(reopened.db.prepare('PRAGMA synchronous').get().synchronous,2);
+  } finally {reopened.close();rmSync(directory,{recursive:true,force:true});}
 });

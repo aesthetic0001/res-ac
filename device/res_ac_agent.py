@@ -190,6 +190,8 @@ def load_config(path):
     interval = config.get('interval_seconds', 10)
     if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not 2 <= interval <= 3600:
         raise ValueError('Invalid reporting interval')
+    if not isinstance(config.get('native_bridge', False), bool):
+        raise ValueError('native_bridge must be a boolean')
     limit = config.get('queue_limit', 100)
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
         raise ValueError('Invalid queue limit')
@@ -454,10 +456,11 @@ class BridgeEvents(object):
                       'resac_fan_session', 'resac_fan_heartbeat', 'resac_fan_invalidate',
                       'resac_command', 'resac_command_status', 'resac_upload_status',
                       'resac_command_notify', 'resac_command_protocol', 'resac_fan_control',
-                      'resac_timing_arm', 'resac_timing_dump'])
+                      'resac_timing_arm', 'resac_timing_dump', 'resac_native_bridge'])
 
-    def __init__(self, host='127.0.0.1', port=5700, command_gpio=None, timing=None):
-        self.host, self.port = host, port
+    def __init__(self, host='127.0.0.1', port=None, command_gpio=None, timing=None, native=False):
+        self.host, self.port = host, (5701 if native else 5700) if port is None else port
+        self.native = native
         self.connection = None
         self.connecting = False
         self.ready = False
@@ -559,7 +562,11 @@ class BridgeEvents(object):
             self.cancel_command()
 
     def _queue(self, value):
-        encoded = encode_json(value).encode('utf-8')
+        if self.native:
+            from native_bridge_protocol import encode
+            encoded = encode(value)
+        else:
+            encoded = encode_json(value).encode('utf-8')
         if len(self.outgoing) + len(encoded) > 8192:
             self._disconnect()
             raise IOError('Bridge write queue is full')
@@ -623,6 +630,8 @@ class BridgeEvents(object):
                     log('Bridge event firmware is required; waiting for matching firmware')
                     self.firmware_warning = True
                 raise ValueError('Matching event firmware is required')
+            if self.native and values.get('resac_native_bridge') != 'v1':
+                raise ValueError('Native Bridge capability is required')
             self.values = {}
             for key, value in values.items():
                 self._update(key, value)
@@ -675,6 +684,21 @@ class BridgeEvents(object):
                 self._sample(True)
 
     def _receive(self, block):
+        if self.native:
+            from native_bridge_protocol import decode, MAX_FRAME
+            self.incoming.extend(block)
+            if len(self.incoming) > MAX_FRAME + 4 + 4096:
+                raise ValueError('Native Bridge receive queue too large')
+            while len(self.incoming) >= 4:
+                length = struct.unpack('!I', bytes(self.incoming[:4]))[0]
+                if not 0 < length <= MAX_FRAME:
+                    raise ValueError('Native Bridge frame too large')
+                if len(self.incoming) < 4 + length:
+                    break
+                frame = bytes(self.incoming[4:4+length])
+                del self.incoming[:4+length]
+                self._message(decode(frame))
+            return
         # Frame concatenated JSON objects without relying on JSONDecoder, which
         # is missing from the board's legacy JSON module. Decode only full UTF-8.
         for char in block:
@@ -735,6 +759,8 @@ class BridgeEvents(object):
                         select.select([], [], [], max(0, min(timeout, self.retry_at - monotonic())))
                     return
                 self.connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                if self.native:
+                    self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.connection.setblocking(False)
                 code = self.connection.connect_ex((self.host, self.port))
                 if code not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
@@ -812,6 +838,7 @@ class Telemetry(object):
         self.dropped = 0
         self.request = None
         self.batch = None
+        self.encoding = self.prepared_payload = None
         self.next_due = 0
         self.backoff = 5
         self.previous_cpu = None
@@ -895,6 +922,7 @@ class Telemetry(object):
             if self.request is not None:
                 self.request.close()
             self.request = None
+            self.encoding = self.prepared_payload = None
             self.next_due = monotonic() + self.backoff
             self.backoff = min(self.backoff * 2, 60)
 
@@ -913,6 +941,13 @@ class Telemetry(object):
                 self.request.close()
                 self.request = None
         if monotonic() < self.next_due:
+            return
+        if self.encoding is not None:
+            encoded = self.encoding.step()
+            if encoded is not None:
+                payload = self.prepared_payload
+                self.encoding = self.prepared_payload = None
+                self.request = CurlUpload(self.config, payload, route='telemetry', timeout=10, encoded_body=encoded)
             return
         if self.batch is None:
             self.sensor()
@@ -934,9 +969,15 @@ class Telemetry(object):
         if self.last_sample_at is not None:
             metrics['sensor_sample_age_seconds'] = max(0, now - self.last_sample_at)
         payload = dict(self.batch, metrics=metrics, events=[event for event in events if event['ageMs'] <= 604800000])
-        self.request = CurlUpload(self.config, payload, route='telemetry', timeout=10)
+        if self.config.get('native_bridge', False):
+            from cooperative_json import Encoding
+            self.encoding, self.prepared_payload = Encoding(payload), payload
+            self.next_due = monotonic()  # Ready work on the existing selector, no added timer.
+        else:
+            self.request = CurlUpload(self.config, payload, route='telemetry', timeout=10)
 
     def close(self):
+        self.encoding = self.prepared_payload = None
         if self.request is not None:
             self.request.close()
 
@@ -1006,6 +1047,10 @@ def curl_diagnostics(output, errors, code):
                     attributes['http.timing.' + name + '_ms'] = seconds * 1000
             except ValueError:
                 pass
+    return curl_error_status(status, attributes, errors, code)
+
+
+def curl_error_status(status, attributes, errors, code):
     if code or not status or status >= 400:
         message = errors[:4096].decode('utf-8', 'replace').lower()
         # Only transport errors use these phrases: HTTP response text is never read.
@@ -1040,8 +1085,10 @@ class HttpResult(object):
         self.status = 0
         self.connections = 0
         self.output = b''
+        self.timings = (0, 0, 0, 0, 0)
         self.errors = b''
         self.body = b''
+        self.received_at = None
         self.local_error = False
 
 
@@ -1084,14 +1131,14 @@ class HttpTransport(object):
         finally:
             child.close()
 
-    def submit(self, route, parent, payload, method, timeout):
+    def submit(self, route, parent, payload, method, timeout, encoded_body=None):
         if len(self.pending) >= 4:
             raise IOError('All HTTP request slots are occupied')
         if self.connection is None:
             self._start()
         self.serial = self.serial % 0xffffffff + 1
         result = HttpResult(self.serial)
-        body = encode_json(payload) if payload is not None else b''
+        body = encoded_body if encoded_body is not None else (encode_json(payload) if payload is not None else b'')
         if isinstance(body, text_type):
             body = body.encode('utf-8')
         if len(body) > 32768 or method not in ('GET', 'POST') or not 1 <= timeout <= 60:
@@ -1099,7 +1146,26 @@ class HttpTransport(object):
         message = b'Q' + struct.pack('!II', result.id, timeout) + (b'G' if method == 'GET' else b'P')
         self._queue(message + self.field(route) + self.field(parent) + self.field(body))
         self.pending[result.id] = result
+        # Start network work before the caller runs background telemetry/fan work.
+        # One nonblocking send is enough; backpressure stays with the selector.
+        try:
+            self._flush()
+        except (IOError, OSError):
+            self._failed()
         return result
+
+    def _flush(self):
+        if self.connection is None or not self.outgoing:
+            return
+        try:
+            sent = self.connection.send(self.outgoing)
+        except (IOError, OSError) as error:
+            if getattr(error, 'errno', None) in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+                return
+            raise
+        if sent == 0:
+            raise IOError('HTTP helper closed')
+        self.outgoing = self.outgoing[sent:]
 
     def cancel(self, result):
         if result.id not in self.pending:
@@ -1130,11 +1196,11 @@ class HttpTransport(object):
             if result.completed:
                 raise ValueError('Duplicate HTTP completion')
             result.code, result.status, result.connections = code, status, connections
-            result.output = ('%d ' % status + ' '.join('%.6f' % (value / 1000000.0)
-                                                     for value in fields[5:10])).encode('ascii')
+            result.timings = fields[5:10]
             result.errors = {1: b'Connection refused', 2: b'Network is unreachable', 3: b'No route to host',
                              4: b'Connection reset', 5: b'Broken pipe'}.get(reason, b'')
             result.body = frame[44:]
+            result.received_at = monotonic()
             result.completed = True
 
     def _failed(self):
@@ -1175,10 +1241,7 @@ class HttpTransport(object):
                 if connection in errors:
                     raise IOError('HTTP helper connection failed')
                 if connection in writable:
-                    sent = connection.send(self.outgoing)
-                    if sent == 0:
-                        raise IOError('HTTP helper closed')
-                    self.outgoing = self.outgoing[sent:]
+                    self._flush()
                 if connection in readable:
                     block = connection.recv(65536)
                     if not block:
@@ -1204,15 +1267,17 @@ def request_completed(request):
 
 class CurlUpload(object):
     """HTTP attempt backed by the shared helper, or standalone curl for probes."""
-    def __init__(self, config, payload=None, route='readings', method='POST', timeout=25):
+    def __init__(self, config, payload=None, route='readings', method='POST', timeout=25, encoded_body=None, journal_ms=None):
         self.process = None
         self.files = []
         self.transport = config.get('_http')
         self.result = None
         self.telemetry = config.get('_telemetry')
         self.started = monotonic()
+        self.prepared_at, self.journal_ms = None, journal_ms
         self.reported = False
-        self.kind = 'result' if route.endswith('/result') else route
+        path = route.split('?', 1)[0]
+        self.kind = 'result' if path.endswith('/result') else path
         self.network_start = {}
         if self.telemetry is not None:
             try:
@@ -1227,7 +1292,8 @@ class CurlUpload(object):
         self.request_traceparent = self.parent if self.root_request else traceparent(self.parent)
         try:
             if self.transport is not None:
-                self.result = self.transport.submit(route, self.request_traceparent, payload, method, timeout)
+                self.result = self.transport.submit(route, self.request_traceparent, payload, method, timeout, encoded_body=encoded_body)
+                self.prepared_at = monotonic()
                 return
             header_fd, header_path = temporary('res-ac-curl-')
             self.files.append(header_path)
@@ -1249,8 +1315,10 @@ class CurlUpload(object):
             if payload is not None:
                 payload_fd, payload_path = temporary('res-ac-payload-')
                 self.files.append(payload_path)
-                with os.fdopen(payload_fd, 'w') as stream:
-                    stream.write(encode_json(payload))
+                with os.fdopen(payload_fd, 'wb') as stream:
+                    body = encoded_body if encoded_body is not None else encode_json(payload)
+                    if isinstance(body, text_type): body = body.encode('utf-8')
+                    stream.write(body)
                 arguments += ['--data-binary', '@' + payload_path]
             self.process = subprocess.Popen(arguments,
                                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1258,6 +1326,7 @@ class CurlUpload(object):
             # must not block the control loop while writing a subprocess pipe.
             self.process.stdin.close()
             self.process.stdin = None
+            self.prepared_at = monotonic()
         except BaseException:
             self._report(0, 0, {'error.reason': 'request_setup', 'error.stage': 'local'})
             self.close()
@@ -1276,6 +1345,17 @@ class CurlUpload(object):
         outcome = ('ok' if 200 <= status < 300 else 'failed') if not code else {6: 'dns', 7: 'connect', 28: 'timeout', 35: 'tls', 60: 'tls'}.get(code, 'other')
         attributes = {'outcome': outcome, 'curl.code': code, 'http.status_code': status, 'request.kind': self.kind}
         attributes.update(diagnostics or {})
+        ended = monotonic()
+        prepared = getattr(self, 'prepared_at', None)
+        received = getattr(getattr(self, 'result', None), 'received_at', None)
+        if prepared is not None:
+            attributes['http.agent.prepare_ms'] = max(0, (prepared - self.started) * 1000)
+        if received is not None:
+            attributes['http.agent.consume_ms'] = max(0, (ended - received) * 1000)
+            if prepared is not None and 'http.timing.total_ms' in attributes:
+                attributes['http.agent.ipc_wait_ms'] = max(0, (received - prepared) * 1000 - attributes['http.timing.total_ms'])
+        if getattr(self, 'journal_ms', None) is not None:
+            attributes['command.final_journal_ms'] = self.journal_ms
         if outcome != 'ok':
             try:
                 attributes.update(('network.start.' + key, value) for key, value in getattr(self, 'network_start', {}).items())
@@ -1290,11 +1370,14 @@ class CurlUpload(object):
         if self.result is not None:
             if not self.result.completed:
                 raise RuntimeError('HTTP request has not completed')
-            output, errors, code = self.result.output, self.result.errors, self.result.code
+            code = self.result.code
+            diagnostics = dict(('http.timing.' + name + '_ms', value / 1000.0)
+                               for name, value in zip(['dns', 'connect', 'tls', 'first_byte', 'total'], self.result.timings))
+            status, diagnostics = curl_error_status(self.result.status, diagnostics, self.result.errors, code)
         else:
             output, errors = self.process.communicate()
             code = self.process.returncode
-        status, diagnostics = curl_diagnostics(output, errors, code)
+            status, diagnostics = curl_diagnostics(output, errors, code)
         if (self.result is not None and code == 28 and not self.result.connections and
                 not diagnostics.get('http.timing.connect_ms') and not diagnostics.get('http.timing.tls_ms')):
             # Reused connections have zero connect/TLS milestones. Those zeros
@@ -1514,7 +1597,7 @@ class FanReporter(object):
         heartbeat_due = monotonic() >= self.next_due
         if isinstance(self.bridge, BridgeEvents):
             version = (self.bridge.version('resac_command_ready', 'resac_fan_session', 'resac_fan_state'),
-                       encode_json(self.automation.snapshot()) if self.automation else None)
+                       self.automation.snapshot() if self.automation else None)
             changed = finished or version != self.bridge_version
             self.bridge_version = version
         else:
@@ -1583,6 +1666,7 @@ class CommandProcessor(object):
         self.reply = None
         self.cached = None
         self.persisted = False
+        self.final_journal_ms = 0
         self.retry_at = 0
         self.backoff = 1
         self.bridge_due = 0
@@ -1694,7 +1778,9 @@ class CommandProcessor(object):
             os.close(directory)
 
     def _save(self):
+        started = monotonic()
         self._write_state(self.reply)
+        self.final_journal_ms = max(0, (monotonic() - started) * 1000)
         self.cached = self.reply
         self.persisted = True
         try:
@@ -1702,10 +1788,11 @@ class CommandProcessor(object):
         except Exception:
             pass
 
-    def _accept(self, command):
+    def _accept(self, command, started_at=None):
         if not isinstance(command, dict) or not re.match(COMMAND_ID, command.get('id', '')):
             raise ValueError('Invalid command ID')
         self.backoff = 1
+        self.final_journal_ms = 0
         if self.cached and self.cached['id'] == command['id']:
             self.reply = self.cached
             self.persisted = True
@@ -1714,7 +1801,7 @@ class CommandProcessor(object):
         self.avr_phases = None
         self.avr_state = None
         self.phase_timings = {}
-        self.execution_started = monotonic()
+        self.execution_started = monotonic() if started_at is None else started_at
         self.bridge_failed_reported = False
         if not re.match(TRACEPARENT, command.get('traceparent', '')):
             command['traceparent'] = traceparent()
@@ -1919,11 +2006,19 @@ class CommandProcessor(object):
                         log('Command result no longer accepted (HTTP %d)' % status)
                         self._status('result rejected HTTP=%d' % status)
                 elif status == 200:
-                    value = decode_json(body.decode('utf-8'))
+                    accepted_at = monotonic()
+                    if self.config.get('native_bridge', False) and body.startswith(b'RAC1'):
+                        from command_wire import decode
+                        value = decode(body)
+                    else:
+                        value = decode_json(body.decode('utf-8'))
+                    decoded_at = monotonic()
                     commands = value.get('commands')
                     if not isinstance(commands, list) or len(commands) != 1:
                         raise ValueError('Expected one command')
-                    self._accept(commands[0])
+                    self._accept(commands[0], started_at=accepted_at)
+                    if self.current is not None:
+                        self.phase_timings['command.timing.decode_ms'] = max(0, (decoded_at - accepted_at) * 1000)
                 elif status == 204:
                     self.backoff = 1
                 else:
@@ -1943,14 +2038,15 @@ class CommandProcessor(object):
                     self._save()
                 payload = dict(status=self.reply['status'], result=self.reply['result'], traceparent=self.reply.get('traceparent') or traceparent())
                 self.request = CurlUpload(self.config, payload,
-                                          route='commands/%s/result' % self.reply['id'])
+                                          route='commands/%s/result' % self.reply['id'], journal_ms=self.final_journal_ms)
                 self.request_kind = 'result'
             else:
                 if self.bridge.get('resac_command_ready') not in ('v1', 'v2', 'v3', 'v4'):
                     self.retry_at = monotonic() + 2
                     return
                 # Server waits 30 seconds; leave 5 seconds for transport overhead.
-                self.request = CurlUpload(self.config, route='commands', method='GET', timeout=35)
+                route = 'commands?format=binary-v1' if self.config.get('native_bridge', False) else 'commands'
+                self.request = CurlUpload(self.config, route=route, method='GET', timeout=35)
                 self.request_kind = 'poll'
         except Exception as error:
             self._failed_request(error)
@@ -1993,7 +2089,8 @@ class AutoController(object):
         return self.runner is not None
 
     def snapshot(self):
-        return dict(self.settings, status=self.status, targetLevel=self.target, minAdjustmentSeconds=30)
+        return dict(self.settings, thresholdsC=list(self.settings['thresholdsC']),
+                    status=self.status, targetLevel=self.target, minAdjustmentSeconds=30)
 
     def configure(self, payload):
         settings = validate_curve(payload)
@@ -2137,7 +2234,9 @@ def next_wakeup(bridge, telemetry, commands, automation, fan_reporter, pending, 
 
 
 def run(config):
-    bridge = config.get('_bridge') or BridgeEvents(command_gpio=CommandGPIO(), timing=config.get('_timing_trace'))
+    native = config.get('native_bridge', False)
+    bridge = config.get('_bridge') or BridgeEvents(port=5701 if native else 5700, native=native,
+                                                   command_gpio=CommandGPIO(), timing=config.get('_timing_trace'))
     config['_bridge'] = bridge
     http = config.get('_http') or HttpTransport(config)
     config['_http'] = http

@@ -279,7 +279,8 @@ test('device, AVR and backend spans share one trace with server requests nested 
   assert.equal(byName['http.device'].spanContext().spanId, client.slice(36, 52));
   assert.equal(byName['http.device'].parentSpanContext.spanId, root.slice(36, 52));
   assert.equal(byName['http.server'].parentSpanContext.spanId, byName['http.device'].spanContext().spanId);
-  assert.equal(byName['db.reading'].parentSpanContext.spanId, byName['http.server'].spanContext().spanId);
+  assert.equal(byName['db.transaction'].parentSpanContext.spanId, byName['http.server'].spanContext().spanId);
+  assert.equal(byName['db.reading'].parentSpanContext.spanId, byName['db.transaction'].spanContext().spanId);
   assert.equal(byName['http.device'].kind, 2); // CLIENT
   assert.equal(byName['http.server'].kind, 1); // SERVER
   assert.ok(f.logs.some(log => log.operation === 'sensor.read' && log.service === 'res-ac-avr'));
@@ -297,9 +298,11 @@ test('command result persistence remains beneath the result-upload server span',
   const server = spans.find(span => span.name === 'http.server');
   const result = spans.find(span => span.name === 'command.result');
   const db = spans.find(span => span.name === 'db.result');
+  const transaction = spans.find(span => span.name === 'db.transaction' && span.parentSpanContext?.spanId === result.spanContext().spanId);
   assert.equal(server.parentSpanContext.spanId, client.slice(36, 52));
   assert.equal(result.parentSpanContext.spanId, server.spanContext().spanId);
-  assert.equal(db.parentSpanContext.spanId, result.spanContext().spanId);
+  assert.ok(transaction);
+  assert.equal(db.parentSpanContext.spanId, transaction.spanContext().spanId);
   for (const span of spans.filter(span => ['command.queue_wait', 'command.delivery', 'command.result'].includes(span.name))) {
     assert.deepEqual(JSON.parse(span.attributes['command.payload']), payload);
   }
@@ -349,13 +352,29 @@ test('compact command timing fields expand only on the backend and deduplicate a
   const f=await fixture(t), value=batch();
   value.events=[{name:'command.execute',traceparent:newTraceparent(),durationMs:400,ageMs:0,
     attributes:{'command.type':'device.ping',outcome:'succeeded','command.timing.fetch_ms':30,
-      'command.timing.safety_ms':0,'command.timing.notify_ms':80,'command.timing.roundtrip_ms':300}}];
+      'command.timing.safety_ms':0,'command.timing.notify_ms':80,'command.timing.roundtrip_ms':300,
+      'command.timing.decode_ms':20}}];
   assert.equal((await f.request('/api/devices/board/telemetry',value)).status,200);
   assert.equal((await f.request('/api/devices/board/telemetry',value)).status,200);
   await Promise.all(Object.values(f.obs.providers).map(provider=>provider.forceFlush()));
-  for(const name of ['command.execute','avr.fetch','avr.safety','command.notify','bridge.roundtrip'])
+  for(const name of ['command.execute','command.decode','avr.fetch','avr.safety','command.notify','bridge.roundtrip'])
     assert.equal(f.exporter.getFinishedSpans().filter(span=>span.name===name).length,1);
   for(const invalid of [-1,86400_001,NaN,'30'])
     assert.equal(validateTelemetry({...value,events:[{...value.events[0],attributes:{'command.timing.fetch_ms':invalid}}]}),false);
   assert.equal(validateTelemetry({...value,events:[{...value.events[0],name:'reading.buffer'}]}),false);
+});
+
+test('compact agent and final-journal phases stay bounded on existing HTTP events', () => {
+  const value=batch();
+  const phases=['http.agent.prepare_ms','http.agent.consume_ms','http.agent.ipc_wait_ms','command.final_journal_ms'];
+  for (const key of phases) {
+    value.events[0].attributes={outcome:'ok','request.kind':'result',[key]:25};
+    assert.equal(validateTelemetry(value),true);
+    for (const invalid of [-1,NaN,Infinity,86400_001,'secret']) {
+      value.events[0].attributes[key]=invalid;
+      assert.equal(validateTelemetry(value),false);
+    }
+  }
+  value.events[0]={...value.events[0],name:'command.execute',attributes:{outcome:'ok','http.agent.prepare_ms':10}};
+  assert.equal(validateTelemetry(value),false);
 });

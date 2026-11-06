@@ -57,13 +57,25 @@ class FirmwareSchedulingTests(unittest.TestCase):
             ''',
             'Bridge.h': r'''
                 #pragma once
+                #include <cassert>
                 #include <map>
                 #include <string>
                 #include <cstring>
                 struct TestBridge {
                   std::map<std::string,std::string> values;
                   std::map<std::string,int> reads;
+                  unsigned int transfers = 0;
+                  bool nativeAck = true;
                   void begin() {}
+                  unsigned int transfer(const uint8_t *prefix, unsigned int prefixSize,
+                      const uint8_t *value, unsigned int size, uint8_t *reply, unsigned int replySize) {
+                    assert(prefix[0] == 'B' && prefix[prefixSize-1] == 0xfe && replySize == 1);
+                    ++transfers;
+                    std::string key(reinterpret_cast<const char *>(prefix+1), prefixSize-2);
+                    if (nativeAck) values[key] = std::string(reinterpret_cast<const char *>(value), size);
+                    reply[0] = nativeAck ? 1 : 0;
+                    return 1;
+                  }
                   void put(const char *key, const char *value) { values[key] = value; }
                   unsigned int get(const char *key, char *buffer, unsigned int length) {
                     ++reads[key];
@@ -134,7 +146,7 @@ class FirmwareSchedulingTests(unittest.TestCase):
               #if RESAC_BATCHED_COMMANDS
               sensorPublication.stage=0;
               #endif
-              controlSession[0] = 0; fanControlValid = false; fanControlSource="reset";
+              controlSession[0] = 0; fanControlValid = false; fanControlSource="reset"; nativeBridge=false; Bridge.transfers=0; Bridge.nativeAck=true;
               #if RESAC_COMMAND_GPIO
               PINB = _BV(PB2); commandWake = commandLowHandled = false;
               #else
@@ -184,6 +196,16 @@ class FirmwareSchedulingTests(unittest.TestCase):
                 #else
                 assert(false);
                 #endif
+              } else if (mode == "native") {
+                nativeBridge = true;
+                publishValue("resac_command_result", "v6,matching-completion");
+                assert(Bridge.transfers == 1);
+                assert(Bridge.values["resac_command_result"] == "v6,matching-completion");
+                assert(Mailbox.messages.empty());
+                Bridge.nativeAck = false;
+                publishValue("resac_sensor_status", "ok");
+                assert(!nativeBridge && Bridge.values["resac_sensor_status"] == "ok");
+                assert(Mailbox.messages.size() == 1);
               } else if (mode == "boot") {
                 #if RESAC_COMMAND_GPIO
                 PINB = 0; power(); setup();
@@ -411,3 +433,6 @@ class FirmwareSchedulingTests(unittest.TestCase):
 
     def test_opt_in_timing_captures_irq_handler_and_uart_without_recursive_work(self):
         subprocess.run([self.timing_binary, 'timing'], check=True)
+
+    def test_native_publication_is_one_exchange_and_legacy_fallback_retains_state(self):
+        subprocess.run([self.batched_binary, 'native'], check=True)
