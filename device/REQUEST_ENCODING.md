@@ -70,3 +70,57 @@ diagnostic drops in binary mode, and no more than 5% regression in ordinary
 100-ping durable p95. Check restart/downgrade recovery and fresh reports before
 merging or permanently deploying. Encoder speed alone cannot satisfy this gate
 or establish that the system is network bound.
+
+
+## Live trial outcome (2026-11-06)
+
+Rejected as a latency optimization; do not permanently deploy this experiment.
+The repeated comparison used the same RAM-only agent/helper and backend image,
+changing only negotiated format advertisement. Each mode ran two sets of five
+24-ping bursts (240 pings per mode), plus 100 ordinary pings. Every measured
+command succeeded on its first attempt. Server logs verified the intended body
+format and successful telemetry responses. No readings were dropped.
+
+| Measure | JSON control | Binary trial |
+| --- | ---: | ---: |
+| Median 24-ping burst completion, 10 bursts | 4,616.5 ms | 4,472 ms |
+| p95 gap between completions, 230 gaps | 243 ms | 221 ms |
+| Diagnostic events dropped during measured bursts | 144 | 0 |
+| Ordinary durable completion median, 100 pings | 183.87 ms | 180.72 ms |
+| Ordinary durable completion p95, 100 pings | 240.16 ms | 241.91 ms |
+
+Median burst completion improved 3.13% and p95 completion gap improved 9.05%,
+below the required 20% each. Ordinary durable p95 increased 0.73%, within its
+5% regression limit. The first burst pair's 21.5% p95-gap improvement did not
+repeat; pooled results govern the decision. Burst statistics use server
+completion timestamps. Ordinary durable figures use paired traces through the
+end of the backend result response after transaction commit; neither is a
+measurement of dashboard rendering or receipt of the result acknowledgment on
+the device. Tail percentiles are calculated from samples, not added together.
+
+The on-board encoder CPU improvement and elimination of diagnostic drops are
+real, but they did not translate into a qualifying command-latency reduction.
+Global CPU still reached saturation briefly during binary bursts. The final
+binary repeat grew the already warm WAL by 8,240 bytes; the other measured
+phases retained its allocation. This is not a cold-WAL comparison.
+
+Paired ordinary traces put warm HTTP transport, excluding server processing,
+at about 48–49 ms median per round trip in both modes. Combined SQLite
+transaction time remained about 50–51 ms median per command; agent command
+execution remained about 40 ms median, including the nested Bridge round trip
+of about 20 ms. These measurements overlap and must not be summed as independent
+phases. They do not establish that the application is network bound.
+
+During rollback maintenance, isolated Python 2.7.3 measurements on the board
+found network diagnostics at 2.45 ms per call (200 samples), the small vendor
+JSON writer at 2.79 ms (200), and trace-parent creation at 0.69 ms (1,000).
+The coarse live 10-ms prepare spans alone overstated the likely benefit of
+moving any one of those operations into C.
+
+Backend format switches and a downgrade to the accepted backend recovered fresh
+reports and commands. The accepted backend image, installed device runtime,
+and exact original AVR application were restored; trial files were removed
+from device RAM. The latest command journal was retained, Wi-Fi recovery files
+were preserved, and calibration recovery sent no physical IR. The draft is
+closed without merging. The protocol and tests remain on the experiment branch
+as evidence for future work.
