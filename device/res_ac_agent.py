@@ -1045,6 +1045,10 @@ def curl_diagnostics(output, errors, code):
                     attributes['http.timing.' + name + '_ms'] = seconds * 1000
             except ValueError:
                 pass
+    return curl_error_status(status, attributes, errors, code)
+
+
+def curl_error_status(status, attributes, errors, code):
     if code or not status or status >= 400:
         message = errors[:4096].decode('utf-8', 'replace').lower()
         # Only transport errors use these phrases: HTTP response text is never read.
@@ -1079,6 +1083,7 @@ class HttpResult(object):
         self.status = 0
         self.connections = 0
         self.output = b''
+        self.timings = (0, 0, 0, 0, 0)
         self.errors = b''
         self.body = b''
         self.received_at = None
@@ -1170,8 +1175,7 @@ class HttpTransport(object):
             if result.completed:
                 raise ValueError('Duplicate HTTP completion')
             result.code, result.status, result.connections = code, status, connections
-            result.output = ('%d ' % status + ' '.join('%.6f' % (value / 1000000.0)
-                                                     for value in fields[5:10])).encode('ascii')
+            result.timings = fields[5:10]
             result.errors = {1: b'Connection refused', 2: b'Network is unreachable', 3: b'No route to host',
                              4: b'Connection reset', 5: b'Broken pipe'}.get(reason, b'')
             result.body = frame[44:]
@@ -1347,11 +1351,14 @@ class CurlUpload(object):
         if self.result is not None:
             if not self.result.completed:
                 raise RuntimeError('HTTP request has not completed')
-            output, errors, code = self.result.output, self.result.errors, self.result.code
+            code = self.result.code
+            diagnostics = dict(('http.timing.' + name + '_ms', value / 1000.0)
+                               for name, value in zip(['dns', 'connect', 'tls', 'first_byte', 'total'], self.result.timings))
+            status, diagnostics = curl_error_status(self.result.status, diagnostics, self.result.errors, code)
         else:
             output, errors = self.process.communicate()
             code = self.process.returncode
-        status, diagnostics = curl_diagnostics(output, errors, code)
+            status, diagnostics = curl_diagnostics(output, errors, code)
         if (self.result is not None and code == 28 and not self.result.connections and
                 not diagnostics.get('http.timing.connect_ms') and not diagnostics.get('http.timing.tls_ms')):
             # Reused connections have zero connect/TLS milestones. Those zeros

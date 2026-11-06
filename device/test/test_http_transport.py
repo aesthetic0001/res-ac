@@ -145,6 +145,17 @@ class PersistentHttpTests(unittest.TestCase):
             self.assertEqual(request.finish()[0],201)
         self.assertEqual(self.received[0][3],payload)
 
+    def test_native_completion_keeps_binary_timings_without_text_roundtrip(self):
+        telemetry=agent.Telemetry(self.config);self.config['_telemetry']=telemetry
+        with patch.object(agent,'curl_diagnostics',side_effect=AssertionError('Native timings reparsed as text')):
+            request=self.upload({'readingId':'binary-timings'})
+            self.completed(request)
+            self.assertEqual(request.finish()[0],201)
+        attrs=telemetry.events[-1]['attributes']
+        self.assertGreater(attrs['http.timing.total_ms'],0)
+        self.assertEqual(attrs['http.timing.total_ms'],request.result.timings[-1]/1000.0)
+        self.assertGreaterEqual(attrs['http.agent.consume_ms'],0)
+
     def test_held_poll_does_not_block_upload_and_completion_wakes_wait(self):
         poll = self.upload(route='commands', method='GET', timeout=5)
         reading = self.upload(dict(readingId='concurrent', traceparent=agent.traceparent()))
