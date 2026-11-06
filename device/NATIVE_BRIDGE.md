@@ -86,9 +86,13 @@ recovery, malformed limits, native agent GPIO confirmation, and the actual sketc
 The C service also runs under address/undefined-behavior sanitizers. Live latency
 and fault/recovery acceptance are required before enabling a permanent rollout.
 
-Native-mode telemetry encodes at most 512 bytes per event-loop iteration before
-returning to HTTP/Bridge readiness and command handling. The completed JSON body
+Native-mode telemetry yields after a five-millisecond work budget or 512 bytes
+before returning to HTTP/Bridge readiness and command handling. It caches at
+most 64 short dictionary keys per batch. The completed JSON body
 uses the existing HTTP helper protocol. Failed batches keep their identity and
 backoff. Fan-report change detection compares snapshots without serializing JSON
 on idle ticks. The daemon opens its log after backgrounding, so runtime errors
 remain available for diagnosis.
+
+Native clients also negotiate bounded binary command HTTP responses; older
+servers can return JSON. See [measured performance and response format](NETWORK_PERFORMANCE.md).

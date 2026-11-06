@@ -1,114 +1,128 @@
 # Software latency objective
 
-The target is to make the avoidable software cost smaller than the measured
-network contribution on the deployed device, under both ordinary operation and
-command bursts. A percentage improvement alone does not establish that target.
-Report individual command phases, warm/cold connections, failures, queue drops,
-and tail latency. Required physical IR transmission/dwell and DHT sampling time
-must remain visible separately; removing those requirements is not an optimization.
+The target is to make avoidable software cost smaller than the measured network
+contribution on the deployed device, under ordinary operation and command bursts.
+Percentage improvement alone does not establish that target. Physical IR dwell
+and DHT sampling must remain visible separately. Network-bound completion has
+not yet been demonstrated; burst profiling and further residual work remain.
 
-The previous deployed release is `38c125f`. Its matched acceptance run recorded
-40 pings, five calibrations, and four level commands. Ping median/p95 was
-537/866 ms; the complete 49-command run was 558/874 ms. The backend's active TCP
-connections measured 47–69 ms smoothed RTT with observed minima of 44–45 ms.
-One client TCP connection measured 47 ms to establish, corroborating that order.
+## Production trial, 2026-11-06
 
-The correlated 40 ping traces show remaining median software costs:
+The previous release is `38c125f`. The accepted candidate runtime is `86e27a9`
+with backend code from `5def7b8`. The following independent runs use real
+production commands and sensor uploads. Each command succeeded on its first
+attempt. The fan runs contain five calibrations and levels 1, 2, 1, off.
 
-| Measurement | Median | p95 |
+| Stored completion time | Commands | Median | p95 |
+| --- | ---: | ---: | ---: |
+| Previous release, sequential pings | 100 | 543.5 ms | 856 ms |
+| Native Bridge + cooperative telemetry | 100 | 246.5 ms | 327 ms |
+| Grouped durable transactions | 100 | 198.5 ms | 276 ms |
+| Binary command responses | 100 | 169 ms | 268 ms |
+| Bounded telemetry + immediate HTTP submission | 100 | 154.5 ms | 220 ms |
+| Previous release, calibration/levels | 9 | 747 ms | 1096 ms |
+| Final candidate, calibration/levels | 9 | 243 ms | 431 ms |
+
+Final ping p95 is 74.3% lower than the matched previous-release run, exceeding
+the deployment's 20% acceptance threshold. This is an intermediate improvement,
+not proof that the software is network-bound. Network jitter and storage latency
+vary between runs, so intermediate differences cannot all be attributed to code.
+
+For the final 100 pings, completion through the final durable backend commit
+measured **176.68 ms median / 246.11 ms p95**. The paired result curl duration
+minus server processing was **48.47 / 78.86 ms**. This is a transport estimate,
+not an exact packet measurement. TCP's observed minimum RTT was about 44–47 ms;
+reused connections avoid repeated DNS, TCP and TLS setup.
+
+| Final candidate phase | Median | p95 |
 | --- | ---: | ---: |
-| Agent command execution | 280 ms | 620 ms |
-| Datastore put → GPIO assertion, included above | 60 ms | 160 ms |
-| GPIO → consumed completion, included above | 210 ms | 520 ms |
-| AVR command fetch, included in round trip | 31 ms | 49 ms |
+| Device command handling, including body decoding | 40 ms | 60 ms |
+| Datastore put to GPIO assertion, included above | 10 ms | 20 ms |
+| GPIO to consumed completion, included above | 20 ms | 30 ms |
+| AVR fetch, included in round trip | 3 ms | 4 ms |
 | Actual AVR ping action, included in round trip | 0 ms | 1 ms |
-| SQLite enqueue/claim/seen/result durations per command | 89 ms | 183 ms |
-| Agent result HTTP duration minus libcurl duration | 34 ms | 301 ms |
+| Each backend durable transaction, two per command | 22.09 ms | 58.93 ms |
+| Final device journal | 10 ms | 20 ms |
+| HTTP agent preparation | 10 ms | 10 ms |
+| HTTP helper/selector work outside curl | 0.60 ms | 9.85 ms |
 
-These overlap and their percentiles cannot be added. Result POSTs took a median
-98 ms inside curl including backend work. Long-poll waiting is not network RTT.
-The reported end-to-end measure starts at backend enqueue and ends at the stored
-result timestamp; browser/dashboard latency and the final response's return to
-the device are outside that measure. Device telemetry uses a coarse monotonic
-clock on the old board, so detailed captures must report clock resolution.
+These phases overlap; their medians and percentiles must not be summed. The
+old board's Python monotonic fallback has 10 ms resolution: a reported zero
+is not proof of zero work. A separate on-board 100-iteration benchmark measured
+JSON command decoding at 32–33.4 ms and binary decoding at 4.3–6.0 ms.
 
-The next candidate adds the opt-in [native Bridge](NATIVE_BRIDGE.md). It replaces
-Python UART/JSON processing on the command path with bounded native framing and
-one atomic retained-publication exchange. Live acceptance and recovery evidence
-are pending. Further work must follow measured residuals, including agent
-serialization/scheduling and backend durable writes; network-bound completion
-has not been demonstrated.
+A live idle AVR reset, without rewriting application flash, produced a fresh
+sensor epoch and rotated fan session, invalidated calibration and recovered
+production uploads. Six post-reset pings and the final nine fan commands
+passed. Stale-session commands were rejected without enqueueing; the fan ended
+off. The unrelated deployed Wi-Fi files and private configuration were preserved.
+Earlier whole-runtime rollback and native restart paths were also exercised.
 
-HTTP events carry bounded `http.agent.prepare_ms`, `http.agent.ipc_wait_ms`, and
-`http.agent.consume_ms` fields. They separate constructor work, helper/selector
-queueing outside libcurl time, and consumption after the IPC frame is read.
-`command.final_journal_ms` measures the final durable journal write before result
-submission; it is outside the HTTP request duration. These are compact attributes
-on existing events. The local command interval includes delivery-body decoding.
-Grouped SQLite work is measured by `db.transaction`, including durable commit;
-inner SQL spans do not include that commit. Compare durable server completion as
-well as the stored result timestamp, which precedes its commit.
+## Implementation and durability
 
-Presence observations stay exact in the live backend API. Their disk copy is
-coalesced to one write per five seconds of authenticated traffic and flushed on
-clean shutdown; after a crash that noncritical timestamp can lag by up to five
-seconds. Command enqueue/claim/result durability and fan-state freshness are
-unchanged. Native HTTP completions retain their integer timing fields rather than
-formatting them as curl output and parsing them back to floats.
+The opt-in [native Bridge](NATIVE_BRIDGE.md) replaces Python UART/JSON handling
+with bounded native framing and atomic retained publication. Existing CRC,
+duplicate suppression, exact put-confirmation-before-GPIO, session checks,
+heartbeat, physical dwell and pre-IR journaling remain enforced.
 
-The 100-ping run on the presence-coalescing backend and instrumented device
-recorded 199/279 ms median/p95 to the stored completion timestamp, or
-224.74/322.05 ms through the final server response (including commit). The
-paired result curl duration minus server processing was 50.80/95.55 ms. This is
-a transport estimate, not an exact packet measurement. Command handling,
-including body decoding, measured 80/120 ms; earlier execution-only captures
-excluded that decoding and are not directly comparable. Each of the two durable
-backend transactions measured 21.69/60.07 ms. A separate syscall capture measured
-22 WAL fsyncs at 23.87 ms median, 66.94 ms maximum. FULL durability is preserved.
+Telemetry uses direct scalar encoding, caches at most 64 short keys per batch,
+and yields after a five-millisecond work budget or 512 bytes. This is active-work
+budgeting, not a new wake-up timer. A scalar may finish before yielding, and the
+byte limit still applies after a backwards wall-clock adjustment. The board's
+paired benchmark measured 306 ms for a 32-event cooperative batch with vendor
+scalars versus 263 ms with the candidate, and maximum observed steps of 30 versus
+10 ms at its coarse clock resolution. Whole request and journal bodies retain
+the vendor writer, which proved faster than a generic replacement.
 
-Native-mode command polls request `commands?format=binary-v1`. The optional
-`application/vnd.res-ac.command.v1` representation starts with `RAC1`, then a
-bounded typed value: null/true/false (`n/t/f`), signed big-endian int32 (`i`),
+HTTP submission attempts one nonblocking helper write immediately so curl can
+start before background work. Short writes and backpressure retain the remainder
+for the readiness selector. Fatal helper errors complete locally without
+replaying queued work. Libcurl retains its existing process and connection pool.
+
+SQLite groups enqueue/claim and presence/write operations into durable
+transactions. Device delivery occurs only after successful COMMIT. `db.transaction`
+includes fsync; inner SQL spans exclude commit. WAL `synchronous=FULL` remains
+enabled. A direct trace of 22 production WAL fsyncs measured 23.87 ms median and
+66.94 ms maximum, so storage remains a significant residual cost.
+
+Presence stays exact in the live API. Its disk copy coalesces to one update per
+five seconds of authenticated traffic and flushes on clean shutdown; a crash can
+leave that noncritical timestamp up to five seconds behind. Command/result
+persistence and fan-state freshness retain their durability guarantees.
+
+## Command response format
+
+Native-mode polls request `commands?format=binary-v1`. The optional content type
+is `application/vnd.res-ac.command.v1`; its body starts with `RAC1`, followed by
+a bounded typed value: null/true/false (`n/t/f`), signed big-endian int32 (`i`),
 finite big-endian float64 (`d`), UTF-8 string (`s` + u16 byte length), array
-(`a` + u16 item count), or object (`o` + u16 pair count, string keys). Limits
-are 32768 bytes, depth 16, and 1024 values including keys. Duplicate keys,
-invalid UTF-8, truncation, unknown types and trailing data fail closed. This
-only replaces response decoding; the existing command envelope and physical
-safety validation still run. Legacy clients receive JSON. Older servers may
-ignore the format request and return JSON, which the native client still
-accepts. No HTTP helper protocol change, polling timer or new connection is
-required. `command.timing.decode_ms` measures both decoding paths on the
-existing command event. The board benchmark measured 33.4 ms per JSON decode
-versus 6.0 ms per binary decode over 100 iterations. A subsequent live 100-ping
-run recorded 169/268 ms to the stored timestamp and 206.67/309.00 ms through
-durable server completion. Its paired transport estimate was 49.44/95.75 ms.
-All pings succeeded on the first attempt. Five calibration and four level
-commands also succeeded once each, rejected a stale session, reported state
-and ended with the fan off. This remains above the network-bound target.
+(`a` + u16 item count), or object (`o` + u16 pair count, string keys). Limits are
+32768 bytes, depth 16, and 1024 values including keys. Duplicate keys, invalid
+UTF-8, truncation, unknown types and trailing data fail closed.
 
-An on-board experiment found that replacing the vendor writer for whole bodies
-regresses encoding time: a small result took 2.6 ms with the vendor writer versus
-6.0 ms with the generic encoder; a 32-event batch took 115 versus 265 ms.
-The next candidate retains the vendor writer for requests and journals and
-measures fast scalar encoding only within cooperative telemetry. Native Bridge
-clients also disable Nagle buffering, matching the server side. Live validation
-of these changes is pending.
+This only replaces response decoding. Existing envelope and physical safety
+validation still run. Legacy clients receive JSON; an older server can ignore
+the format request and return JSON, which the native client accepts. The HTTP
+helper protocol and connections are unchanged. Shared Node/Python vectors cover
+all six command types, booleans, integers, floats and Unicode.
 
-The corrected scalar-only run passed 100 first-attempt pings at 165.5/217 ms
-median/p95 to the stored timestamp, or 191.07/249.50 ms through durable server
-completion. Its transport estimate was 48.28/69.90 ms, so some tail improvement
-also coincided with lower network jitter. Agent command handling measured
-40/80 ms, notification 10/30 ms, and Bridge round trip 20/40 ms. These overlap.
-The paired board benchmark measured a cooperative batch at 301 ms with vendor
-scalar encoding versus 256 ms with direct scalars, with maximum observed steps
-of 40 versus 30 ms. Whole request/journal bodies still use the vendor writer.
+## Measurement and validation
 
-The next candidate caches up to 64 short dictionary keys per telemetry batch
-and yields after a five-millisecond work budget as well as the 512-byte budget.
-It adds no wake-up timer. Each step makes progress; a backwards wall-clock
-adjustment cannot remove its byte limit. A scalar can finish before yielding.
-HTTP submission attempts one nonblocking helper write immediately so network
-work can overlap the caller's remaining background work. Short writes and
-backpressure leave the remainder for the existing readiness selector; fatal
-helper errors complete locally and never replay queued work. Live validation
-of these changes is pending.
+Stored completion starts at backend enqueue and ends at the stored result
+timestamp, which precedes the final COMMIT. Durable completion instead uses the
+result-upload server span end. Neither includes dashboard rendering or the final
+response's return to the device. Long-poll waiting is not network RTT. Device
+span placement is approximate; cross-host absolute timestamps are not used to
+subtract device phases.
+
+Compact attributes on existing events report `command.timing.decode_ms`,
+`command.final_journal_ms`, `http.agent.prepare_ms`, `http.agent.ipc_wait_ms`, and
+`http.agent.consume_ms`. Backend expansion adds phase spans without increasing
+the device event count. Native HTTP timing fields remain binary rather than
+being formatted to text and reparsed.
+
+Validation: 188 device tests, 54 backend tests, native Bridge address/undefined
+behavior sanitizer tests, actual-sketch tests, and live command/upload/recovery
+checks. The AVR build uses 1391 bytes static SRAM and 22204 bytes flash. Native
+Bridge is a 66 KB static big-endian MIPS executable. No storage-sync substitution
+or weaker synchronization mode is included in this release.
