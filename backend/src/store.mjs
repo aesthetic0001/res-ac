@@ -74,6 +74,23 @@ export class Store {
     if (this.commitObservers !== null) this.commitObservers.push(fn);
     else fn();
   }
+  savepoint(fn) {
+    if (fn.constructor.name === 'AsyncFunction') throw new TypeError('Write callbacks must be synchronous');
+    if (this.commitObservers === null) return this.transaction(() => this.savepoint(fn));
+    const observers = this.commitObservers, offset = observers.length;
+    this.db.exec('SAVEPOINT request_write');
+    try {
+      const result = fn();
+      if (result && typeof result.then === 'function') throw new TypeError('Write callbacks cannot return promises');
+      this.db.exec('RELEASE request_write');
+      return result;
+    } catch (error) {
+      this.db.exec('ROLLBACK TO request_write');
+      this.db.exec('RELEASE request_write');
+      observers.length = offset;
+      throw error;
+    }
+  }
   device(id) {
     const row = this.db.prepare('SELECT * FROM devices WHERE id=?').get(id);
     if (row && this.presence.has(id)) row.last_seen = this.presence.get(id).latest;
@@ -129,8 +146,8 @@ export class Store {
     this.db.prepare("UPDATE commands SET status='expired',lease_until=NULL WHERE status IN ('pending','inflight') AND expires_at<=?").run(now);
     this.db.prepare('DELETE FROM sessions WHERE expires_at<=?').run(now);
   }
-  enqueue(deviceId, type, payload, ttlSeconds) {
-    const now = Date.now(), id = randomUUID();
+  enqueue(deviceId, type, payload, ttlSeconds, now = Date.now()) {
+    const id = randomUUID();
     this.db.prepare('INSERT INTO commands(id,device_id,type,payload,created_at,expires_at,traceparent) VALUES(?,?,?,?,?,?,?)')
       .run(id, deviceId, type, canonical(payload), now, now + ttlSeconds * 1000, this.observability?.currentTraceparent() || null);
     return this.command(id);

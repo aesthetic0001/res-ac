@@ -1,4 +1,5 @@
 import { test, before } from 'node:test';
+import { EventEmitter } from 'node:events';
 import { randomBytes } from 'node:crypto';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -45,8 +46,67 @@ async function fixture(t, overrides = {}) {
     assert.equal(response.status, 201); return response.json();
   }
   const deviceHeaders = { authorization: `Bearer ${firstDeviceToken}`, 'content-type': 'application/json' };
-  return { request, login, enqueue, config, store, path, deviceHeaders };
+  return { request, login, enqueue, config, store, path, deviceHeaders, handler: app.handler };
 }
+
+// Ready all bodies together to test the actual route/transaction boundary
+// deterministically, independently of TCP packet batching on the test host.
+function pendingRequest(handler, spec) {
+    const req = Object.assign(new EventEmitter(), { method: spec.method || 'POST', headers: spec.headers, url: spec.path });
+    const res = Object.assign(new EventEmitter(), { destroyed: false, writableEnded: false,
+      setHeader() {}, writeHead(status) { this.statusCode = status; },
+      end(body) { this.body = body; this.writableEnded = this.writableFinished = true; this.emit('finish'); } });
+    const done = handler(req, res);
+    return { req, res, done, body: spec.body };
+}
+function readyRequests(handler, specs) {
+  const requests = specs.map(spec => pendingRequest(handler, spec));
+  for (const row of requests) { row.req.emit('data', Buffer.from(JSON.stringify(row.body))); row.req.emit('end'); }
+  return Promise.all(requests.map(async row => { await row.done; return row.res; }));
+}
+
+test('concurrent authenticated enqueues retain distinct durable IDs and share a commit', async t => {
+  const f = await fixture(t), auth = await f.login();
+  const exec = f.store.db.exec.bind(f.store.db); let commits = 0;
+  f.store.db.exec = sql => { if (sql === 'COMMIT') commits++; return exec(sql); };
+  const headers = { host: 'unit.test', origin: 'http://unit.test', cookie: auth.cookie,
+    'x-csrf-token': auth.csrf, 'content-type': 'application/json' };
+  const rows = await readyRequests(f.handler, Array.from({ length: 24 }, () => ({ headers,
+    path: '/api/admin/devices/board-1/commands', body: { type: 'device.ping', payload: {}, ttlSeconds: 60 } })));
+  assert.ok(rows.every(row => row.statusCode === 201));
+  assert.equal(new Set(rows.map(row => JSON.parse(row.body).id)).size, 24);
+  assert.equal(f.store.db.prepare('SELECT count(*) n FROM commands').get().n, 24); assert.equal(commits, 1);
+});
+
+test('an aborted queued poll cannot remove the next poll registered for that device', async t => {
+  const f = await fixture(t, { pollWaitMs: 5000, leaseMs: 10000 }), auth = await f.login();
+  const spec = { method: 'GET', path: '/api/devices/board-1/commands', headers: f.deviceHeaders };
+  const first = pendingRequest(f.handler, spec);
+  first.res.destroyed = true; first.res.emit('close');
+  const next = pendingRequest(f.handler, spec);
+  await Promise.all([first.done, next.done]);
+  const queued = await f.enqueue(auth);
+  assert.equal(next.res.statusCode, 200); assert.equal(JSON.parse(next.res.body).commands[0].id, queued.id);
+  assert.equal(f.store.command(queued.id).attempts, 1);
+});
+
+test('queued commands validate the latest committed/batched fan session, not the request-time snapshot', async t => {
+  const f = await fixture(t), auth = await f.login();
+  const oldSession = 'a'.repeat(32), nextSession = 'b'.repeat(32);
+  f.store.setFanState('board-1', { sessionId: oldSession, calibrated: true, power: 'off', speed: 0, revision: 1, firmwareVersion: 'v4' });
+  const admin = { host: 'unit.test', origin: 'http://unit.test', cookie: auth.cookie,
+    'x-csrf-token': auth.csrf, 'content-type': 'application/json' };
+  const rows = await readyRequests(f.handler, [
+    { path: '/api/devices/board-1/fan-state', headers: f.deviceHeaders,
+      body: { sessionId: nextSession, calibrated: true, power: 'off', speed: 0, revision: 0, firmwareVersion: 'v4' } },
+    { path: '/api/admin/devices/board-1/commands', headers: admin,
+      body: { type: 'fan.calibrate', payload: { sessionId: oldSession, confirmOff: true } } },
+    { path: '/api/admin/devices/board-1/commands', headers: admin, body: { type: 'device.ping', payload: {} } }
+  ]);
+  assert.deepEqual(rows.map(row => row.statusCode), [200, 409, 201]);
+  assert.equal(f.store.fanState('board-1').sessionId, nextSession);
+  assert.deepEqual(f.store.db.prepare('SELECT type FROM commands').all().map(row => row.type), ['device.ping']);
+});
 
 test('login gates dashboard/API; sessions, CSRF, and logout work', async t => {
   const f = await fixture(t);

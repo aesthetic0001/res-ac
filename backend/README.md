@@ -303,3 +303,6 @@ command trace context, and accepts bounded authenticated device diagnostics at
 separate metrics listener is enabled only when `METRICS_PORT` is configured.
 
 Use Node.js 22.15+ for local development. Run `npm ci` before tests/start.
+
+See [the durable write batching experiment](WRITE_BATCHING.md) for its bounds,
+recovery behavior, same-image control, and required live acceptance gate.

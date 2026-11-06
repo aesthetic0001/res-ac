@@ -155,6 +155,8 @@ export class Observability {
     this.requests = counter('http_requests_total', ['route', 'method', 'status']);
     this.latency = histogram('http_duration_seconds', ['route', 'method']);
     this.dbTime = histogram('db_duration_seconds', ['operation', 'outcome']);
+    this.writeBatchSize = new Histogram({ name: 'resac_db_write_batch_size', help: 'Write requests per durable batch attempt',
+      buckets: [1, 2, 4, 8, 16, 32], registers: [this.registry] });
     this.exportErrors = counter('trace_export_errors_total');
     this.traceDrops = counter('trace_dropped_total');
     this.logDrops = counter('log_dropped_total');
@@ -192,6 +194,17 @@ export class Observability {
       try { const result = fn(); span.setStatus({ code: SpanStatusCode.OK }); return result; }
       catch (error) { failed = true; span.setAttribute('error.type', /^[A-Za-z0-9_]{1,64}$/.test(error.code || error.name) ? (error.code || error.name) : 'Error'); span.setStatus({ code: SpanStatusCode.ERROR, message: 'operation_failed' }); throw error; }
       finally { span.end(); if (name.startsWith('db.')) this.dbTime.observe({ operation: name.slice(3), outcome: failed ? 'error' : 'ok' }, (performance.now() - started) / 1000); }
+    });
+  }
+  async runAsync(name, attributes, fn, parent) {
+    const span = this.span(name, attributes, parent);
+    return this.local.run(span, async () => {
+      try { const result = await fn(); span.setStatus({ code: SpanStatusCode.OK }); return result; }
+      catch (error) {
+        span.setAttribute('error.type', /^[A-Za-z0-9_]{1,64}$/.test(error.code || error.name) ? (error.code || error.name) : 'Error');
+        span.setStatus({ code: SpanStatusCode.ERROR, message: 'operation_failed' });
+        throw error;
+      } finally { span.end(); }
     });
   }
   record(name, parent, start, duration, attributes = {}, spanId) {

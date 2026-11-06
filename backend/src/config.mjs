@@ -8,8 +8,10 @@ export function loadConfig(env = process.env) {
   if (env.DEVICE_TOKEN.length < 32) throw new Error('DEVICE_TOKEN must have at least 32 characters');
   const port = Number(env.PORT || 3000);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Invalid PORT');
+  if (env.WRITE_BATCHING !== undefined && !['true', 'false'].includes(env.WRITE_BATCHING)) throw new Error('Invalid WRITE_BATCHING');
   return {
     port, host: env.HOST || '0.0.0.0', httpDev: env.HTTP_DEV === 'true',
+    writeBatching: env.WRITE_BATCHING !== 'false',
     dbPath: resolve(env.DATA_DIR || './data', 'sensors.sqlite'),
     tlsDir: resolve(env.TLS_DIR || '/run/sensor-tls'),
     adminUsername: env.ADMIN_USERNAME, passwordHash: env.ADMIN_PASSWORD_HASH,

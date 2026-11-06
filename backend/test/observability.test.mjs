@@ -9,6 +9,7 @@ import { InMemorySpanExporter } from '@opentelemetry/sdk-trace';
 import { Observability, commandPayloadAttributes, newTraceparent, validateTelemetry } from '../src/observability.mjs';
 import { Store } from '../src/store.mjs';
 import { createApp } from '../src/app.mjs';
+import { WriteQueue } from '../src/write-queue.mjs';
 import { hashPassword } from '../src/auth.mjs';
 
 async function fixture(t, options = {}) {
@@ -29,6 +30,31 @@ async function fixture(t, options = {}) {
 const batch = (parent = newTraceparent()) => ({ session: randomBytes(16).toString('hex'), batchId: randomBytes(16).toString('hex'), metrics: { cpu_ratio: .25, memory_available_bytes: 1024 }, events: [
   { name: 'http.device', traceparent: parent, durationMs: 25, ageMs: 100, attributes: { outcome: 'tls', 'curl.code': 60, 'request.kind': 'readings' } }
 ] });
+
+test('shared commits preserve every command trace and asynchronous result span through commit', async t => {
+  const f = await fixture(t), queue = new WriteQueue(f.store, { observability: f.obs });
+  t.after(() => queue.close());
+  const parents = Array.from({ length: 3 }, () => newTraceparent());
+  const exec = f.store.db.exec.bind(f.store.db);
+  f.store.db.exec = sql => {
+    if (sql === 'COMMIT') assert.equal(f.exporter.getFinishedSpans().filter(s => s.name === 'request.stub').length, 0);
+    return exec(sql);
+  };
+  const commands = await Promise.all(parents.map(parent => f.obs.runAsync('request.stub', {},
+    () => queue.run(() => f.store.enqueue('board', 'device.ping', {}, 60)), parent)));
+  await f.obs.provider.forceFlush();
+  const spans = f.exporter.getFinishedSpans();
+  for (let i = 0; i < parents.length; i++) {
+    const id = parents[i].slice(3, 35), own = spans.filter(s => s.spanContext().traceId === id);
+    assert.equal(commands[i].traceparent.slice(3, 35), id);
+    assert.equal(own.filter(s => s.name === 'db.enqueue').length, 1);
+    const wait = own.find(s => s.name === 'db.write_wait'), request = own.find(s => s.name === 'request.stub');
+    assert.equal(wait.attributes['db.batch.size'], 3);
+    assert.ok(request.endTime[0] > wait.endTime[0] || request.endTime[1] >= wait.endTime[1]);
+  }
+  assert.equal(spans.filter(s => s.name === 'db.transaction').length, 1);
+  assert.match(await f.obs.registry.metrics(), /resac_db_write_batch_size_sum 3/);
+});
 
 test('connection evidence survives validation, logs and traces without widening arbitrary attributes', async t => {
   const f = await fixture(t), value = batch();

@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { token, digest, equal, verifyPassword, cookieToken } from './auth.mjs';
 import { curveSettings } from './fan-curve.mjs';
 import { commandMediaType, encodeCommand } from './command-wire.mjs';
+import { WriteQueue } from './write-queue.mjs';
 
 class HttpError extends Error { constructor(status, message) { super(message); this.status = status; } }
 const assert = (test, message) => { if (!test) throw new HttpError(400, message); };
@@ -62,6 +63,7 @@ export function createApp(config, store, observability) {
     ['/assets/fan-curve.js', ['fan-curve.js', 'text/javascript']]
   ].map(([route, [name, type]]) => [route, { data: readFileSync(fileURLToPath(new URL(`../public/${name}`, import.meta.url))), type }]));
   const waiters = new Map(), limits = new Map();
+  const writes = new WriteQueue(store, { enabled: config.writeBatching !== false, observability });
   const notify = deviceId => waiters.get(deviceId)?.wake();
   let shuttingDown = false;
   const authVersion = digest(config.adminUsername + '\0' + config.passwordHash);
@@ -86,8 +88,9 @@ export function createApp(config, store, observability) {
   function poll(req, res, deviceId, touch) {
     if (waiters.has(deviceId)) throw new HttpError(409, 'Only one command poll may be open per device');
     const deadline = Date.now() + config.pollWaitMs;
-    let timer, stopped = false, firstWake = true;
+    let timer, stopped = false, firstWake = true, waking = false;
     const cleanup = () => {
+      if (stopped) return;
       stopped = true; clearTimeout(timer); waiters.delete(deviceId); res.off('close', cleanup);
     };
     const prepare = () => {
@@ -101,23 +104,25 @@ export function createApp(config, store, observability) {
         commandResponse(req, res, 200, { commands: [command] });
       };
     };
-    const wake = () => {
-      if (stopped) return;
+    const wake = async () => {
+      if (stopped || waking) return;
       clearTimeout(timer);
       if (res.destroyed) return cleanup();
+      waking = true;
       try {
-        const deliver = firstWake ? store.transaction(() => { touch(); return prepare(); }) : prepare();
+        const deliver = firstWake ? await writes.run(() => { touch(); return prepare(); }) : prepare();
         firstWake = false;
+        if (stopped || res.destroyed) return cleanup();
         if (deliver) { deliver(); return; }
         if (Date.now() >= deadline) { cleanup(); json(res, 204); return; }
         timer = setTimeout(wake, Math.min(1000, deadline - Date.now()));
       } catch {
         cleanup(); json(res, 500, { error: 'Could not retrieve commands' });
-      }
+      } finally { waking = false; }
     };
     waiters.set(deviceId, { wake, prepare, close: () => { cleanup(); json(res, 503, { error: 'Server is restarting; reconnect shortly' }); } });
     res.on('close', cleanup);
-    wake();
+    return wake();
   }
   const handler = async (req, res) => {
     res.setHeader('x-content-type-options', 'nosniff');
@@ -186,23 +191,24 @@ export function createApp(config, store, observability) {
         if (value.type === 'fan.curve') {
           try { curveSettings(value.payload); } catch (error) { throw new HttpError(400, error.message); }
         }
-        if (['fan.command', 'ir.send', 'fan.calibrate', 'fan.level', 'fan.curve'].includes(value.type)) {
-          const fan = store.fanState(deviceId);
-          if (!fan || Date.now() - fan.receivedAt > 30_000 || !fan.sessionId || value.payload.sessionId !== fan.sessionId)
-            throw new HttpError(409, 'Fan status is missing, stale, or changed. Wait for the device and recalibrate.');
-          if (['fan.level', 'fan.curve'].includes(value.type) && fan.firmwareVersion !== 'v4') throw new HttpError(409, 'Update firmware for target levels and automatic curves');
-          if (value.type === 'fan.calibrate') {
-            assert(value.payload.confirmOff === true && Object.keys(value.payload).length === 2, 'Confirm the fan is off with saved speed 1');
-          } else if (!fan.calibrated && !(value.type === 'fan.curve' && value.payload.enabled === false)) throw new HttpError(409, 'Calibration required: set speed to 1, then turn fan off');
-          const speedPress = value.type === 'fan.command' && ['speed_up', 'speed_down'].includes(value.payload.button)
-            || value.type === 'ir.send' && value.payload.protocol === 'NEC' && value.payload.address === 0xDE80 && [0x16, 0x14].includes(value.payload.command);
-          if (speedPress && fan.power !== 'on') throw new HttpError(409, 'Turn the fan on before changing speed');
-        }
         const ttl = value.ttlSeconds ?? 300;
         assert(Number.isInteger(ttl) && ttl >= 1 && ttl <= 86400, 'TTL must be between 1 and 86400 seconds');
         let deliver;
-        const command = store.transaction(() => {
-          const queued = store.enqueue(deviceId, value.type, value.payload, ttl);
+        const enqueuedAt = Date.now();
+        const command = await writes.run(() => {
+          if (['fan.command', 'ir.send', 'fan.calibrate', 'fan.level', 'fan.curve'].includes(value.type)) {
+            const fan = store.fanState(deviceId);
+            if (!fan || Date.now() - fan.receivedAt > 30_000 || !fan.sessionId || value.payload.sessionId !== fan.sessionId)
+              throw new HttpError(409, 'Fan status is missing, stale, or changed. Wait for the device and recalibrate.');
+            if (['fan.level', 'fan.curve'].includes(value.type) && fan.firmwareVersion !== 'v4') throw new HttpError(409, 'Update firmware for target levels and automatic curves');
+            if (value.type === 'fan.calibrate') {
+              assert(value.payload.confirmOff === true && Object.keys(value.payload).length === 2, 'Confirm the fan is off with saved speed 1');
+            } else if (!fan.calibrated && !(value.type === 'fan.curve' && value.payload.enabled === false)) throw new HttpError(409, 'Calibration required: set speed to 1, then turn fan off');
+            const speedPress = value.type === 'fan.command' && ['speed_up', 'speed_down'].includes(value.payload.button)
+              || value.type === 'ir.send' && value.payload.protocol === 'NEC' && value.payload.address === 0xDE80 && [0x16, 0x14].includes(value.payload.command);
+            if (speedPress && fan.power !== 'on') throw new HttpError(409, 'Turn the fan on before changing speed');
+          }
+          const queued = store.enqueue(deviceId, value.type, value.payload, ttl, enqueuedAt);
           deliver = waiters.get(deviceId)?.prepare();
           return queued;
         });
@@ -218,7 +224,7 @@ export function createApp(config, store, observability) {
         const touch = () => { if (!touched) { store.seen(id); touched = true; } };
         try {
           if (req.method === 'POST' && route === 'telemetry' && !commandId) {
-            touch();
+            await writes.run(touch);
             const value = await body(req);
             assert(validateTelemetry(value), 'Invalid telemetry');
             observability?.ingest(id, value);
@@ -250,7 +256,7 @@ export function createApp(config, store, observability) {
               assert(automatic.targetLevel === null || (Number.isInteger(automatic.targetLevel) && automatic.targetLevel >= 0 && automatic.targetLevel <= 5), 'Invalid automatic target');
               Object.assign(state.automatic, { status: automatic.status, targetLevel: automatic.targetLevel, minAdjustmentSeconds: 30 });
             }
-            if (!store.transaction(() => { touch(); return store.setFanState(id, state); })) throw new HttpError(409, 'Outdated fan revision');
+            if (!await writes.run(() => { touch(); return store.setFanState(id, state); })) throw new HttpError(409, 'Outdated fan revision');
             return json(res, 200, { ok: true });
           }
           if (req.method === 'POST' && route === 'readings' && !commandId) {
@@ -259,17 +265,17 @@ export function createApp(config, store, observability) {
             assert(typeof value.humidity === 'number' && Number.isFinite(value.humidity) && value.humidity >= 0 && value.humidity <= 100, 'Invalid humidity');
             if (value.readingId !== undefined) assert(typeof value.readingId === 'string' && value.readingId.length > 0 && value.readingId.length <= 100, 'Invalid readingId');
             if (value.recordedAt !== undefined) assert(typeof value.recordedAt === 'string' && value.recordedAt.length <= 40 && Number.isFinite(Date.parse(value.recordedAt)), 'Invalid recordedAt');
-            const result = store.transaction(() => { touch(); return store.reading(id, value); });
+            const result = await writes.run(() => { touch(); return store.reading(id, value); });
             return json(res, result.duplicate ? 200 : 201, result);
           }
-          if (req.method === 'GET' && route === 'commands' && !commandId) return poll(req, res, id, touch);
+          if (req.method === 'GET' && route === 'commands' && !commandId) return await poll(req, res, id, touch);
           if (req.method === 'POST' && route === 'commands' && commandId) {
             const value = await body(req);
             assert(['succeeded', 'failed'].includes(value.status), 'Status must be succeeded or failed');
             const saved = store.command(commandId);
             const handoff = url.searchParams.get('next') === '1';
             let deliver;
-            const persist = () => store.transaction(() => {
+            const persist = () => writes.run(() => {
               touch();
               const result = handoff
                 ? store.resultAndClaim(id, commandId, value.status, value.result ?? null, config.leaseMs, !waiters.has(id))
@@ -277,18 +283,18 @@ export function createApp(config, store, observability) {
               if (result.code === 200) deliver = waiters.get(id)?.prepare();
               return result;
             });
-            const result = observability && saved?.device_id === id && validTraceparent(saved.traceparent)
-              ? observability.run('command.result', { 'command.id': commandId, 'command.type': saved.type, 'command.source': 'manual',
+            const result = await (observability && saved?.device_id === id && validTraceparent(saved.traceparent)
+              ? observability.runAsync('command.result', { 'command.id': commandId, 'command.type': saved.type, 'command.source': 'manual',
                 ...commandPayloadAttributes(saved.type, JSON.parse(saved.payload)), outcome: value.status }, persist,
                 validTraceparent(req.headers.traceparent) && req.headers.traceparent.slice(3, 35) === saved.traceparent.slice(3, 35)
-                  ? undefined : saved.traceparent) : persist();
+                  ? undefined : saved.traceparent) : persist());
             if (deliver) deliver();
             else if (result.code === 200) notify(id);
             return commandResponse(req, res, result.code, result.error ? { error: result.error }
               : { ok: true, duplicate: result.duplicate, ...(handoff ? {resultId: result.resultId, commands: result.commands} : {}) });
           }
           throw new HttpError(405, 'Method not allowed');
-        } finally { touch(); }
+        } finally { if (!touched) await writes.run(touch); }
       }
       if (req.method === 'GET' && assets.has(path)) {
         if (path === '/' && !session(req)) { res.writeHead(303, { location: '/login' }); return res.end(); }
@@ -301,5 +307,5 @@ export function createApp(config, store, observability) {
       json(res, error.status || 500, { error: error.status ? error.message : 'Internal server error' });
     }
   };
-  return { handler: observability ? (req, res) => observability.request(req, res, () => handler(req, res)) : handler, close() { shuttingDown = true; for (const waiter of [...waiters.values()]) waiter.close(); } };
+  return { handler: observability ? (req, res) => observability.request(req, res, () => handler(req, res)) : handler, close() { shuttingDown = true; for (const waiter of [...waiters.values()]) waiter.close(); writes.close(); } };
 }
