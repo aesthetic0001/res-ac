@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <FanState.h>
+#include <CommandTiming.h>
+#if RESAC_COMMAND_TIMING
+CommandTiming commandTiming;
+#endif
 
 // Seeeduino Cloud v1.0: Linux GPIO21 -> TXS0102 -> PB2/MOSI (PCINT2).
 // This is NOT the D7 handshake connection found on the original Arduino Yun.
@@ -20,7 +24,12 @@
 #include <util/atomic.h>
 volatile bool commandWake = false;
 ISR(PCINT0_vect) {
-  if (!(PINB & _BV(PB2))) commandWake = true;
+  if (!(PINB & _BV(PB2))) {
+#if RESAC_COMMAND_TIMING
+    commandTiming.irq();
+#endif
+    commandWake = true;
+  }
 }
 #endif
 
@@ -68,13 +77,46 @@ bool commandExecuting = false;
 bool commandNotificationsReady = false;
 bool fanStatePending = false;
 
+unsigned int bridgeGet(const char *key, char *buffer, unsigned int size) {
+#if RESAC_COMMAND_TIMING
+  const CommandTiming::Tag tag = commandTiming.active ? CommandTiming::tag(key) : CommandTiming::OTHER;
+  commandTiming.record(CommandTiming::UART_BEGIN, tag);
+#endif
+  const unsigned int result = Bridge.get(key, buffer, size);
+#if RESAC_COMMAND_TIMING
+  commandTiming.record(CommandTiming::UART_END, tag);
+#endif
+  return result;
+}
+
+void bridgePut(const char *key, const char *value) {
+#if RESAC_COMMAND_TIMING
+  const CommandTiming::Tag tag = commandTiming.active ? CommandTiming::tag(key) : CommandTiming::OTHER;
+  commandTiming.record(CommandTiming::UART_BEGIN, tag);
+#endif
+  Bridge.put(key, value);
+#if RESAC_COMMAND_TIMING
+  commandTiming.record(CommandTiming::UART_END, tag);
+#endif
+}
+
+void mailboxWrite(const uint8_t *data, unsigned int size) {
+#if RESAC_COMMAND_TIMING
+  commandTiming.record(CommandTiming::UART_BEGIN, CommandTiming::MAILBOX);
+#endif
+  Mailbox.writeMessage(data, size);
+#if RESAC_COMMAND_TIMING
+  commandTiming.record(CommandTiming::UART_END, CommandTiming::MAILBOX);
+#endif
+}
+
 void publishValue(const char *key, const char *value) {
   // Retain a snapshot for reconnects, then notify connected Linux clients.
-  Bridge.put(key, value);
+  bridgePut(key, value);
   char event[224];
   const int length = snprintf_P(event, sizeof(event), PSTR("v1,%s,%s"), key, value);
   if (length > 0 && static_cast<size_t>(length) < sizeof(event))
-    Mailbox.writeMessage(reinterpret_cast<const uint8_t *>(event), length);
+    mailboxWrite(reinterpret_cast<const uint8_t *>(event), length);
 }
 
 void publishFanState() {
@@ -103,7 +145,7 @@ void updateFan() {
 #if RESAC_BATCHED_COMMANDS
   // One atomic, agent-owned context replaces independent safety/session reads.
   char context[56] = {0};
-  const unsigned int length = Bridge.get("resac_fan_control", context, sizeof(context) - 1);
+  const unsigned int length = bridgeGet("resac_fan_control", context, sizeof(context) - 1);
   char *save = nullptr;
   char *version = strtok_r(context, ",", &save);
   char *session = strtok_r(nullptr, ",", &save);
@@ -132,13 +174,13 @@ void updateFan() {
   if (changed) { publishValue("resac_fan_session", fanSession); publishFanState(); }
 #else
   char invalidate[4] = {0};
-  Bridge.get("resac_fan_invalidate", invalidate, sizeof(invalidate) - 1);
+  bridgeGet("resac_fan_invalidate", invalidate, sizeof(invalidate) - 1);
   if (strcmp(invalidate, "1") == 0) {
-    Bridge.put("resac_fan_invalidate", "");
+    bridgePut("resac_fan_invalidate", "");
     invalidateFan();
   }
   char heartbeat[16] = {0};
-  Bridge.get("resac_fan_heartbeat", heartbeat, sizeof(heartbeat) - 1);
+  bridgeGet("resac_fan_heartbeat", heartbeat, sizeof(heartbeat) - 1);
   if (heartbeat[0] && strcmp(heartbeat, fanHeartbeat) != 0) {
     strcpy(fanHeartbeat, heartbeat);
     lastFanHeartbeatMs = millis();
@@ -146,7 +188,7 @@ void updateFan() {
   if (fan.calibrated() && static_cast<unsigned long>(millis() - lastFanHeartbeatMs) > 10000) invalidateFan();
   if (!fanSession[0]) {
     char session[33] = {0};
-    Bridge.get("resac_fan_session", session, sizeof(session) - 1);
+    bridgeGet("resac_fan_session", session, sizeof(session) - 1);
     if (validEpoch(session)) { strcpy(fanSession, session); ++fanRevision; publishFanState(); }
   }
 #endif
@@ -216,7 +258,7 @@ bool validCommandId(const char *id) {
 void processCommand() {
   const unsigned long fetchStarted = millis();
   char frame[128] = {0};
-  Bridge.get("resac_command", frame, sizeof(frame) - 1);
+  bridgeGet("resac_command", frame, sizeof(frame) - 1);
   const unsigned long fetchDuration = millis() - fetchStarted;
   // One atomic request; the batched completion requires the matching agent.
   const bool control = strncmp(frame, "v3,", 3) == 0;
@@ -227,6 +269,9 @@ void processCommand() {
   if (!separator) return;
   *separator = '\0';
   if (!validCommandId(id)) return;
+#if RESAC_COMMAND_TIMING
+  commandTiming.bind(id);
+#endif
   unsigned long address = 0, command = 0, repeats = 0;
   bool calibrate = false;
   bool automatic = false;
@@ -254,6 +299,9 @@ void processCommand() {
     if (control || levelControl) updateFan();
     const unsigned long safetyDuration = millis() - safetyStarted;
     const unsigned long executionStarted = millis();
+#if RESAC_COMMAND_TIMING
+    commandTiming.record(CommandTiming::ACTION_BEGIN);
+#endif
     if (control || levelControl) {
       if (
 #if RESAC_BATCHED_COMMANDS
@@ -282,6 +330,9 @@ void processCommand() {
       snprintf_P(lastCommandReply, sizeof(lastCommandReply), PSTR("v1,%s,pong,%lu"), id, millis());
       Serial.println(F("Ping handled by Arduino; replying pong"));
     }
+#if RESAC_COMMAND_TIMING
+    commandTiming.record(CommandTiming::ACTION_END);
+#endif
     strcpy(lastCommandId, id);
 #if RESAC_BATCHED_COMMANDS
     // Retain and push one versioned completion, including the legacy reply and
@@ -330,6 +381,24 @@ void processSerial() {
       continue;
     }
     line[used] = '\0';
+#if RESAC_COMMAND_TIMING
+    if (strcmp(line, "timing arm") == 0) {
+      commandTiming.arm(); Serial.println(F("TIMING armed")); used = 0; overflow = false; continue;
+    }
+    if (strcmp(line, "timing dump") == 0) {
+      commandTiming.stop();
+      // Dump only on operator request, after execution; never write from the ISR.
+      Serial.print(F("TIMING v1 micros32 resolution_us=4 id_hash=")); Serial.print(commandTiming.idHash);
+      Serial.print(F(" count=")); Serial.print(commandTiming.count);
+      Serial.print(F(" dropped=")); Serial.println(commandTiming.dropped);
+      for (uint8_t i = 0; i < commandTiming.count; ++i) {
+        const CommandTiming::Row &row = commandTiming.rows[i];
+        Serial.print(F("T ")); Serial.print(row.event); Serial.print(' ');
+        Serial.print(row.tag); Serial.print(' '); Serial.println(row.us);
+      }
+      used = 0; overflow = false; continue;
+    }
+#endif
     char *save = nullptr;
     char *kind = strtok_r(line, " ", &save);
     unsigned long address, command;
@@ -361,7 +430,7 @@ bool validEpoch(const char *epoch) {
 
 void updateInterval() {
   char buffer[16] = {0};
-  Bridge.get("resac_interval_ms", buffer, sizeof(buffer) - 1);
+  bridgeGet("resac_interval_ms", buffer, sizeof(buffer) - 1);
   if (!buffer[0]) return;
   char *end = nullptr;
   const unsigned long configured = strtoul(buffer, &end, 10);
@@ -394,7 +463,7 @@ void publishSample() {
   switch (sample.stage) {
     case 0: {
       memset(sample.epoch, 0, sizeof(sample.epoch));
-      Bridge.get("resac_epoch", sample.epoch, sizeof(sample.epoch) - 1);
+      bridgeGet("resac_epoch", sample.epoch, sizeof(sample.epoch) - 1);
       const unsigned long started = millis();
       ++sensorAttempts;
       const float humidity = dht.readHumidity(), temperature = dht.readTemperature();
@@ -431,7 +500,7 @@ void publishSample() {
     }
     default: {
       char status[48] = {0};
-      Bridge.get(sample.stage == 4 ? "resac_upload_status" : "resac_command_status", status, sizeof(status) - 1);
+      bridgeGet(sample.stage == 4 ? "resac_upload_status" : "resac_command_status", status, sizeof(status) - 1);
       if (status[0]) { Serial.print(sample.stage == 4 ? F("Uploader: ") : F("Commands: ")); Serial.println(status); }
       sample.stage = sample.stage == 4 ? 5 : 0;
       break;
@@ -441,7 +510,7 @@ void publishSample() {
 #else
 void publishSample() {
   char epoch[33] = {0};
-  Bridge.get("resac_epoch", epoch, sizeof(epoch) - 1);
+  bridgeGet("resac_epoch", epoch, sizeof(epoch) - 1);
   const unsigned long started = millis();
   ++sensorAttempts;
   const float humidity = dht.readHumidity();
@@ -473,13 +542,13 @@ void publishSample() {
   publishValue("resac_sensor_status", "ok");
   publishValue("resac_sample", frame);
   char uploadStatus[48] = {0};
-  Bridge.get("resac_upload_status", uploadStatus, sizeof(uploadStatus) - 1);
+  bridgeGet("resac_upload_status", uploadStatus, sizeof(uploadStatus) - 1);
   if (uploadStatus[0]) {
     Serial.print(F("Uploader: "));
     Serial.println(uploadStatus);
   }
   char commandStatus[48] = {0};
-  Bridge.get("resac_command_status", commandStatus, sizeof(commandStatus) - 1);
+  bridgeGet("resac_command_status", commandStatus, sizeof(commandStatus) - 1);
   if (commandStatus[0]) {
     Serial.print(F("Commands: "));
     Serial.println(commandStatus);
@@ -503,12 +572,12 @@ void setup() {
   // AVR sequence numbers restart at zero; request a fresh reading-ID epoch.
   publishValue("resac_epoch", "");
   // Discard a pre-reset mailbox: a stale toggle must not run during boot.
-  Bridge.put("resac_command", "");
+  bridgePut("resac_command", "");
   publishValue("resac_sample", "");
   publishValue("resac_command_result", "");
   publishValue("resac_command_diagnostic", "");
   publishValue("resac_sensor_diagnostic", "");
-  Bridge.put("resac_fan_invalidate", "");
+  bridgePut("resac_fan_invalidate", "");
   invalidateFan();
 #if RESAC_COMMAND_GPIO
   // An AVR pull-up keeps this active-low input inactive if Linux releases it
@@ -556,17 +625,29 @@ void serviceCommandNotification() {
   if (!pending) commandLowHandled = false;
   if (pending && (wake || !commandLowHandled)) {
     commandLowHandled = pending;
+#if RESAC_COMMAND_TIMING
+    commandTiming.begin();
+#endif
     commandExecuting = true;
     processCommand();
     commandExecuting = false;
+#if RESAC_COMMAND_TIMING
+    commandTiming.finish();
+#endif
   }
 #else
   const unsigned long commandNow = millis();
   if (static_cast<unsigned long>(commandNow - lastCommandCheckMs) >= COMMAND_CHECK_MS) {
     lastCommandCheckMs = commandNow;
+#if RESAC_COMMAND_TIMING
+    commandTiming.begin();
+#endif
     commandExecuting = true;
     processCommand();
     commandExecuting = false;
+#if RESAC_COMMAND_TIMING
+    commandTiming.finish();
+#endif
   }
 #endif
 }

@@ -177,3 +177,6 @@ Round-trip duration includes the AVR phases; these overlapping spans must not be
 summed. AVR span placement is reconstructed from Linux receipt time and does not
 provide synchronized hardware timestamps. Install backend telemetry support
 before the matching agent/sketch so complete telemetry batches remain valid.
+
+For opt-in IRQ, UART, socket-flush, and agent-consumption capture, see
+[TIMING.md](TIMING.md). Diagnostic rows stay outside normal telemetry.

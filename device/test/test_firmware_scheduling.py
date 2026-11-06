@@ -44,6 +44,7 @@ class FirmwareSchedulingTests(unittest.TestCase):
                 extern void (*readHook)(const char *);
                 extern void (*mailboxHook)();
                 inline unsigned long millis() { return testClock; }
+                inline unsigned long micros() { return testClock * 1000; }
                 inline void delay(unsigned long ms) { testClock += ms; }
                 struct TestSerial {
                   void begin(int) {}
@@ -318,6 +319,39 @@ class FirmwareSchedulingTests(unittest.TestCase):
                 loop(); assert(Bridge.values["resac_sample"].find(std::string("v1,")+session+",1,22000,50000,")==0);
                 loop(); loop(); assert(sensorPublication.stage==0);
                 #endif
+
+              } else if (mode == "timing") {
+                #if RESAC_COMMAND_TIMING
+                commandTiming.arm();
+                Bridge.values["resac_command"] = std::string("v1,") + id1 + ",ping";
+                testClock=10; notify(); testClock=40;
+                readHook=[](const char *) { testClock+=5; };
+                loop();
+                assert(!commandTiming.active && !commandTiming.armed && commandTiming.dropped==0);
+                assert(commandTiming.count >= 9);
+                assert(commandTiming.rows[0].event==CommandTiming::IRQ);
+                assert(commandTiming.rows[0].us==10000);
+                assert(commandTiming.rows[1].event==CommandTiming::ENTER);
+                assert(commandTiming.rows[1].us==40000);
+                assert(commandTiming.rows[2].event==CommandTiming::UART_BEGIN);
+                assert(commandTiming.rows[2].tag==CommandTiming::COMMAND);
+                assert(commandTiming.rows[3].event==CommandTiming::UART_END);
+                assert(commandTiming.rows[3].us-commandTiming.rows[2].us==5000);
+                assert(commandTiming.rows[commandTiming.count-1].event==CommandTiming::COMPLETE);
+                assert(commandTiming.idHash!=0);
+                const uint8_t frozen=commandTiming.count;
+                commandTiming.record(CommandTiming::ENTER); assert(commandTiming.count==frozen);
+                reset(); commandTiming.arm(); PINB=0; testClock=1; loop();
+                assert(commandTiming.rows[0].event==CommandTiming::ENTER); // Masked IRQ is unknown, never fabricated.
+                commandTiming.arm(); commandTiming.begin();
+                for(int i=0;i<100;++i) commandTiming.record(CommandTiming::ENTER);
+                assert(commandTiming.count==CommandTiming::capacity && commandTiming.dropped>0);
+                commandTiming.stop();
+                reset(); commandTiming.arm();
+                Bridge.values["resac_command"] = std::string("v1,") + id1 + ",ping";
+                testClock=4294967UL; notify(); testClock+=10; loop();
+                assert(static_cast<uint32_t>(commandTiming.rows[1].us-commandTiming.rows[0].us)==10000);
+                #endif
               } else { assert(false); }
             }
         '''
@@ -330,6 +364,9 @@ class FirmwareSchedulingTests(unittest.TestCase):
                             '-I' + str(directory), '-I' + str(root / 'include'), str(path), '-o', binary], check=True)
             cls.binaries.append(binary)
         cls.binary = cls.binaries[0]
+        cls.timing_binary = str(directory / 'timing-test')
+        subprocess.run([shutil.which('g++') or 'g++', '-std=c++11', '-DRESAC_COMMAND_GPIO=1', '-DRESAC_COMMAND_TIMING=1',
+                        '-I' + str(directory), '-I' + str(root / 'include'), str(path), '-o', cls.timing_binary], check=True)
         cls.batched_binary = str(directory / 'batched-test')
         subprocess.run([shutil.which('g++') or 'g++', '-std=c++11', '-DRESAC_COMMAND_GPIO=1',
                         '-I' + str(directory), '-I' + str(root / 'include'), str(path), '-o', cls.batched_binary], check=True)
@@ -371,3 +408,6 @@ class FirmwareSchedulingTests(unittest.TestCase):
 
     def test_sensor_publication_returns_to_command_loop_between_ordered_stages(self):
         subprocess.run([self.batched_binary, 'sensor-priority'], check=True)
+
+    def test_opt_in_timing_captures_irq_handler_and_uart_without_recursive_work(self):
+        subprocess.run([self.timing_binary, 'timing'], check=True)

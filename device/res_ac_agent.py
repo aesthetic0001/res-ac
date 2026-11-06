@@ -455,7 +455,7 @@ class BridgeEvents(object):
                       'resac_command', 'resac_command_status', 'resac_upload_status',
                       'resac_command_notify', 'resac_command_protocol', 'resac_fan_control'])
 
-    def __init__(self, host='127.0.0.1', port=5700, command_gpio=None):
+    def __init__(self, host='127.0.0.1', port=5700, command_gpio=None, timing=None):
         self.host, self.port = host, port
         self.connection = None
         self.connecting = False
@@ -478,6 +478,8 @@ class BridgeEvents(object):
         self.quoted = False
         self.escaped = False
         self.command_gpio = command_gpio
+        self.timing = timing
+        self.receive_sequence = 0
         self.notification = None
         self.control_session = None
         self.control_confirmed = False
@@ -530,6 +532,8 @@ class BridgeEvents(object):
         self.command_gpio.open()
         self.command_gpio.set(False)
         self.put('resac_command', frame)
+        if self.timing:
+            self.timing.record('agent.command_queue', command=frame.split(',')[1])
         # Wait for this exact put confirmation before asserting the wire. TCP
         # send completion alone does not establish that the datastore was updated.
         self.notification = dict(frame=frame, deadline=deadline, signaled=False, queued_at=queued_at, on_signal=on_signal)
@@ -599,7 +603,13 @@ class BridgeEvents(object):
                 message.get('key') == 'resac_command' and message.get('value') == pending['frame']):
             self._expire_notification()
             if self.notification is not None and not pending['signaled']:
+                if self.timing:
+                    ident = pending['frame'].split(',')[1]
+                    self.timing.record('agent.put_confirm', command=ident)
+                    self.timing.record('agent.gpio_begin', command=ident)
                 self.command_gpio.set(True)
+                if self.timing:
+                    self.timing.record('agent.gpio_assert', command=ident)
                 pending['signaled'] = True
                 pending['signaled_at'] = monotonic()
                 if pending.get('on_signal'):
@@ -632,6 +642,10 @@ class BridgeEvents(object):
         if len(fields) != 3 or fields[0] != 'v1' or fields[1] not in self.keys:
             return
         key, value = fields[1:]
+        if self.timing and key == 'resac_command_result':
+            from timing_trace import command_id
+            self.timing.record('agent.completion_received', packet=self.receive_sequence,
+                               command=command_id(value))
         if key == 'resac_events':
             if value == '':
                 # AVR restart: discard old state and unsent actions immediately.
@@ -679,7 +693,11 @@ class BridgeEvents(object):
             elif number in (125, 93):
                 self.depth -= 1
             if self.depth == 0:
+                if self.timing:
+                    self.timing.record('agent.json_begin', packet=self.receive_sequence)
                 message = decode_json(self.incoming.decode('utf-8'))
+                if self.timing:
+                    self.timing.record('agent.json_end', packet=self.receive_sequence)
                 self.incoming = bytearray()
                 self._message(message)
 
@@ -734,7 +752,12 @@ class BridgeEvents(object):
                         raise IOError('Bridge closed while sending')
                     self.outgoing = self.outgoing[sent:]
             if self.connection in reads:
+                self.receive_sequence += 1
+                if self.timing:
+                    self.timing.record('agent.recv_begin', packet=self.receive_sequence)
                 block = self.connection.recv(4096)
+                if self.timing:
+                    self.timing.record('agent.recv_end', packet=self.receive_sequence, value=len(block))
                 if not block:
                     raise IOError('Bridge closed')
                 self._receive(block)
@@ -1597,6 +1620,9 @@ class CommandProcessor(object):
         return attributes
 
     def _complete(self, status, result):
+        timing = self.config.get('_timing_trace')
+        if timing:
+            timing.record('agent.completion_consumed', command=self.current['id'])
         signaled_at = None
         if isinstance(self.bridge, BridgeEvents) and self.bridge.notification:
             signaled_at = self.bridge.notification.get('signaled_at')
@@ -2100,7 +2126,7 @@ def next_wakeup(bridge, telemetry, commands, automation, fan_reporter, pending, 
 
 
 def run(config):
-    bridge = config.get('_bridge') or BridgeEvents(command_gpio=CommandGPIO())
+    bridge = config.get('_bridge') or BridgeEvents(command_gpio=CommandGPIO(), timing=config.get('_timing_trace'))
     config['_bridge'] = bridge
     http = config.get('_http') or HttpTransport(config)
     config['_http'] = http
@@ -2117,6 +2143,9 @@ def run(config):
     sample = None
     try:
         while True:
+            timing = config.get('_timing_trace')
+            if timing and timing.dump_requested and commands.current is None and not automation.busy:
+                timing.write(config['_timing_path'])
             http.wait(bridge, 0)
             collector.tick()
             commands.tick(allow_execution=not automation.busy)
@@ -2163,6 +2192,10 @@ def run(config):
             upload.close()
         bridge.close()
         http.close()
+        timing = config.get('_timing_trace')
+        if timing and not timing.exported:
+            timing.request_dump()
+            timing.write(config['_timing_path'])
 
 
 def main():
@@ -2177,6 +2210,13 @@ def main():
         print(__doc__)
         return 0
     config = load_config(path)
+    if '--timing-trace' in sys.argv:
+        from timing_trace import TimingTrace
+        output = sys.argv[sys.argv.index('--timing-trace') + 1]
+        TimingTrace.validate_output(output)
+        timing = TimingTrace()
+        config['_timing_trace'], config['_timing_path'] = timing, output
+        signal.signal(signal.SIGUSR1, lambda *_: timing.request_dump())
     if '--probe' in sys.argv:
         status, response = post(config, {})
         # An authenticated, intentionally invalid sample verifies the route without
