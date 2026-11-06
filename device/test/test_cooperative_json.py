@@ -18,8 +18,11 @@ class CooperativeJsonTests(unittest.TestCase):
         payload = {'text': ''.join(chr(i) for i in range(128)) + '\u00e9\u96ea\U0001f600',
                    'numbers': [1.234567890123456, -0.0, 1e-200, 1e200, 2147483648],
                    'values': [True, False, None, {}, []]}
-        self.assertEqual(json.loads(cooperative.dumps(payload)), payload)
-        self.assertIn(b'1.234567890123456', cooperative.dumps(payload))
+        encoding = cooperative.Encoding(payload)
+        body = None
+        while body is None: body = encoding.step()
+        self.assertEqual(json.loads(body), payload)
+        self.assertIn(b'1.234567890123456', body)
         for value in [float('inf'), float('nan'), set(), '\ud800']:
             with self.assertRaises((ValueError, UnicodeError)): cooperative.scalar(value)
 

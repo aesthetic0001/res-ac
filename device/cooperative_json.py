@@ -35,14 +35,6 @@ def scalar(value):
     raise ValueError('Unsupported JSON scalar')
 
 
-def dumps(value):
-    encoding = Encoding(value)
-    result = None
-    while result is None:
-        result = encoding.step()
-    return result
-
-
 class Encoding(object):
     def __init__(self, value, scalar_encode=None, limit=32768):
         self.scalar_encode = scalar_encode or scalar

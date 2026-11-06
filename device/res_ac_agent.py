@@ -153,11 +153,7 @@ def log(message):
 def encode_json(value):
     if hasattr(json, 'dumps'):
         return json.dumps(value, separators=(',', ':'), allow_nan=False)
-    # Avoid the vendor writer per field and its six-decimal float formatting.
-    # Keep UTF-8 and round-tripping numeric precision with bounded output.
-    from cooperative_json import dumps
-    encoded = dumps(value)
-    return encoded if sys.version_info[0] == 2 else encoded.decode('utf-8')
+    return json.write(value)
 
 
 def decode_json(text):

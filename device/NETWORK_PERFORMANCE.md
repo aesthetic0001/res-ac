@@ -86,9 +86,10 @@ All pings succeeded on the first attempt. Five calibration and four level
 commands also succeeded once each, rejected a stale session, reported state
 and ended with the fan off. This remains above the network-bound target.
 
-The next device candidate replaces the vendor JSON writer with a bounded
-encoder on old Python installations. Scalars use direct UTF-8 escaping and
-finite round-tripping numeric representations; telemetry keeps its 512-byte
-cooperative steps. This avoids constructing the vendor writer repeatedly for
-every field. Native Bridge clients also disable Nagle buffering, matching the
-server side. Live validation of these changes is pending.
+An on-board experiment found that replacing the vendor writer for whole bodies
+regresses encoding time: a small result took 2.6 ms with the vendor writer versus
+6.0 ms with the generic encoder; a 32-event batch took 115 versus 265 ms.
+The next candidate retains the vendor writer for requests and journals and
+measures fast scalar encoding only within cooperative telemetry. Native Bridge
+clients also disable Nagle buffering, matching the server side. Live validation
+of these changes is pending.
