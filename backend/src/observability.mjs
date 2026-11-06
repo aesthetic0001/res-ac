@@ -40,6 +40,8 @@ const diagnosticRules = {
 };
 for (const phase of ['dns', 'connect', 'tls', 'first_byte', 'total'])
   diagnosticRules[`http.timing.${phase}_ms`] = value => payloadNumber(value, 0, 86400_000);
+for (const phase of ['http.agent.prepare_ms', 'http.agent.consume_ms', 'http.agent.ipc_wait_ms', 'command.final_journal_ms'])
+  diagnosticRules[phase] = value => payloadNumber(value, 0, 86400_000);
 for (const prefix of ['network.', 'network.start.']) {
   diagnosticRules[`${prefix}ipv4_default_route`] = value => ['present', 'absent', 'unknown'].includes(value);
   diagnosticRules[`${prefix}interface_state`] = value => ['up', 'down', 'dormant', 'notpresent', 'lowerlayerdown', 'testing', 'unknown'].includes(value);

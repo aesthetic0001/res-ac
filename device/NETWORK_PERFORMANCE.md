@@ -38,3 +38,13 @@ one atomic retained-publication exchange. Live acceptance and recovery evidence
 are pending. Further work must follow measured residuals, including agent
 serialization/scheduling and backend durable writes; network-bound completion
 has not been demonstrated.
+
+HTTP events carry bounded `http.agent.prepare_ms`, `http.agent.ipc_wait_ms`, and
+`http.agent.consume_ms` fields. They separate constructor work, helper/selector
+queueing outside libcurl time, and consumption after the IPC frame is read.
+`command.final_journal_ms` measures the final durable journal write before result
+submission; it is outside the HTTP request duration. These are compact attributes
+on existing events. The local command interval includes delivery-body decoding.
+Grouped SQLite work is measured by `db.transaction`, including durable commit;
+inner SQL spans do not include that commit. Compare durable server completion as
+well as the stored result timestamp, which precedes its commit.

@@ -236,6 +236,21 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(telemetry.events[0]['attributes']['outcome'], 'tls')
         self.assertGreaterEqual(telemetry.events[0]['durationMs'], 250)
 
+    def test_result_reports_prepare_ipc_consume_and_final_journal_without_extra_events(self):
+        from types import SimpleNamespace
+        telemetry=agent.Telemetry({})
+        request=agent.CurlUpload.__new__(agent.CurlUpload)
+        request.telemetry=telemetry;request.reported=False;request.started=100.0
+        request.prepared_at=100.02;request.result=SimpleNamespace(received_at=100.12)
+        request.journal_ms=10;request.parent=agent.traceparent();request.request_traceparent=agent.traceparent(request.parent)
+        request.kind='result';request.root_request=False
+        with patch.object(agent,'monotonic',return_value=100.125):
+            request._report(200,0,{'http.timing.total_ms':80})
+        self.assertEqual(len(telemetry.events),1)
+        attrs=telemetry.events[0]['attributes']
+        for key,expected in [('http.agent.prepare_ms',20),('http.agent.ipc_wait_ms',20),('http.agent.consume_ms',5),('command.final_journal_ms',10)]:
+            self.assertAlmostEqual(attrs[key],expected,places=5)
+
     def test_command_and_avr_spans_use_durable_command_context(self):
         command_id, parent = str(uuid.uuid4()), agent.traceparent()
         class Bridge:

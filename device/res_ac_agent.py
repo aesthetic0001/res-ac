@@ -1081,6 +1081,7 @@ class HttpResult(object):
         self.output = b''
         self.errors = b''
         self.body = b''
+        self.received_at = None
         self.local_error = False
 
 
@@ -1174,6 +1175,7 @@ class HttpTransport(object):
             result.errors = {1: b'Connection refused', 2: b'Network is unreachable', 3: b'No route to host',
                              4: b'Connection reset', 5: b'Broken pipe'}.get(reason, b'')
             result.body = frame[44:]
+            result.received_at = monotonic()
             result.completed = True
 
     def _failed(self):
@@ -1243,13 +1245,14 @@ def request_completed(request):
 
 class CurlUpload(object):
     """HTTP attempt backed by the shared helper, or standalone curl for probes."""
-    def __init__(self, config, payload=None, route='readings', method='POST', timeout=25, encoded_body=None):
+    def __init__(self, config, payload=None, route='readings', method='POST', timeout=25, encoded_body=None, journal_ms=None):
         self.process = None
         self.files = []
         self.transport = config.get('_http')
         self.result = None
         self.telemetry = config.get('_telemetry')
         self.started = monotonic()
+        self.prepared_at, self.journal_ms = None, journal_ms
         self.reported = False
         self.kind = 'result' if route.endswith('/result') else route
         self.network_start = {}
@@ -1267,6 +1270,7 @@ class CurlUpload(object):
         try:
             if self.transport is not None:
                 self.result = self.transport.submit(route, self.request_traceparent, payload, method, timeout, encoded_body=encoded_body)
+                self.prepared_at = monotonic()
                 return
             header_fd, header_path = temporary('res-ac-curl-')
             self.files.append(header_path)
@@ -1299,6 +1303,7 @@ class CurlUpload(object):
             # must not block the control loop while writing a subprocess pipe.
             self.process.stdin.close()
             self.process.stdin = None
+            self.prepared_at = monotonic()
         except BaseException:
             self._report(0, 0, {'error.reason': 'request_setup', 'error.stage': 'local'})
             self.close()
@@ -1317,6 +1322,17 @@ class CurlUpload(object):
         outcome = ('ok' if 200 <= status < 300 else 'failed') if not code else {6: 'dns', 7: 'connect', 28: 'timeout', 35: 'tls', 60: 'tls'}.get(code, 'other')
         attributes = {'outcome': outcome, 'curl.code': code, 'http.status_code': status, 'request.kind': self.kind}
         attributes.update(diagnostics or {})
+        ended = monotonic()
+        prepared = getattr(self, 'prepared_at', None)
+        received = getattr(getattr(self, 'result', None), 'received_at', None)
+        if prepared is not None:
+            attributes['http.agent.prepare_ms'] = max(0, (prepared - self.started) * 1000)
+        if received is not None:
+            attributes['http.agent.consume_ms'] = max(0, (ended - received) * 1000)
+            if prepared is not None and 'http.timing.total_ms' in attributes:
+                attributes['http.agent.ipc_wait_ms'] = max(0, (received - prepared) * 1000 - attributes['http.timing.total_ms'])
+        if getattr(self, 'journal_ms', None) is not None:
+            attributes['command.final_journal_ms'] = self.journal_ms
         if outcome != 'ok':
             try:
                 attributes.update(('network.start.' + key, value) for key, value in getattr(self, 'network_start', {}).items())
@@ -1624,6 +1640,7 @@ class CommandProcessor(object):
         self.reply = None
         self.cached = None
         self.persisted = False
+        self.final_journal_ms = 0
         self.retry_at = 0
         self.backoff = 1
         self.bridge_due = 0
@@ -1735,7 +1752,9 @@ class CommandProcessor(object):
             os.close(directory)
 
     def _save(self):
+        started = monotonic()
         self._write_state(self.reply)
+        self.final_journal_ms = max(0, (monotonic() - started) * 1000)
         self.cached = self.reply
         self.persisted = True
         try:
@@ -1743,10 +1762,11 @@ class CommandProcessor(object):
         except Exception:
             pass
 
-    def _accept(self, command):
+    def _accept(self, command, started_at=None):
         if not isinstance(command, dict) or not re.match(COMMAND_ID, command.get('id', '')):
             raise ValueError('Invalid command ID')
         self.backoff = 1
+        self.final_journal_ms = 0
         if self.cached and self.cached['id'] == command['id']:
             self.reply = self.cached
             self.persisted = True
@@ -1755,7 +1775,7 @@ class CommandProcessor(object):
         self.avr_phases = None
         self.avr_state = None
         self.phase_timings = {}
-        self.execution_started = monotonic()
+        self.execution_started = monotonic() if started_at is None else started_at
         self.bridge_failed_reported = False
         if not re.match(TRACEPARENT, command.get('traceparent', '')):
             command['traceparent'] = traceparent()
@@ -1960,11 +1980,12 @@ class CommandProcessor(object):
                         log('Command result no longer accepted (HTTP %d)' % status)
                         self._status('result rejected HTTP=%d' % status)
                 elif status == 200:
+                    accepted_at = monotonic()
                     value = decode_json(body.decode('utf-8'))
                     commands = value.get('commands')
                     if not isinstance(commands, list) or len(commands) != 1:
                         raise ValueError('Expected one command')
-                    self._accept(commands[0])
+                    self._accept(commands[0], started_at=accepted_at)
                 elif status == 204:
                     self.backoff = 1
                 else:
@@ -1984,7 +2005,7 @@ class CommandProcessor(object):
                     self._save()
                 payload = dict(status=self.reply['status'], result=self.reply['result'], traceparent=self.reply.get('traceparent') or traceparent())
                 self.request = CurlUpload(self.config, payload,
-                                          route='commands/%s/result' % self.reply['id'])
+                                          route='commands/%s/result' % self.reply['id'], journal_ms=self.final_journal_ms)
                 self.request_kind = 'result'
             else:
                 if self.bridge.get('resac_command_ready') not in ('v1', 'v2', 'v3', 'v4'):

@@ -362,3 +362,18 @@ test('compact command timing fields expand only on the backend and deduplicate a
     assert.equal(validateTelemetry({...value,events:[{...value.events[0],attributes:{'command.timing.fetch_ms':invalid}}]}),false);
   assert.equal(validateTelemetry({...value,events:[{...value.events[0],name:'reading.buffer'}]}),false);
 });
+
+test('compact agent and final-journal phases stay bounded on existing HTTP events', () => {
+  const value=batch();
+  const phases=['http.agent.prepare_ms','http.agent.consume_ms','http.agent.ipc_wait_ms','command.final_journal_ms'];
+  for (const key of phases) {
+    value.events[0].attributes={outcome:'ok','request.kind':'result',[key]:25};
+    assert.equal(validateTelemetry(value),true);
+    for (const invalid of [-1,NaN,Infinity,86400_001,'secret']) {
+      value.events[0].attributes[key]=invalid;
+      assert.equal(validateTelemetry(value),false);
+    }
+  }
+  value.events[0]={...value.events[0],name:'command.execute',attributes:{outcome:'ok','http.agent.prepare_ms':10}};
+  assert.equal(validateTelemetry(value),false);
+});
