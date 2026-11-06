@@ -1146,7 +1146,26 @@ class HttpTransport(object):
         message = b'Q' + struct.pack('!II', result.id, timeout) + (b'G' if method == 'GET' else b'P')
         self._queue(message + self.field(route) + self.field(parent) + self.field(body))
         self.pending[result.id] = result
+        # Start network work before the caller runs background telemetry/fan work.
+        # One nonblocking send is enough; backpressure stays with the selector.
+        try:
+            self._flush()
+        except (IOError, OSError):
+            self._failed()
         return result
+
+    def _flush(self):
+        if self.connection is None or not self.outgoing:
+            return
+        try:
+            sent = self.connection.send(self.outgoing)
+        except (IOError, OSError) as error:
+            if getattr(error, 'errno', None) in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+                return
+            raise
+        if sent == 0:
+            raise IOError('HTTP helper closed')
+        self.outgoing = self.outgoing[sent:]
 
     def cancel(self, result):
         if result.id not in self.pending:
@@ -1222,10 +1241,7 @@ class HttpTransport(object):
                 if connection in errors:
                     raise IOError('HTTP helper connection failed')
                 if connection in writable:
-                    sent = connection.send(self.outgoing)
-                    if sent == 0:
-                        raise IOError('HTTP helper closed')
-                    self.outgoing = self.outgoing[sent:]
+                    self._flush()
                 if connection in readable:
                     block = connection.recv(65536)
                     if not block:

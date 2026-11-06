@@ -1,5 +1,6 @@
 """Serialize bounded JSON in small steps so the event loop can service I/O."""
 import re
+import time
 
 try:
     strings, integers = (str, unicode), (int, long)
@@ -39,12 +40,19 @@ class Encoding(object):
     def __init__(self, value, scalar_encode=None, limit=32768):
         self.scalar_encode = scalar_encode or scalar
         self.limit, self.size, self.parts = limit, 0, []
+        self.keys = {}
         self.pending, self.result = b'', None
         self.tokens = self._tokens(value, 0)
 
-    def _scalar(self, value):
+    def _scalar(self, value, key=False):
+        cache_key = (type(value), value) if key and len(value) <= 128 else None
+        if cache_key is not None and cache_key in self.keys:
+            return self.keys[cache_key]
         encoded = self.scalar_encode(value)
-        return encoded.encode('utf-8') if not isinstance(encoded, bytes) else encoded
+        encoded = encoded.encode('utf-8') if not isinstance(encoded, bytes) else encoded
+        if cache_key is not None and len(self.keys) < 64 and len(encoded) <= 130:
+            self.keys[cache_key] = encoded
+        return encoded
 
     def _tokens(self, value, depth):
         if depth > 16:
@@ -55,7 +63,7 @@ class Encoding(object):
                 if not isinstance(key, strings):
                     raise ValueError('JSON keys must be strings')
                 if index: yield b','
-                yield self._scalar(key)
+                yield self._scalar(key, key=True)
                 yield b':'
                 for part in self._tokens(item, depth + 1): yield part
             yield b'}'
@@ -78,11 +86,16 @@ class Encoding(object):
         else:
             raise ValueError('Unsupported JSON value')
 
-    def step(self, budget=512):
+    def step(self, budget=512, max_seconds=.005):
         if not 1 <= budget <= 32768:
             raise ValueError('Invalid serialization budget')
+        if not 0 < max_seconds <= 1:
+            raise ValueError('Invalid serialization time budget')
         if self.result is not None:
             return self.result
+        # This bounds active work, not a wake-up timer. Clock adjustments can
+        # yield early; the byte budget still bounds work after a backwards jump.
+        deadline = time.time() + max_seconds
         while budget:
             if not self.pending:
                 try:
@@ -98,4 +111,6 @@ class Encoding(object):
             self.pending = self.pending[count:]
             self.size += count
             budget -= count
+            if time.time() >= deadline:
+                return None
         return None

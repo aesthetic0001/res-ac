@@ -1,4 +1,5 @@
 import json
+import errno
 import os
 from pathlib import Path
 import socket
@@ -113,6 +114,14 @@ class PersistentHttpTests(unittest.TestCase):
             remaining = deadline - time.monotonic()
             self.assertGreater(remaining, 0, 'No HTTP completion event')
             self.http.wait(timeout=remaining)
+
+    def test_request_starts_before_the_agent_returns_to_its_selector(self):
+        request = self.upload(dict(hold=True))
+        self.assertTrue(self.held.wait(2), 'Queued HTTP work waited for a later agent iteration')
+        self.assertFalse(request.completed)
+        self.release.set()
+        self.completed(request)
+        self.assertEqual(request.finish(), (201, b'{"ok":true}'))
 
     def test_reuses_one_process_and_tls_connection_without_request_files(self):
         real_popen = subprocess.Popen
@@ -396,3 +405,37 @@ class SchedulerTests(unittest.TestCase):
         self.assertFalse(agent.request_completed(request))
         result.completed = True
         self.assertTrue(agent.request_completed(request))
+
+
+class NonblockingSubmissionTests(unittest.TestCase):
+    def test_backpressure_and_short_writes_preserve_the_queued_frame(self):
+        class Connection:
+            def __init__(self): self.calls = 0
+            def send(self, data):
+                self.calls += 1
+                if self.calls == 1: raise OSError(errno.EAGAIN, 'busy')
+                return min(3, len(data))
+            def close(self): pass
+        transport = agent.HttpTransport({})
+        transport.connection = Connection()
+        result = transport.submit('readings', agent.traceparent(), {'value': 1}, 'POST', 25)
+        queued = transport.outgoing
+        self.assertTrue(queued)
+        self.assertIs(transport.pending[result.id], result)
+        self.assertFalse(result.completed)
+        transport._flush()
+        self.assertEqual(transport.outgoing, queued[3:])
+        transport.close()
+
+    def test_failed_immediate_send_completes_locally_without_replaying_work(self):
+        class Connection:
+            def send(self, data): raise OSError(errno.EPIPE, 'closed')
+            def close(self): pass
+        transport = agent.HttpTransport({})
+        transport.connection = Connection()
+        result = transport.submit('commands', agent.traceparent(), None, 'GET', 35)
+        self.assertTrue(result.completed)
+        self.assertTrue(result.local_error)
+        self.assertEqual(transport.outgoing, b'')
+        self.assertIsNone(transport.connection)
+        transport.close()

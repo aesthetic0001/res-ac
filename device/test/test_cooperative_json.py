@@ -14,6 +14,33 @@ cooperative=importlib.util.module_from_spec(spec);spec.loader.exec_module(cooper
 
 
 class CooperativeJsonTests(unittest.TestCase):
+    def test_slow_encoding_yields_for_io_before_using_its_byte_budget(self):
+        clock = [0.0]
+        def slow(value):
+            clock[0] += .004
+            return agent.encode_json(value)
+        payload = {'events': [{'name': 'command.execute', 'duration': i} for i in range(32)]}
+        encoding = cooperative.Encoding(payload, slow)
+        with patch.object(cooperative.time, 'time', lambda: clock[0]):
+            self.assertIsNone(encoding.step())
+            self.assertLess(encoding.size, 512)
+            self.assertLessEqual(clock[0], .012)
+            body = None
+            while body is None: body = encoding.step()
+        self.assertEqual(json.loads(body), payload)
+
+    def test_key_cache_is_bounded_and_reuses_common_telemetry_keys(self):
+        calls = []
+        def encode(value): calls.append(value); return agent.encode_json(value)
+        payload = {'events': [{'name': 'reading.collect', 'number': i} for i in range(32)],
+                   'many': dict(('key_%d' % i, i) for i in range(100))}
+        encoding = cooperative.Encoding(payload, encode)
+        body = None
+        while body is None: body = encoding.step()
+        self.assertEqual(json.loads(body), payload)
+        self.assertEqual(calls.count('name'), 1)
+        self.assertLessEqual(len(encoding.keys), 64)
+
     def test_fast_scalars_escape_controls_and_preserve_unicode_and_numeric_precision(self):
         payload = {'text': ''.join(chr(i) for i in range(128)) + '\u00e9\u96ea\U0001f600',
                    'numbers': [1.234567890123456, -0.0, 1e-200, 1e200, 2147483648],

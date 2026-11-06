@@ -93,3 +93,22 @@ The next candidate retains the vendor writer for requests and journals and
 measures fast scalar encoding only within cooperative telemetry. Native Bridge
 clients also disable Nagle buffering, matching the server side. Live validation
 of these changes is pending.
+
+The corrected scalar-only run passed 100 first-attempt pings at 165.5/217 ms
+median/p95 to the stored timestamp, or 191.07/249.50 ms through durable server
+completion. Its transport estimate was 48.28/69.90 ms, so some tail improvement
+also coincided with lower network jitter. Agent command handling measured
+40/80 ms, notification 10/30 ms, and Bridge round trip 20/40 ms. These overlap.
+The paired board benchmark measured a cooperative batch at 301 ms with vendor
+scalar encoding versus 256 ms with direct scalars, with maximum observed steps
+of 40 versus 30 ms. Whole request/journal bodies still use the vendor writer.
+
+The next candidate caches up to 64 short dictionary keys per telemetry batch
+and yields after a five-millisecond work budget as well as the 512-byte budget.
+It adds no wake-up timer. Each step makes progress; a backwards wall-clock
+adjustment cannot remove its byte limit. A scalar can finish before yielding.
+HTTP submission attempts one nonblocking helper write immediately so network
+work can overlap the caller's remaining background work. Short writes and
+backpressure leave the remainder for the existing readiness selector; fatal
+helper errors complete locally and never replay queued work. Live validation
+of these changes is pending.
