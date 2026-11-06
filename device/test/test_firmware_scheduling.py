@@ -34,6 +34,8 @@ class FirmwareSchedulingTests(unittest.TestCase):
                 using std::isnan;
                 using std::lround;
                 #define F(s) s
+                #define PSTR(s) s
+                #define snprintf_P snprintf
                 #define HEX 16
                 #define _BV(bit) (1U << (bit))
                 enum {PB2=2, DDB2=2, PCIF0=0, PCINT2=2, PCIE0=0};

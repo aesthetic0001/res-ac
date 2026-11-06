@@ -72,7 +72,7 @@ void publishValue(const char *key, const char *value) {
   // Retain a snapshot for reconnects, then notify connected Linux clients.
   Bridge.put(key, value);
   char event[224];
-  const int length = snprintf(event, sizeof(event), "v1,%s,%s", key, value);
+  const int length = snprintf_P(event, sizeof(event), PSTR("v1,%s,%s"), key, value);
   if (length > 0 && static_cast<size_t>(length) < sizeof(event))
     Mailbox.writeMessage(reinterpret_cast<const uint8_t *>(event), length);
 }
@@ -83,7 +83,7 @@ void publishFanState() {
 #endif
   fanStatePending = false;
   char frame[96];
-  snprintf(frame, sizeof(frame), "v2,%s,%u,%u,%u,%lu,%s", fanSession[0] ? fanSession : "none",
+  snprintf_P(frame, sizeof(frame), PSTR("v2,%s,%u,%u,%u,%lu,%s"), fanSession[0] ? fanSession : "none",
            fan.calibrated(), fan.power(), fan.speed(), fanRevision, fanControlSource);
   publishValue("resac_fan_state", frame);
 }
@@ -262,24 +262,24 @@ void processCommand() {
           !fanSession[0] || strcmp(session, fanSession) != 0 ||
           !fanHeartbeat[0] || static_cast<unsigned long>(millis() - lastFanHeartbeatMs) > 10000 ||
           (!calibrate && !fan.calibrated())) {
-        snprintf(lastCommandReply, sizeof(lastCommandReply), "v3,%s,rejected,%s", id, session);
+        snprintf_P(lastCommandReply, sizeof(lastCommandReply), PSTR("v3,%s,rejected,%s"), id, session);
       } else if (calibrate) {
         fan.calibrateOff(); fanControlSource = "calibration"; ++fanRevision; publishFanState();
-        snprintf(lastCommandReply, sizeof(lastCommandReply), "v3,%s,calibrated,%s", id, session);
+        snprintf_P(lastCommandReply, sizeof(lastCommandReply), PSTR("v3,%s,calibrated,%s"), id, session);
         Serial.println(F("Fan calibrated: estimated off; saved speed 1"));
       } else if (levelControl) {
         uint8_t presses;
         if (setFanLevel(command, automatic, presses))
-          snprintf(lastCommandReply, sizeof(lastCommandReply), "v4,%s,level_set,%s,%lu,%u,%lu", id, session, command, presses, millis());
-        else snprintf(lastCommandReply, sizeof(lastCommandReply), "v3,%s,rejected,%s", id, session);
+          snprintf_P(lastCommandReply, sizeof(lastCommandReply), PSTR("v4,%s,level_set,%s,%lu,%u,%lu"), id, session, command, presses, millis());
+        else snprintf_P(lastCommandReply, sizeof(lastCommandReply), PSTR("v3,%s,rejected,%s"), id, session);
       } else {
         if (sendFanIR(address, command, repeats))
-          snprintf(lastCommandReply, sizeof(lastCommandReply), "v3,%s,ir_sent,%s,%lu,%lu,%lu,%lu",
+          snprintf_P(lastCommandReply, sizeof(lastCommandReply), PSTR("v3,%s,ir_sent,%s,%lu,%lu,%lu,%lu"),
                    id, session, address, command, repeats, millis());
-        else snprintf(lastCommandReply, sizeof(lastCommandReply), "v3,%s,rejected,%s", id, session);
+        else snprintf_P(lastCommandReply, sizeof(lastCommandReply), PSTR("v3,%s,rejected,%s"), id, session);
       }
     } else {
-      snprintf(lastCommandReply, sizeof(lastCommandReply), "v1,%s,pong,%lu", id, millis());
+      snprintf_P(lastCommandReply, sizeof(lastCommandReply), PSTR("v1,%s,pong,%lu"), id, millis());
       Serial.println(F("Ping handled by Arduino; replying pong"));
     }
     strcpy(lastCommandId, id);
@@ -291,11 +291,11 @@ void processCommand() {
     const char source = strcmp(fanControlSource, "automatic") == 0 ? 'a' :
                         strcmp(fanControlSource, "manual") == 0 ? 'm' :
                         strcmp(fanControlSource, "calibration") == 0 ? 'c' : 'r';
-    const int size = snprintf(prefix, sizeof(prefix), "v6,%lu,%lu,%lu,%lu,%u,%u,%c,", fetchDuration,
+    const int size = snprintf_P(prefix, sizeof(prefix), PSTR("v6,%lu,%lu,%lu,%lu,%u,%u,%c,"), fetchDuration,
                               safetyDuration, static_cast<unsigned long>(millis() - executionStarted),
                               fanRevision, (fan.calibrated() ? 1 : 0) | (fan.power() ? 2 : 0), fan.speed(), source);
 #else
-    const int size = snprintf(prefix, sizeof(prefix), "v5,%lu,%lu,%lu,", fetchDuration,
+    const int size = snprintf_P(prefix, sizeof(prefix), PSTR("v5,%lu,%lu,%lu,"), fetchDuration,
                               safetyDuration, static_cast<unsigned long>(millis() - executionStarted));
 #endif
     const size_t replyLength = strlen(lastCommandReply);
@@ -305,7 +305,7 @@ void processCommand() {
     memcpy(lastCommandReply, prefix, size);
 #else
     char diagnostic[72];
-    snprintf(diagnostic, sizeof(diagnostic), "v1,%s,%lu,%s", id,
+    snprintf_P(diagnostic, sizeof(diagnostic), PSTR("v1,%s,%lu,%s"), id,
              static_cast<unsigned long>(millis() - executionStarted),
              strstr(lastCommandReply, ",rejected,") ? "failed" : "ok");
     publishValue("resac_command_diagnostic", diagnostic);
@@ -373,7 +373,7 @@ void updateInterval() {
 void publishSensorDiagnostic(const char *epoch, unsigned long duration, bool ok) {
   if (!validEpoch(epoch)) return;
   char frame[112];
-  snprintf(frame, sizeof(frame), "v1,%s,%lu,%lu,%lu,%s,%lu,%lu", epoch, sequence,
+  snprintf_P(frame, sizeof(frame), PSTR("v1,%s,%lu,%lu,%lu,%s,%lu,%lu"), epoch, sequence,
            sensorAttempts, duration, ok ? "ok" : "failed", millis(), sensorErrors);
   publishValue("resac_sensor_diagnostic", frame);
 }
@@ -423,7 +423,7 @@ void publishSample() {
       break;
     case 3: {
       char frame[112];
-      snprintf(frame, sizeof(frame), "v1,%s,%lu,%ld,%ld,%lu", sample.epoch, sequence,
+      snprintf_P(frame, sizeof(frame), PSTR("v1,%s,%lu,%ld,%ld,%lu"), sample.epoch, sequence,
                sample.temperatureMilli, sample.humidityMilli, sample.sampledAt);
       publishValue("resac_sample", frame);
       sample.stage = 4;
@@ -467,7 +467,7 @@ void publishSample() {
   const long temperatureMilli = lround(temperature * 1000.0f);
   const long humidityMilli = lround(humidity * 1000.0f);
   ++sequence;
-  snprintf(frame, sizeof(frame), "v1,%s,%lu,%ld,%ld,%lu", epoch, sequence,
+  snprintf_P(frame, sizeof(frame), PSTR("v1,%s,%lu,%ld,%ld,%lu"), epoch, sequence,
            temperatureMilli, humidityMilli, millis());
   publishSensorDiagnostic(epoch, duration, true);
   publishValue("resac_sensor_status", "ok");
