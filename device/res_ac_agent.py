@@ -1990,6 +1990,37 @@ class CommandProcessor(object):
         log('Command request failed (%s); retrying in %ds' % (detail, self.backoff))
         self.backoff = min(self.backoff * 2, 60)
 
+    def _response_commands(self, body, result_id=None):
+        started = monotonic()
+        if self.config.get('native_bridge', False) and body.startswith(b'RAC1'):
+            from command_wire import decode
+            value = decode(body)
+        else:
+            value = decode_json(body.decode('utf-8'))
+        if not isinstance(value, dict):
+            raise ValueError('Expected a command response object')
+        if result_id is not None and 'commands' not in value:
+            return [], started, monotonic()  # Older servers acknowledge without a handoff.
+        commands = value.get('commands')
+        if (not isinstance(commands, list) or len(commands) > 1 or
+                (result_id is None and len(commands) != 1)):
+            raise ValueError('Expected at most one command')
+        if result_id is not None:
+            if value.get('ok') is not True or value.get('resultId') != result_id:
+                raise ValueError('Handoff does not acknowledge the submitted result')
+            for command in commands:
+                ident = command.get('id') if isinstance(command, dict) else None
+                if (not isinstance(ident, (str, text_type)) or not re.match(COMMAND_ID, ident) or ident == result_id or
+                        not isinstance(command.get('traceparent', ''), (str, text_type))):
+                    raise ValueError('Invalid handoff command')
+        return commands, started, monotonic()
+
+    def _accept_decoded(self, commands, started, decoded):
+        if commands:
+            self._accept(commands[0], started_at=started)
+            if self.current is not None:
+                self.phase_timings['command.timing.decode_ms'] = max(0, (decoded - started) * 1000)
+
     def tick(self, allow_execution=True):
         if self.request is not None and request_completed(self.request):
             try:
@@ -1997,28 +2028,28 @@ class CommandProcessor(object):
                 if self.request_kind == 'result':
                     if status not in (200, 404, 409):
                         raise UploadError(status=status)
+                    commands, started, decoded = [], None, None
+                    if status == 200 and self.config.get('native_bridge', False):
+                        commands, started, decoded = self._response_commands(body, self.reply['id'])
+                    previous = self.reply
                     self.reply = None
+                    try:
+                        self._accept_decoded(commands, started, decoded)
+                    except Exception:
+                        # Acceptance never dispatches IR. Keep the previous journal
+                        # and retry its persisted server handoff on malformed input.
+                        self.current, self.reply = None, previous
+                        raise
                     self.backoff = 1
                     if status == 200:
                         log('Command result accepted by backend')
-                        self._status('result accepted HTTP=200')
+                        if not commands:
+                            self._status('result accepted HTTP=200')
                     else:
                         log('Command result no longer accepted (HTTP %d)' % status)
                         self._status('result rejected HTTP=%d' % status)
                 elif status == 200:
-                    accepted_at = monotonic()
-                    if self.config.get('native_bridge', False) and body.startswith(b'RAC1'):
-                        from command_wire import decode
-                        value = decode(body)
-                    else:
-                        value = decode_json(body.decode('utf-8'))
-                    decoded_at = monotonic()
-                    commands = value.get('commands')
-                    if not isinstance(commands, list) or len(commands) != 1:
-                        raise ValueError('Expected one command')
-                    self._accept(commands[0], started_at=accepted_at)
-                    if self.current is not None:
-                        self.phase_timings['command.timing.decode_ms'] = max(0, (decoded_at - accepted_at) * 1000)
+                    self._accept_decoded(*self._response_commands(body))
                 elif status == 204:
                     self.backoff = 1
                 else:
@@ -2037,8 +2068,10 @@ class CommandProcessor(object):
                 if not self.persisted:
                     self._save()
                 payload = dict(status=self.reply['status'], result=self.reply['result'], traceparent=self.reply.get('traceparent') or traceparent())
-                self.request = CurlUpload(self.config, payload,
-                                          route='commands/%s/result' % self.reply['id'], journal_ms=self.final_journal_ms)
+                route = 'commands/%s/result' % self.reply['id']
+                if self.config.get('native_bridge', False):
+                    route += '?format=binary-v1&next=1'
+                self.request = CurlUpload(self.config, payload, route=route, journal_ms=self.final_journal_ms)
                 self.request_kind = 'result'
             else:
                 if self.bridge.get('resac_command_ready') not in ('v1', 'v2', 'v3', 'v4'):

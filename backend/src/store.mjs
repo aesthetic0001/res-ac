@@ -27,10 +27,12 @@ export class Store {
       CREATE INDEX IF NOT EXISTS command_device_time ON commands(device_id,created_at);
       CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,csrf TEXT NOT NULL,expires_at INTEGER NOT NULL,auth_version TEXT NOT NULL);`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS fan_states(device_id TEXT PRIMARY KEY REFERENCES devices(id), state TEXT NOT NULL, received_at INTEGER NOT NULL);`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS command_handoffs(previous_id TEXT PRIMARY KEY REFERENCES commands(id) ON DELETE CASCADE,
+      next_id TEXT UNIQUE REFERENCES commands(id) ON DELETE CASCADE);`);
     if (!this.db.prepare('PRAGMA table_info(commands)').all().some(column => column.name === 'traceparent'))
       this.db.exec('ALTER TABLE commands ADD COLUMN traceparent TEXT');
     if (observability) {
-      for (const name of ['transaction', 'device', 'seen', 'fanState', 'setFanState', 'reading', 'readingHistory', 'enqueue', 'command', 'claim', 'result', 'expire', 'createSession', 'session', 'logout', 'snapshot']) {
+      for (const name of ['transaction', 'device', 'seen', 'fanState', 'setFanState', 'reading', 'readingHistory', 'enqueue', 'command', 'claim', 'result', 'resultAndClaim', 'expire', 'createSession', 'session', 'logout', 'snapshot']) {
         const original = this[name].bind(this);
         this[name] = (...args) => observability.run(`db.${name}`, { 'db.system.name': 'sqlite' }, () => original(...args));
       }
@@ -140,6 +142,9 @@ export class Store {
     // Preserve device command order until the first command completes or expires.
     const command = this.db.prepare("SELECT * FROM commands WHERE device_id=? AND status IN ('pending','inflight') ORDER BY created_at,rowid LIMIT 1").get(deviceId);
     if (!command || (command.status === 'inflight' && command.lease_until > now)) return null;
+    return this.lease(command, leaseMs, now);
+  }
+  lease(command, leaseMs, now) {
     if (!command.traceparent && this.observability) {
       command.traceparent = this.observability.currentTraceparent();
       this.db.prepare('UPDATE commands SET traceparent=? WHERE id=?').run(command.traceparent, command.id);
@@ -152,12 +157,15 @@ export class Store {
       this.afterCommit(() => {
         if (!command.attempts) {
           this.observability.record('command.queue_wait', command.traceparent, command.created_at, now - command.created_at, attributes);
-          this.observability.queueTime.observe({ device: deviceId }, (now - command.created_at) / 1000);
+          this.observability.queueTime.observe({ device: command.device_id }, (now - command.created_at) / 1000);
         }
         this.observability.record('command.delivery', command.traceparent, now, 0,
           { ...attributes, 'delivery.attempt': command.attempts + 1, 'command.age_ms': now - command.created_at });
       });
     }
+    return this.commandValue(command);
+  }
+  commandValue(command) {
     return { ...(command.traceparent ? { traceparent: command.traceparent } : {}), id: command.id, type: command.type, payload: JSON.parse(command.payload),
       createdAt: new Date(command.created_at).toISOString(), expiresAt: new Date(command.expires_at).toISOString() };
   }
@@ -173,6 +181,26 @@ export class Store {
     if (command.status !== 'inflight') return { code: 409, error: 'Command has not been delivered or has expired' };
     this.db.prepare('UPDATE commands SET status=?,result=?,completed_at=?,lease_until=NULL WHERE id=?').run(status, serialized, Date.now(), id);
     return { code: 200, duplicate: false };
+  }
+  resultAndClaim(deviceId, id, status, value, leaseMs, allowClaim = true) {
+    return this.transaction(() => {
+      const result = this.result(deviceId, id, status, value);
+      if (result.code !== 200) return result;
+      const previous = this.db.prepare('SELECT next_id FROM command_handoffs WHERE previous_id=?').get(id);
+      let next = null;
+      if (previous?.next_id && allowClaim) {
+        // A lost response must recover this same handoff, including after restart.
+        const command = this.command(previous.next_id), now = Date.now();
+        if (command?.device_id === deviceId && command.status === 'inflight' && command.expires_at > now) {
+          next = command.lease_until > now ? this.commandValue(command) : this.lease(command, leaseMs, now);
+        }
+      } else if (!previous && !result.duplicate) {
+        next = allowClaim ? this.claim(deviceId, leaseMs) : null;
+        // Persist an empty decision too: a duplicate must not claim another action.
+        this.db.prepare('INSERT INTO command_handoffs(previous_id,next_id) VALUES(?,?)').run(id, next?.id ?? null);
+      }
+      return { ...result, resultId: id, commands: next ? [next] : [] };
+    });
   }
   createSession(key, csrf, expiresAt, authVersion) { this.db.prepare('INSERT INTO sessions VALUES(?,?,?,?)').run(digest(key), csrf, expiresAt, authVersion); }
   session(key) { return this.db.prepare('SELECT * FROM sessions WHERE token_hash=? AND expires_at>?').get(digest(key), Date.now()); }
