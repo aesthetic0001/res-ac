@@ -192,6 +192,20 @@ class NativeBridgeTests(unittest.TestCase):
         pump(lambda:bridge.get('resac_command_result') is not None)
         bridge.cancel_command();self.assertFalse(levels[-1])
 
+    def test_legacy_struct_receives_byte_strings_without_json_decoding(self):
+        from test_agent import agent
+        unpack=struct.unpack
+        def legacy_unpack(format, data):
+            if isinstance(data, bytearray):
+                raise TypeError('Legacy struct requires a byte string')
+            return unpack(format, data)
+        bridge=agent.BridgeEvents(native=True);bridge.snapshot_pending=True
+        encoded=frame(b'S'+protocol.entry('resac_events','v1')+protocol.entry('resac_native_bridge','v1'))
+        with patch.object(struct,'unpack',legacy_unpack), \
+                patch.object(agent,'decode_json',side_effect=AssertionError('Native stream must not decode JSON')):
+            for byte in encoded:bridge._receive(bytes([byte]))
+        self.assertTrue(bridge.ready)
+
     def test_agent_rejects_bad_native_lengths_and_snapshot_capability(self):
         from test_agent import agent
         bridge=agent.BridgeEvents(native=True)
