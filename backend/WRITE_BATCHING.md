@@ -52,3 +52,57 @@ per measured command. Verify actual shared commits via batch metrics, restart
 and downgrade recovery, fresh reports, and production rollback. Reject and close
 the draft if it fails the gate. Reduced sync count alone does not qualify or
 prove the full application is network bound.
+
+
+## Live outcome: rejected (2026-11-06)
+
+The unchanged production device ran against one candidate backend image with
+batching disabled/enabled. Each mode completed 240 burst pings (ten bursts of
+24) and 100 ordinary pings, all successfully on the first attempt.
+
+| Measure | Independent commits | Grouped commits |
+| --- | ---: | ---: |
+| Median 24-ping burst completion | 4,546 ms | 4,053 ms |
+| p95 gap between completions | 244 ms | 227 ms |
+| Ordinary durable median, 100 pings | 189.76 ms | 184.06 ms |
+| Ordinary durable p95, 100 pings | 239.27 ms | 262.47 ms |
+| Diagnostic events dropped during measured bursts | 145 | 160 |
+| Reading drops | 0 | 0 |
+
+The 10.84% median burst improvement and 6.97% p95-gap improvement are below the
+20% gate. Ordinary durable p95 was 9.70% higher, exceeding the 5% regression
+limit. These independent samples include network/storage variation, so the
+entire p95 difference cannot be attributed to batching. They provide no basis
+for claiming an ordinary-command improvement.
+
+Metrics confirm the intended batching behavior: measured burst phases handled
+556 one-job transaction attempts in the control versus 557 jobs in 355 attempts
+with batching. However, all 360 observed write jobs in the grouped ordinary
+phase still ran as single-job transactions. An ordinary command's enqueue/lease
+and final-result commits remain separate. Reducing concurrent enqueue syncs
+therefore saves burst setup cost without removing these two required durable
+waits. The implementation should not have been prioritized as a likely large
+ordinary-latency improvement without quantifying that ceiling first.
+
+The idle read-only keeper preserved WAL allocation across control restarts,
+but the first control phase still grew the WAL from 3,996,432 to 4,128,272 bytes;
+later measured phases retained that size. This can favor the grouped comparison.
+Even the favorable pooled comparison missed the gate. The fully warm repeat
+pair improved median burst completion only 7.05%.
+
+Durable ordinary figures use paired traces through the end of the result-upload
+server span after COMMIT. Burst figures use stored completion timestamps and
+exclude the final commit tail. Neither measures dashboard rendering or the
+result acknowledgment's return to the device. Current paired ordinary traces
+still show about 50–51 ms combined transaction time per command and about 50 ms
+warm result-HTTP transport excluding backend processing. Agent execution is
+about 40–50 ms, including a nested 20 ms Bridge round trip. These overlapping
+phases and their percentiles cannot be added to infer a full critical path.
+
+The accepted backend image/source were restored with the live database retained.
+The temporary keeper was removed. Six post-rollback pings and fresh reading/fan
+reports passed; the fan remained calibrated off and the database quick check
+passed. Device firmware, runtime, calibration, Wi-Fi files, and IR journals were
+unchanged throughout this backend-only experiment. The draft is closed without
+merging. Future implementation should follow an attributed critical-path bound,
+rather than another speculative SQLite variation.
