@@ -1,5 +1,38 @@
 # Durable SQLite synchronization experiment
 
+## Outcome: rejected after the production canary
+
+The experiment missed the 20% end-to-end acceptance gate and was rolled back.
+Production remains on the accepted `6fa81ab` release with the live database
+preserved. No device agent or AVR firmware changed during the trial.
+
+Two warmed 100-ping samples per mode, with WAL allocation constant, produced:
+
+| Durable completion | Built-in SQLite | Data synchronization | Reduction |
+| --- | ---: | ---: | ---: |
+| Median, pooled 200 pings per mode | 183.20 ms | 163.68 ms | 10.65% |
+| p95, pooled 200 pings per mode | 277.62 ms | 227.61 ms | 18.02% |
+
+The individual warmed p95 results were 287.80/250.66 ms for built-in SQLite
+and 227.55/227.61 ms for the candidate. Cold/growing-WAL samples showed no
+improvement: 184.19/255.89 ms median/p95 for built-in SQLite versus
+183.78/271.32 ms for the candidate. The first cold control grew the WAL on
+all 100 commands. This distinction explains why an overwrite-only storage
+microbenchmark overstated practical gains.
+
+All sampled commands completed on their first attempt, with fresh readings and
+fan reports. A bounded idle read-only connection preserved WAL allocation across
+the repeat mode switches without holding a read transaction. The helper was
+removed after the trial. Tracing confirmed the daemon really used `fdatasync`.
+The candidate passed 62 backend tests, including process-kill recovery and
+real synchronization-error injection; tests alone did not establish acceptance.
+
+The implementation below is retained on this experimental branch for reference.
+It is not the production backend configuration and does not establish that the
+software is network bound.
+
+## Implementation and isolated measurements
+
 Production command completion still includes substantial durable SQLite I/O.
 On the backend's ext4 volume, interleaved disposable WAL commits measured
 14.42/38.46 ms median/p95 with Node's built-in driver and 6.88/20.25 ms with
