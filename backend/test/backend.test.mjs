@@ -24,7 +24,7 @@ async function fixture(t, overrides = {}) {
     pollWaitMs: 100, leaseMs: 60, devices: [{ id: 'board-1', token: firstDeviceToken }, { id: 'board-2', token: secondDeviceToken }], ...overrides };
   const directory = mkdtempSync(join(tmpdir(), 'sensor-test-'));
   const path = join(directory, 'state.sqlite');
-  const store = new Store(path, config.devices);
+  const store = new Store(path, config.devices, undefined, { fanHeartbeatCheckpointMs: config.fanHeartbeatCheckpointMs });
   const app = createApp(config, store);
   const server = http.createServer(app.handler);
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -116,6 +116,26 @@ test('speed presses require power on while absolute levels can power on first', 
   f.store.setFanState('board-1', { ...state, power: 'on', speed: 1, revision: 2 });
   for (const button of ['speed_up', 'speed_down']) assert.equal((await queue('fan.command', { button })).status, 201);
   for (const command of [0x16, 0x14]) assert.equal((await queue('ir.send', { protocol: 'NEC', address: 0xDE80, command })).status, 201);
+});
+
+test('HTTP fan heartbeats avoid presence writes while preserving fresh live state and revision validation', async t => {
+  let now = Date.now(); t.mock.method(Date, 'now', () => now);
+  const f = await fixture(t, { fanHeartbeatCheckpointMs: 60_000 });
+  const state = { sessionId: randomBytes(16).toString('hex'), calibrated: true, power: 'off', speed: 0, revision: 1, firmwareVersion: 'v4' };
+  const report = value => f.request('/api/devices/board-1/fan-state', {
+    method: 'POST', headers: f.deviceHeaders, body: JSON.stringify(value)
+  });
+  assert.equal((await report(state)).status, 200);
+  const changes = f.store.db.prepare('SELECT total_changes() n').get().n;
+  const persistedAt = f.store.db.prepare('SELECT received_at FROM fan_states WHERE device_id=?').get('board-1').received_at;
+  now += 10_000;
+  assert.equal((await report(state)).status, 200);
+  assert.equal(f.store.db.prepare('SELECT total_changes() n').get().n, changes);
+  assert.equal(f.store.fanState('board-1').receivedAt, now);
+  assert.equal(f.store.device('board-1').last_seen, now);
+  assert.equal(f.store.db.prepare('SELECT received_at FROM fan_states WHERE device_id=?').get('board-1').received_at, persistedAt);
+  assert.equal((await report({ ...state, revision: 2 })).status, 200);
+  assert.equal((await report(state)).status, 409);
 });
 
 test('calibration gates remote requests, is session-bound, and stale telemetry cannot unlock controls', async t => {
@@ -500,6 +520,7 @@ test('transaction observers run only after successful durable commit', () => {
   const store = new Store(':memory:', [{ id: 'board', token: firstDeviceToken }]);
   const events = [];
   store.observability = {
+    run: (_name, _attributes, fn) => fn(),
     currentTraceparent: () => '00-' + 'a'.repeat(32) + '-' + 'b'.repeat(16) + '-01',
     record: name => events.push(name), queueTime: { observe: () => events.push('queueMetric') }
   };

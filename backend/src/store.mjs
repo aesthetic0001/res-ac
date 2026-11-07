@@ -10,8 +10,11 @@ export function canonical(value) {
   return JSON.stringify(value);
 }
 export class Store {
-  constructor(path, devices = [], observability) {
+  constructor(path, devices = [], observability, { fanHeartbeatCheckpointMs = 0 } = {}) {
+    if (![0, 60_000].includes(fanHeartbeatCheckpointMs)) throw new TypeError('Invalid fan heartbeat checkpoint');
     this.observability = observability;
+    this.fanHeartbeatCheckpointMs = fanHeartbeatCheckpointMs;
+    this.fanReports = new Map();
     this.commitObservers = null;
     this.presence = new Map();
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -32,7 +35,7 @@ export class Store {
     if (!this.db.prepare('PRAGMA table_info(commands)').all().some(column => column.name === 'traceparent'))
       this.db.exec('ALTER TABLE commands ADD COLUMN traceparent TEXT');
     if (observability) {
-      for (const name of ['transaction', 'device', 'seen', 'fanState', 'setFanState', 'reading', 'readingHistory', 'enqueue', 'command', 'claim', 'result', 'resultAndClaim', 'expire', 'createSession', 'session', 'logout', 'snapshot']) {
+      for (const name of ['transaction', 'device', 'seen', 'fanState', 'setFanState', 'reportFanState', 'reading', 'readingHistory', 'enqueue', 'command', 'claim', 'result', 'resultAndClaim', 'expire', 'createSession', 'session', 'logout', 'snapshot']) {
         const original = this[name].bind(this);
         this[name] = (...args) => observability.run(`db.${name}`, { 'db.system.name': 'sqlite' }, () => original(...args));
       }
@@ -41,9 +44,12 @@ export class Store {
   }
   close() {
     const pending = [...this.presence].filter(([, state]) => state.latest !== state.persisted);
-    if (pending.length) this.transaction(() => {
+    const fanPending = [...this.fanReports].filter(([, state]) => state.latest !== state.persisted);
+    if (pending.length || fanPending.length) this.transaction(() => {
       for (const [id, state] of pending)
         this.db.prepare('UPDATE devices SET last_seen=? WHERE id=?').run(state.latest, id);
+      for (const [id, state] of fanPending)
+        this.db.prepare('UPDATE fan_states SET received_at=? WHERE device_id=?').run(state.latest, id);
     });
     this.db.close();
   }
@@ -55,20 +61,26 @@ export class Store {
       return result;
     };
     if (this.commitObservers !== null) return execute();
-    this.db.exec('BEGIN IMMEDIATE');
+    this.transactionPhase('begin', 'BEGIN IMMEDIATE');
     this.commitObservers = [];
     let result, observers;
     try {
       result = execute();
-      this.db.exec('COMMIT');
+      this.transactionPhase('commit', 'COMMIT');
       observers = this.commitObservers;
     } catch (error) {
-      this.db.exec('ROLLBACK');
+      this.transactionPhase('rollback', 'ROLLBACK');
       throw error;
     } finally { this.commitObservers = null; }
     // Optional diagnostics must not prevent delivery of a committed command.
     for (const observe of observers) { try { observe(); } catch {} }
     return result;
+  }
+  transactionPhase(phase, statement) {
+    const execute = () => this.db.exec(statement);
+    return this.observability
+      ? this.observability.run(`db.${phase}`, { 'db.system.name': 'sqlite' }, execute)
+      : execute();
   }
   afterCommit(fn) {
     if (this.commitObservers !== null) this.commitObservers.push(fn);
@@ -79,7 +91,7 @@ export class Store {
     if (row && this.presence.has(id)) row.last_seen = this.presence.get(id).latest;
     return row;
   }
-  seen(id) {
+  seen(id, { deferPersistence = false } = {}) {
     let state = this.presence.get(id);
     if (!state) {
       const row = this.db.prepare('SELECT last_seen FROM devices WHERE id=?').get(id);
@@ -89,6 +101,9 @@ export class Store {
     }
     const now = Date.now();
     state.latest = now;
+    // An unchanged heartbeat has no new durable state. The next ordinary
+    // write/checkpoint or graceful shutdown persists conservative freshness.
+    if (deferPersistence) return;
     // Presence stays exact in the live API. Persist at most once per five
     // seconds of incoming traffic; command/result commits remain fully durable.
     if (state.persisted === null || now < state.persisted || now - state.persisted >= 5000) {
@@ -97,14 +112,36 @@ export class Store {
     }
   }
   fanState(id) {
+    const cached = this.commitObservers === null && this.fanReports.get(id);
+    if (cached) return { ...JSON.parse(cached.serialized), receivedAt: cached.latest };
     const row = this.db.prepare('SELECT state,received_at FROM fan_states WHERE device_id=?').get(id);
+    if (row && this.fanHeartbeatCheckpointMs && this.commitObservers === null) this.fanReports.set(id, {
+      serialized: canonical(JSON.parse(row.state)), latest: row.received_at, persisted: row.received_at
+    });
     return row ? { ...JSON.parse(row.state), receivedAt: row.received_at } : null;
+  }
+  reportFanState(id, state) {
+    if (this.fanHeartbeatCheckpointMs && this.commitObservers === null) {
+      this.fanState(id); // Seed from durable state after restart.
+      const previous = this.fanReports.get(id), now = Date.now();
+      if (previous && previous.serialized === canonical(state) && now >= previous.persisted &&
+          now - previous.persisted < this.fanHeartbeatCheckpointMs) {
+        this.seen(id, { deferPersistence: true });
+        this.afterCommit(() => { previous.latest = now; });
+        return true;
+      }
+    }
+    return this.transaction(() => { this.seen(id); return this.setFanState(id, state); });
   }
   setFanState(id, state) {
     const previous = this.fanState(id);
     if (previous?.sessionId === state.sessionId && previous.revision > state.revision) return false;
+    const serialized = canonical(state), now = Date.now();
     this.db.prepare('INSERT INTO fan_states(device_id,state,received_at) VALUES(?,?,?) ON CONFLICT(device_id) DO UPDATE SET state=excluded.state,received_at=excluded.received_at')
-      .run(id, canonical(state), Date.now());
+      .run(id, serialized, now);
+    if (this.fanHeartbeatCheckpointMs) this.afterCommit(() => {
+      this.fanReports.set(id, { serialized, latest: now, persisted: now });
+    });
     return true;
   }
   reading(id, value) {

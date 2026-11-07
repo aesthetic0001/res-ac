@@ -250,7 +250,9 @@ export function createApp(config, store, observability) {
               assert(automatic.targetLevel === null || (Number.isInteger(automatic.targetLevel) && automatic.targetLevel >= 0 && automatic.targetLevel <= 5), 'Invalid automatic target');
               Object.assign(state.automatic, { status: automatic.status, targetLevel: automatic.targetLevel, minAdjustmentSeconds: 30 });
             }
-            if (!store.transaction(() => { touch(); return store.setFanState(id, state); })) throw new HttpError(409, 'Outdated fan revision');
+            const accepted = store.reportFanState(id, state);
+            touched = true; // reportFanState has already updated live presence.
+            if (!accepted) throw new HttpError(409, 'Outdated fan revision');
             return json(res, 200, { ok: true });
           }
           if (req.method === 'POST' && route === 'readings' && !commandId) {

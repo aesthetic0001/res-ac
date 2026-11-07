@@ -8,7 +8,10 @@ export function loadConfig(env = process.env) {
   if (env.DEVICE_TOKEN.length < 32) throw new Error('DEVICE_TOKEN must have at least 32 characters');
   const port = Number(env.PORT || 3000);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Invalid PORT');
+  const fanHeartbeatCheckpointMs = Number(env.FAN_HEARTBEAT_CHECKPOINT_MS || 0);
+  if (![0, 60_000].includes(fanHeartbeatCheckpointMs)) throw new Error('Invalid FAN_HEARTBEAT_CHECKPOINT_MS');
   return {
+    fanHeartbeatCheckpointMs,
     port, host: env.HOST || '0.0.0.0', httpDev: env.HTTP_DEV === 'true',
     dbPath: resolve(env.DATA_DIR || './data', 'sensors.sqlite'),
     tlsDir: resolve(env.TLS_DIR || '/run/sensor-tls'),

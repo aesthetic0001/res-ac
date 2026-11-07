@@ -11,7 +11,7 @@ import { readIdentity, watchIdentity } from './tls.mjs';
 process.umask(0o077);
 const config = loadConfig();
 const observability = new Observability({ endpoint: process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, lokiEndpoint: process.env.LOKI_PUSH_ENDPOINT });
-const store = new Store(config.dbPath, config.devices, observability);
+const store = new Store(config.dbPath, config.devices, observability, { fanHeartbeatCheckpointMs: config.fanHeartbeatCheckpointMs });
 observability.collect(store, config);
 const metricTimer = setInterval(() => observability.collect(store, config), 60_000);
 metricTimer.unref();

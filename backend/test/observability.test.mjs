@@ -301,9 +301,31 @@ test('device, AVR and backend spans share one trace with server requests nested 
   assert.equal(byName['http.server'].parentSpanContext.spanId, byName['http.device'].spanContext().spanId);
   assert.equal(byName['db.transaction'].parentSpanContext.spanId, byName['http.server'].spanContext().spanId);
   assert.equal(byName['db.reading'].parentSpanContext.spanId, byName['db.transaction'].spanContext().spanId);
+  for (const phase of ['begin', 'commit']) {
+    assert.equal(byName[`db.${phase}`].parentSpanContext.spanId, byName['db.transaction'].spanContext().spanId);
+    assert.equal(byName[`db.${phase}`].status.code, 1);
+  }
   assert.equal(byName['http.device'].kind, 2); // CLIENT
   assert.equal(byName['http.server'].kind, 1); // SERVER
   assert.ok(f.logs.some(log => log.operation === 'sensor.read' && log.service === 'res-ac-avr'));
+});
+
+test('transaction phase tracing preserves nested transactions and rollback after a failed durable commit', async t => {
+  const f = await fixture(t);
+  f.store.db.exec('CREATE TABLE phase_probe(device_id TEXT REFERENCES devices(id) DEFERRABLE INITIALLY DEFERRED)');
+  assert.throws(() => f.store.transaction(() => {
+    f.store.transaction(() => f.store.db.prepare('INSERT INTO phase_probe VALUES(?)').run('missing-device'));
+  }), /FOREIGN KEY/);
+  assert.equal(f.store.db.prepare('SELECT count(*) n FROM phase_probe').get().n, 0);
+  assert.equal(f.store.db.prepare('PRAGMA synchronous').get().synchronous, 2);
+  f.store.transaction(() => f.store.transaction(() => f.store.db.prepare('INSERT INTO phase_probe VALUES(?)').run('board')));
+  assert.equal(f.store.db.prepare('SELECT count(*) n FROM phase_probe').get().n, 1);
+  await f.obs.provider.forceFlush();
+  const phases = f.exporter.getFinishedSpans().filter(span => ['db.begin', 'db.commit', 'db.rollback'].includes(span.name));
+  assert.deepEqual(phases.map(span => span.name), ['db.begin', 'db.commit', 'db.rollback', 'db.begin', 'db.commit']);
+  assert.equal(phases[1].status.code, 2);
+  assert.equal(phases[2].status.code, 1);
+  assert.equal(phases[4].status.code, 1);
 });
 
 test('command result persistence remains beneath the result-upload server span', async t => {
