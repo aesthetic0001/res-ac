@@ -64,4 +64,49 @@ Validation: 67 backend tests pass, including independent SQLite reads, real
 SIGKILL recovery, failed deferred-constraint COMMIT, rollback/nested revision
 checks, clock rollback, shutdown timestamp accuracy and HTTP-route checks.
 
-Production results: pending.
+## Production result: rejected
+
+Four declared windows completed, with every backend fan/reading request paired
+to its device span (no missing traces or failed requests). The state hash stayed
+unchanged throughout each observed window.
+
+| Window | Mode | Fan samples | Fan median / p95 | Reading median / p95 |
+| --- | --- | ---: | ---: | ---: |
+|1 | Individual commits |47 |100 /150ms |100 /120ms |
+|2 | Checkpoint |48 |70 /150ms |100 /170ms |
+|3 | Individual commits |47 |100 /150ms |85 /120ms |
+|4 | Checkpoint |47 |70 /140ms |90 /190ms |
+
+Pooled fan latency was100/150ms versus70/150ms: median improved30%, p95
+improved0%. Fan commits fell from94 to8 (91.5% fewer). Reading latency was
+90/120ms versus100/190ms,48 samples per mode. The primary p95 gate failed;
+reading tails were also worse in the candidate windows. Do not merge or roll out.
+These windows establish no causal explanation for the reading-tail difference.
+
+Commit tracing found control fan BEGIN at about0.02ms p95 and COMMIT at72ms
+p95. This confirms durable commit dominates lock acquisition. In the candidate,
+two reports took240/340ms with backend work below1ms and fresh TCP/TLS setup.
+A430ms report used an existing connection, with418ms inside curl and backend
+work below1ms. Removing all remaining checkpoint commit durations from the
+first candidate's paired fan samples would still leave p95 at150ms. Another
+small storage change therefore cannot be assumed to fix that tail.
+
+Header-only packet logs showed two long-lived spare HTTPS flows closed by the
+server61.000/61.001seconds after their last data, consistent with the configured
+60-second keep-alive plus Node's buffer. Flow inference uses duration/encrypted
+payload lengths, not decrypted identity; short-lived diagnostic HTTPS traffic
+was separated. Short-lived Grafana/trace reads were issued while some later
+windows/warmups were running. This is an observational limitation; all request
+tails remain included and no adjusted passing result is claimed.
+
+After measurements, a real calibration-only command succeeded once in166ms
+and advanced the immediately persisted revision from3 to4.20 further harmless
+pings passed on their first attempt. No physical IR or firmware flash occurred.
+The accepted6fa81ab image/source was restored with the live database retained;
+six recovery pings passed on their first attempt in122–155ms, with fresh uploads,
+calibrated fan-off state, zero pending commands and SQLite quick_check=ok.
+The idle WAL keeper and guarded rollback timer were removed/disarmed.
+
+The experiment remains disabled by default and this draft is closed. Network
+connection reuse/transport attribution and persistent storage service remain
+investigation targets; this experiment does not establish a network-bound system.
