@@ -68,6 +68,59 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(resets, ['radio0'])
 
 
+class TransportRecoveryTests(unittest.TestCase):
+    def test_five_minutes_of_failures_renews_dhcp_then_escalates_to_radio(self):
+        recovery = watchdog.TransportRecovery()
+        renew, radio = [], []
+        health = dict(failed_since=0)
+        for now in [0, 30, 299]:
+            self.assertFalse(recovery.tick('up', 'radio0', now, health, lambda: renew.append(now), radio.append))
+        self.assertTrue(recovery.tick('up', 'radio0', 300, health, lambda: renew.append(300), radio.append))
+        self.assertEqual(renew, [300])
+        self.assertFalse(recovery.tick('up', 'radio0', 599, health, lambda: None, radio.append))
+        self.assertTrue(recovery.tick('up', 'radio0', 600, health, lambda: None, radio.append))
+        self.assertEqual(radio, ['radio0'])
+        self.assertEqual(recovery.next_attempt, 1200)
+
+    def test_manual_disable_unknown_or_stale_agent_state_cannot_reset_network(self):
+        recovery = watchdog.TransportRecovery()
+        for state, health in [('disabled', dict(failed_since=0)), ('unknown', dict(failed_since=0)),
+                             ('down', dict(failed_since=0)), ('up', None), ('up', dict(failed_since=None))]:
+            self.assertFalse(recovery.tick(state, 'radio0', 1000, health,
+                                          lambda: self.fail('unexpected DHCP restart'),
+                                          lambda radio: self.fail('unexpected radio restart')))
+
+    def test_recovery_backoff_is_reserved_even_if_reconfiguration_fails(self):
+        recovery = watchdog.TransportRecovery()
+        def fail():
+            raise IOError('failure')
+        with self.assertRaises(IOError):
+            recovery.tick('up', 'radio0', 300, dict(failed_since=0), fail, lambda radio: None)
+        self.assertEqual(recovery.next_attempt, 600)
+        self.assertFalse(recovery.tick('up', 'radio0', 301, dict(failed_since=0), fail, lambda radio: None))
+
+    def test_five_minutes_of_success_resets_escalation_but_a_brief_recovery_does_not(self):
+        recovery = watchdog.TransportRecovery()
+        recovery.tick('up', 'radio0', 300, dict(failed_since=0), lambda: None, lambda radio: None)
+        recovery.tick('up', 'radio0', 301, dict(failed_since=None), lambda: None, lambda radio: None)
+        recovery.tick('up', 'radio0', 400, dict(failed_since=399), lambda: None, lambda radio: None)
+        self.assertEqual(recovery.stage, 1)
+        recovery.tick('up', 'radio0', 500, dict(failed_since=None), lambda: None, lambda radio: None)
+        recovery.tick('up', 'radio0', 800, dict(failed_since=None), lambda: None, lambda radio: None)
+        self.assertEqual((recovery.stage, recovery.cooldown), (0, 300))
+
+    def test_uplink_always_comes_back_up_and_rechecks_manual_policy(self):
+        with patch.object(watchdog, 'snapshot', return_value=('disabled', None)), patch.object(watchdog, 'command') as command:
+            watchdog.renew_uplink()
+            watchdog.transport_restart_radio('radio0')
+            command.assert_not_called()
+        with patch.object(watchdog, 'snapshot', return_value=('up', 'radio0')), patch.object(watchdog, 'report'), \
+                patch.object(watchdog, 'command', side_effect=[IOError('failed'), '']) as command:
+            with self.assertRaises(IOError):
+                watchdog.renew_uplink()
+            self.assertEqual(command.call_args_list[-1].args[0], ['ifup', 'wwan'])
+
+
 class SnapshotTests(unittest.TestCase):
     def test_compacts_empty_containers_for_legacy_json_without_changing_strings(self):
         text = '{"empty": [\n\t ], "object": {\n\t }, "label": "with spaces and \\\"quotes\\\""}'
@@ -97,6 +150,25 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(watchdog.snapshot(), ('up', 'radio0'))
             repair.assert_not_called()
         watchdog.command.assert_called_once_with(['ifstatus', 'wwan'], allow_failure=True)
+
+    def test_roaming_uses_current_interface_and_gateway(self):
+        details = {}
+        with patch.object(watchdog, 'default_exists', return_value=True):
+            self.assertEqual(watchdog.snapshot(details), ('up', 'radio0'))
+        self.assertEqual(details, dict(device='wlan0', gateways=['192.0.2.1']))
+
+    def test_roaming_respects_ap_pin_and_current_uplink_policy(self):
+        self.settings['wireless.eduroam.bssid'] = '02:00:00:00:00:01'
+        with patch.object(watchdog, 'snapshot') as snapshot:
+            self.assertFalse(watchdog.roaming_allowed('radio0', 'wlan0'))
+            snapshot.assert_not_called()
+        del self.settings['wireless.eduroam.bssid']
+        with patch.object(watchdog, 'default_exists', return_value=True):
+            self.assertTrue(watchdog.roaming_allowed('radio0', 'wlan0'))
+            self.assertFalse(watchdog.roaming_allowed('radio1', 'wlan0'))
+            self.assertFalse(watchdog.roaming_allowed('radio0', 'wlan1'))
+            self.status['autostart'] = False
+            self.assertFalse(watchdog.roaming_allowed('radio0', 'wlan0'))
 
     def test_missing_route_is_repaired_using_current_lease_before_radio_reset(self):
         with patch.object(watchdog, 'default_exists', side_effect=[False, True]), patch.object(watchdog, 'repair') as repair:

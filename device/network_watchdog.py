@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Recover a stuck eduroam uplink on the legacy Seeeduino Linux system.
 
-No external probes, credential changes, or board reboots. Run as
+Bounded local gateway probes, no credential changes or board reboots. Run as
 an independent service so HTTPS polling and sensor collection remain available.
 """
 from __future__ import print_function
@@ -11,8 +11,10 @@ import subprocess
 import sys
 import time
 
-from res_ac_agent import decode_json
+from res_ac_agent import decode_json, HealthHeartbeat
+from service_supervisor import read_health
 from dhcp_route_repair import repair, default_exists
+from wifi_roaming import Roaming, link_health
 
 monotonic = getattr(time, 'monotonic', lambda: os.times()[4])
 
@@ -48,7 +50,7 @@ def network_status(text):
     return decode_json(compact)
 
 
-def snapshot():
+def snapshot(details=None):
     """Return (state, radio); unknown/disabled states never permit a reset."""
     if (setting('wireless.eduroam.network') != 'wwan' or
             setting('wireless.eduroam.mode') != 'sta' or
@@ -79,6 +81,8 @@ def snapshot():
     if not gateways:
         return 'down', radio
     metric = int(setting('network.wwan.metric', '0'))
+    if details is not None:
+        details.update(device=device, gateways=gateways)
     if all(default_exists(device, gateway, metric) for gateway in gateways):
         return 'up', radio
     # Repair the known DHCP route before considering a radio restart. This uses
@@ -122,12 +126,56 @@ class Recovery(object):
         restart(radio)
 
 
+class TransportRecovery(object):
+    """Escalate prolonged total transport loss without rebooting Linux/AVR."""
+    def __init__(self):
+        self.next_attempt = 0
+        self.cooldown = 300
+        self.stage = 0
+        self.good_since = None
+
+    def tick(self, state, radio, now, health, renew, restart):
+        if state != 'up' or health is None:
+            self.good_since = None
+            return False
+        failed = health['failed_since']
+        if failed is None:
+            if self.good_since is None:
+                self.good_since = now
+            if now - self.good_since >= 300:
+                self.stage, self.cooldown = 0, 300
+            return False
+        self.good_since = None
+        if now - failed < 300 or now < self.next_attempt:
+            return False
+        self.next_attempt = now + self.cooldown
+        self.cooldown = min(self.cooldown * 2, 1800)
+        if self.stage == 0:
+            self.stage = 1
+            renew()
+        else:
+            restart(radio)
+        return True
+
+
 def report(message):
+    # Keep recovery evidence even if the firmware's tiny shared syslog buffer
+    # is overwritten by unrelated vendor services. RAM only; no flash wear.
+    path = '/tmp/res-ac-network.log'
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 32768:
+            with open(path, 'w'):
+                pass
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(descriptor, 'a') as stream:
+            stream.write(time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()) + ' ' + message + '\n')
+    except (IOError, OSError):
+        pass
     command(['logger', '-t', 'res-ac-network', message])
 
 
 def restart_radio(radio):
-    report('Wi-Fi uplink unavailable for two minutes; restarting radio')
+    report('Wi-Fi uplink recovery: restarting configured radio')
     # The legacy wifi tool accepts a UCI radio name. Always attempt the up step,
     # including after a failure/timeout bringing the interface down.
     try:
@@ -136,20 +184,77 @@ def restart_radio(radio):
         command(['wifi', 'up', radio], timeout=20)
 
 
+def renew_uplink():
+    # Recheck manual policy immediately before changing the configured uplink.
+    state, radio = snapshot()
+    if state != 'up':
+        return
+    report('Sustained device transport loss: restarting configured DHCP uplink')
+    try:
+        command(['ifdown', 'wwan'], timeout=20)
+    finally:
+        command(['ifup', 'wwan'], timeout=20)
+
+
+def transport_restart_radio(radio):
+    state, current = snapshot()
+    if state == 'up' and current == radio:
+        report('Device transport still unavailable: escalating to radio recovery')
+        restart_radio(radio)
+
+
+def roaming_allowed(radio, device):
+    # An explicit AP pin is policy. Do not override it, even temporarily.
+    if setting('wireless.eduroam.bssid', ''):
+        return False
+    details = {}
+    state, current_radio = snapshot(details)
+    return state == 'up' and current_radio == radio and details.get('device') == device
+
+
 def main():
+    os.umask(0o077)
     if '--check' in sys.argv:
         state, radio = snapshot()
         print('Wi-Fi watchdog uplink state: ' + state)
         return
+    if '--check-link' in sys.argv:
+        details = {}
+        state, radio = snapshot(details)
+        if state == 'up':
+            health = link_health(details['device'], details['gateways'], command)
+            print('Wi-Fi watchdog link state: ' + health['state'])
+            if 'received' in health:
+                print('Gateway replies: %d/%d; Wi-Fi transmit failures during probe: %d' %
+                      (health['received'], health['sent'], health['failed']))
+        else:
+            print('Wi-Fi watchdog uplink state: ' + state)
+        return
     recovery = Recovery()
+    transport = TransportRecovery()
+    heartbeat = HealthHeartbeat('network') if os.environ.get('RESAC_SUPERVISED') == '1' else None
+    roaming = Roaming(command, report, restart_radio, roaming_allowed)
     previous = None
     while True:
         try:
-            state, radio = snapshot()
+            if heartbeat is not None:
+                heartbeat.tick()
+            details = {}
+            state, radio = snapshot(details)
             if state != previous:
                 report('Wi-Fi uplink state: ' + state)
                 previous = state
+            health = read_health('/tmp/res-ac-agent.health', monotonic(), 30)
+            recovered = transport.tick(state, radio, monotonic(), health, renew_uplink, transport_restart_radio)
+            if recovered:
+                roaming.reset_observation()
+                time.sleep(30)
+                continue
             recovery.tick(state, radio, monotonic(), restart_radio)
+            if state == 'up' and not setting('wireless.eduroam.bssid', ''):
+                roaming.tick(details['device'], details['gateways'], radio, monotonic())
+            else:
+                roaming.reset_observation()
         except Exception as error:
             # Do not include command output, addresses, credentials, or URLs.
             if previous != 'error':
@@ -159,6 +264,7 @@ def main():
                     pass
             previous = 'error'
             recovery.tick('unknown', None, monotonic(), restart_radio)
+            roaming.reset_observation()
         time.sleep(30)
 
 

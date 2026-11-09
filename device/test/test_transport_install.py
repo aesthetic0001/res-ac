@@ -28,6 +28,7 @@ class TransportInstallTests(unittest.TestCase):
         self.gpio_ok = True
         self.bridge_ok = True
         self.native_ok = True
+        self.reset_ok = True
         outer = self
 
         class Console:
@@ -44,6 +45,8 @@ class TransportInstallTests(unittest.TestCase):
 
             def run(self, command, **kwargs):
                 outer.events.append(('run', command))
+                if command == 'test -x /usr/bin/reset-mcu' and not outer.reset_ok:
+                    raise RuntimeError('MCU reset utility unavailable')
                 if command == '/tmp/res-ac-http.pending --version':
                     return b'res-ac-http protocol=1 libcurl=8.23.0'
                 if command == '/tmp/res-ac-bridge.pending --version':
@@ -71,7 +74,7 @@ class TransportInstallTests(unittest.TestCase):
                                      'prepare_bridge_socket_wait': self.preparer}):
             spec.loader.exec_module(self.installer)
 
-    def invoke(self, native=False):
+    def invoke(self, native=False, start=False):
         with tempfile.TemporaryDirectory() as directory:
             helper = Path(directory) / 'helper'
             helper.write_bytes(elf())
@@ -80,7 +83,8 @@ class TransportInstallTests(unittest.TestCase):
                                               device_token='PRIVATE', ca_file='/etc/res-ac/ca-bundle.pem',
                                               curl_binary='/tmp/old-curl')))
             config.chmod(0o600)
-            args = ['install_device.py', '--config', str(config), '--http-helper', str(helper), '--no-start']
+            args = ['install_device.py', '--config', str(config), '--http-helper', str(helper)]
+            if not start: args.append('--no-start')
             if native: args += ['--native-bridge-helper', str(helper)]
             with patch.object(sys, 'argv', args), patch.object(self.installer, 'urlopen',
                     side_effect=lambda *args, **kwargs: io.BytesIO(b'-----BEGIN CERTIFICATE-----\nPUBLIC\n')):
@@ -114,6 +118,26 @@ class TransportInstallTests(unittest.TestCase):
         self.assertLess(backup,launcher)
         self.assertEqual(gzip.decompress(self.uploads['/usr/lib/res-ac/bridge.gz']),elf())
         self.assertIn('/usr/lib/res-ac/native_bridge_protocol.py',self.uploads)
+
+    def test_watchdog_dependencies_are_installed_before_either_service_starts(self):
+        self.invoke(start=True)
+        reset = self.events.index(('run', 'test -x /usr/bin/reset-mcu'))
+        for role in ['agent', 'network']:
+            stopped = self.events.index(('run', 'if test -x /etc/init.d/res-ac-%s; then /etc/init.d/res-ac-%s stop; fi' % (role, role)))
+            started = self.events.index(('run', '/etc/init.d/res-ac-%s start' % role))
+            self.assertLess(reset, stopped)
+            for name in ['res_ac_agent.py', 'service_supervisor.py', 'network_watchdog.py', 'wifi_roaming.py']:
+                installed = self.events.index(('upload', '/usr/lib/res-ac/' + name))
+                self.assertLess(stopped, installed)
+                self.assertLess(installed, started)
+
+    def test_missing_mcu_reset_utility_keeps_the_existing_runtime_running(self):
+        self.reset_ok = False
+        with self.assertRaises(RuntimeError):
+            self.invoke()
+        self.assertFalse(any(event[0] == 'run' and ' stop' in event[1] for event in self.events))
+        self.assertFalse(any(path.startswith('/usr/lib/res-ac/') for path in self.uploads))
+        self.assertEqual(self.events[-1], ('close', 'console'))
 
     def test_bad_native_helper_does_not_stop_or_replace_running_agent(self):
         self.native_ok=False

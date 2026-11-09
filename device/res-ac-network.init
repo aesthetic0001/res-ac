@@ -3,8 +3,16 @@ START=96
 STOP=9
 
 start() {
-    start-stop-daemon -S -b -m -p /var/run/res-ac-network.pid -x /usr/bin/python -- /usr/lib/res-ac/network_watchdog.py
+    umask 077
+    start-stop-daemon -S -b -m -p /var/run/res-ac-network.pid -x /usr/bin/python -- -u /usr/lib/res-ac/service_supervisor.py network
 }
 stop() {
     start-stop-daemon -K -p /var/run/res-ac-network.pid
+    local attempts=0
+    while test -f /var/run/res-ac-network.pid && kill -0 "$(cat /var/run/res-ac-network.pid)" 2>/dev/null; do
+        attempts=$((attempts + 1))
+        test "$attempts" -le 12 || return 1
+        sleep 1
+    done
+    rm -f /var/run/res-ac-network.pid
 }

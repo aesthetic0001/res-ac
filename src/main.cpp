@@ -55,6 +55,7 @@ unsigned long lastCommandCheckMs = 0;
 const unsigned long HOUSEKEEPING_MS = 250;
 unsigned long intervalMs = DEFAULT_INTERVAL_MS;
 unsigned long lastSampleMs = 0;
+unsigned long lastHealthMs = 0;
 unsigned long sequence = 0;
 unsigned long sensorAttempts = 0;
 unsigned long sensorErrors = 0;
@@ -603,6 +604,7 @@ void setup() {
   publishValue("resac_command_result", "");
   publishValue("resac_command_diagnostic", "");
   publishValue("resac_sensor_diagnostic", "");
+  bridgePut("resac_health", "v1,0");
   bridgePut("resac_fan_invalidate", "");
   invalidateFan();
 #if RESAC_COMMAND_GPIO
@@ -685,6 +687,13 @@ void loop() {
   if (fanStatePending) { publishFanState(); serviceCommandNotification(); }
   // Recheck time after command execution, which can include physical IR dwell.
   const unsigned long now = millis();
+  if (static_cast<unsigned long>(now - lastHealthMs) >= 5000) {
+    lastHealthMs = now;
+    char health[24];
+    snprintf(health, sizeof(health), "v1,%lu", now);
+    bridgePut("resac_health", health);
+    serviceCommandNotification();
+  }
   if (static_cast<unsigned long>(now - lastHousekeepingMs) >= HOUSEKEEPING_MS) {
     lastHousekeepingMs = now;
     updateInterval();

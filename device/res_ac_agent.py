@@ -26,6 +26,40 @@ CURVE_PATH = '/etc/res-ac/fan-curve.json'
 AUTO_STATE_PATH = '/tmp/res-ac-auto-command-result.json'
 COMMAND_ID = r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'
 monotonic = getattr(time, 'monotonic', lambda: os.times()[4])
+
+
+class HealthHeartbeat(object):
+    """Main-loop progress and transport state, in private RAM rather than flash."""
+    def __init__(self, service, directory='/tmp'):
+        self.path = directory + '/res-ac-' + service + '.health'
+        self.next_due = 0
+        self.transport_failure_since = None
+
+    def http_result(self, status, code):
+        if status or code not in (6, 7, 28):
+            # Any HTTP response establishes a working transport, including a
+            # backend error. Auth/certificate errors do not justify radio resets.
+            self.transport_failure_since = None
+        elif self.transport_failure_since is None:
+            self.transport_failure_since = monotonic()
+
+    def tick(self):
+        now = monotonic()
+        if now < self.next_due:
+            return
+        self.next_due = now + 5
+        staging = self.path + '.new'
+        try:
+            descriptor = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(descriptor, 'w') as stream:
+                stream.write('%d %.6f %.6f\n' % (os.getpid(), now,
+                    self.transport_failure_since if self.transport_failure_since is not None else -1))
+            os.rename(staging, self.path)
+        except (IOError, OSError):
+            # Supervision observes the missing progress; diagnostics must not
+            # interrupt sampling or an in-progress physical command.
+            pass
+
 try:
     text_type = unicode
 except NameError:
@@ -1260,9 +1294,10 @@ class HttpTransport(object):
 def request_completed(request):
     # The running agent uses an in-memory flag set by a completion event.
     # Standalone CLI probes and older test adapters retain their process API.
-    if hasattr(request, 'completed'):
+    try:
         return request.completed
-    return request.process.poll() is not None
+    except AttributeError:
+        return request.process.poll() is not None
 
 
 class CurlUpload(object):
@@ -1274,6 +1309,9 @@ class CurlUpload(object):
         self.result = None
         self.telemetry = config.get('_telemetry')
         self.started = monotonic()
+        self.deadline = self.started + timeout + 5
+        self.expired = False
+        self.health = config.get('_health')
         self.prepared_at, self.journal_ms = None, journal_ms
         self.reported = False
         path = route.split('?', 1)[0]
@@ -1334,12 +1372,33 @@ class CurlUpload(object):
 
     @property
     def completed(self):
-        return self.result.completed if self.result is not None else self.process.poll() is not None
+        completed = self.result.completed if self.result is not None else self.process.poll() is not None
+        if not completed and monotonic() >= getattr(self, 'deadline', float('inf')) and not getattr(self, 'expired', False):
+            self.expired = True
+            if self.result is not None:
+                # Reset the shared helper if its own timeout/completion handling
+                # stalls. All pending attempts fail; callers retain retry IDs.
+                self.transport._failed()
+                self.result.code = 28
+                self.result.local_error = False
+                self.result.completed = True
+            else:
+                try:
+                    self.process.kill()
+                except OSError as error:
+                    if error.errno != errno.ESRCH:
+                        raise
+            completed = self.result.completed if self.result is not None else self.process.poll() is not None
+        return completed
 
     def _report(self, status, code, diagnostics=None):
-        if self.reported or self.telemetry is None:
+        if self.reported:
             return
         self.reported = True
+        if getattr(self, 'health', None) is not None:
+            self.health.http_result(status, code)
+        if self.telemetry is None:
+            return
         # Telemetry attempts join the next ordinary scheduled batch. Reporting
         # an event never starts an upload or changes the heartbeat/backoff.
         outcome = ('ok' if 200 <= status < 300 else 'failed') if not code else {6: 'dns', 7: 'connect', 28: 'timeout', 35: 'tls', 60: 'tls'}.get(code, 'other')
@@ -1367,6 +1426,9 @@ class CurlUpload(object):
                              attributes, span_id=self.request_traceparent[36:52])
 
     def finish(self):
+        if self.expired:
+            self._report(0, 28, {'error.reason': 'timeout', 'error.stage': 'local'})
+            raise UploadError(curl_code=28)
         if self.result is not None:
             if not self.result.completed:
                 raise RuntimeError('HTTP request has not completed')
@@ -1401,7 +1463,7 @@ class CurlUpload(object):
         if self.result is not None:
             self.transport.cancel(self.result)
         if self.process is not None and self.process.poll() is None:
-            self.process.terminate()
+            self.process.kill()
             self.process.communicate()
         for path in self.files:
             if os.path.exists(path):
@@ -2267,6 +2329,8 @@ def next_wakeup(bridge, telemetry, commands, automation, fan_reporter, pending, 
 
 
 def run(config):
+    health = HealthHeartbeat('agent') if os.environ.get('RESAC_SUPERVISED') == '1' else None
+    config['_health'] = health
     native = config.get('native_bridge', False)
     bridge = config.get('_bridge') or BridgeEvents(port=5701 if native else 5700, native=native,
                                                    command_gpio=CommandGPIO(), timing=config.get('_timing_trace'))
@@ -2286,6 +2350,8 @@ def run(config):
     sample = None
     try:
         while True:
+            if health is not None:
+                health.tick()
             timing = config.get('_timing_trace')
             if timing and timing.dump_requested and commands.current is None and not automation.busy:
                 timing.write(config['_timing_path'])
@@ -2325,8 +2391,19 @@ def run(config):
                         log('Reading request setup failed; retaining sample for retry')
             fan_reporter.tick()
             telemetry.tick(pending)
-            http.wait(bridge, next_wakeup(bridge, telemetry, commands, automation,
-                                          fan_reporter, pending, upload, retry_at))
+            wakeup = next_wakeup(bridge, telemetry, commands, automation,
+                                 fan_reporter, pending, upload, retry_at)
+            # The persistent helper's IPC completion can itself stop arriving.
+            # Service both the external health heartbeat and request deadlines.
+            requests = [upload, getattr(telemetry, 'request', None),
+                        getattr(commands, 'request', None), getattr(fan_reporter, 'request', None)]
+            deadlines = [request.deadline for request in requests
+                         if request is not None and getattr(request, 'deadline', None) is not None]
+            if health is not None:
+                deadlines.append(health.next_due)
+            if deadlines:
+                wakeup = min(wakeup, max(0, min(deadlines) - monotonic()))
+            http.wait(bridge, wakeup)
     finally:
         telemetry.close()
         commands.close()

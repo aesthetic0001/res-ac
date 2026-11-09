@@ -84,11 +84,91 @@ uplink every 30 seconds. If it stays without an IPv4 lease/default route for
 two minutes, it restarts the configured Wi-Fi radio. It first repairs a missing
 route from netifd's current lease when possible. Repeated radio recovery attempts
 wait 5, 10, 20, then 30 minutes; five minutes of a healthy uplink resets that
-backoff. Short outages and backend/HTTPS failures alone do not restart Wi-Fi.
+backoff. Short outages do not restart Wi-Fi.
 The watchdog respects disabled eduroam/radio settings, `ifdown wwan`, and
 `auto=0`/`defaultroute=0`. It changes no credentials or persistent network settings
 and never reboots the board. The radio restart affects every interface on that
 radio. State changes/recovery attempts are logged with the `res-ac-network` tag.
+
+The watchdog also detects an associated but unusable Wi-Fi link. It probes the
+current DHCP gateway with four bounded pings and checks the associated station's
+transmit-failure counter before and after that probe. At least 50% gateway loss
+and two new Wi-Fi transmit failures must persist for two minutes before recovery.
+Blocked/rate-limited ICMP without those transmit failures, unknown counters, and
+backend outages alone do not trigger access-point changes.
+
+On a poor link it scans, then tries another WPA2-Enterprise/CCMP access point for
+the same configured SSID, with signal at least −80 dBm. It uses the existing
+supplicant profile and one-time `ROAM` requests, preserving EAP credentials and
+certificate verification. Recovery selections avoid failed access points in RAM for 15, 30,
+then up to 60 minutes; this bounded history resets at service restart. Recovery
+attempts have 5/10/20/30-minute backoff and a one-minute settling period; five
+minutes of measured healthy connectivity resets the backoff. If no eligible AP
+exists, a radio restart is the fallback. An explicitly configured BSSID pin is
+respected. Recovery settings and the service persist across reboot; no AP is
+permanently pinned or excluded. It cannot recover an outage affecting every AP.
+
+Recovery events also go to a bounded RAM-only `/tmp/res-ac-network.log`, because
+unrelated vendor services can overwrite the firmware's small shared syslog buffer.
+
+When the agent's main loop remains healthy but **all** device HTTP traffic has
+transport failures (DNS/connect/timeouts) for five minutes, network recovery
+restarts the configured `wwan` DHCP uplink with `ifdown`/`ifup`. If failures
+continue, it escalates to a radio restart after another five minutes. Further
+attempts wait 10, 20, then 30 minutes. Five minutes of successful transport resets
+escalation. Any HTTP response, including a backend 4xx/5xx, clears the transport
+failure timer. Certificate/authentication errors do not request network resets.
+Unknown/stale agent health and manually disabled uplinks cannot trigger this
+path. A completely unreachable backend can cause bounded network recovery attempts;
+those attempts do not establish that Wi-Fi caused the outage.
+
+### Process and firmware watchdogs
+
+Both init services run `service_supervisor.py` on the board's **Linux AR9331**,
+independently of the Python agent and AVR sketch. Each supervisor starts its
+worker in a separate process group and restarts it after exit, with 5-second
+exponential backoff capped at five minutes. Five minutes of healthy progress
+resets that backoff. The agent and network worker publish PID-bound monotonic
+main-loop heartbeats to private `/tmp/res-ac-agent.health` and
+`/tmp/res-ac-network.health` files. An agent heartbeat older than two minutes,
+or a network-worker heartbeat older than three minutes, triggers termination
+and restart. A healthy event loop continues retrying network failures without
+restarting the agent or losing its RAM sample queue.
+
+The agent supervisor independently reads a dedicated AVR `resac_health` counter
+every ten seconds through local Bridge. The sketch updates it every five seconds,
+including when DHT11 readings fail. After a three-minute startup grace, 90 seconds
+without advancing firmware progress triggers an AVR reset through the platform's
+`/usr/bin/reset-mcu` utility. The agent and its HTTP children are stopped first,
+then the AVR is reset and the agent restarted. Repeated firmware resets wait
+10, 20, 40, then 60 minutes. Successful reset-command exit is logged separately
+from actual recovery: advancing AVR heartbeats establish recovery.
+The supervisor selects the native binary Bridge listener when the installed
+private configuration enables `native_bridge`; otherwise it uses the legacy
+JSON listener. Native health reads have a bounded total deadline and handle
+fragmented responses, so protocol differences cannot masquerade as a frozen AVR.
+
+AVR reset invalidates fan calibration and clears stale command mailboxes. The
+existing durable command journal prevents replay of uncertain IR actions. A hard
+agent restart loses its RAM-only sample/diagnostic queues. Watchdogs do not send
+fan commands, rewrite firmware, alter saved network credentials, or reboot Linux.
+Linux must remain running for these watchdogs to work; a frozen Linux kernel or
+loss of power requires a hardware watchdog or external power recovery.
+
+Supervisor reasons and restart activity are retained in bounded private
+`/tmp/res-ac-agent-supervisor.log` and `/tmp/res-ac-network-supervisor.log` files.
+Each keeps one rotated previous log and the latest 32 KiB worker-log tail at
+`/tmp/res-ac-agent.log.last-failure` or `/tmp/res-ac-network.log.last-failure`.
+These records are local RAM logs, not automatically exported to Grafana.
+
+Install the agent, supervisor, network worker, and matching AVR sketch together.
+An older sketch without `resac_health` appears unhealthy to this supervisor.
+For upgrades, use `scripts/install_device.py --no-start`, flash the matching
+main sketch, then start both init services. Stop both services before entering
+the recovery serial-terminal firmware or performing a firmware maintenance session,
+so automatic recovery does not interfere. Init `stop` disables respawning and
+waits for worker cleanup before a subsequent start. The installer checks that
+the platform MCU-reset utility exists; it never guesses reset GPIO wiring.
 
 ## Reporting and retries
 
@@ -241,6 +321,8 @@ logread | grep res-ac-network
 The watchdog is enabled at boot by the installer. Stop it with
 `/etc/init.d/res-ac-network stop`; run `/etc/init.d/res-ac-network disable` to
 keep it off after a reboot.
+`/etc/init.d/res-ac-agent stop` stops agent/AVR supervision; stop both services
+before deliberate firmware maintenance.
 
 Use `--probe` only to verify connectivity/authentication; it inserts no test
 reading. Do not run a second full agent alongside the startup service. Use the

@@ -92,6 +92,7 @@ def main():
         bundle += cert + b'\n'
     console = Console(args.port)
     try:
+        console.run('test -x /usr/bin/reset-mcu')
         console.run('mkdir -p /usr/lib/res-ac /etc/res-ac; chmod 700 /etc/res-ac')
         # Stage and preflight in RAM before replacing the existing TLS client.
         console.upload(helper_gzip, '/tmp/res-ac-http.pending.gz')
@@ -133,7 +134,8 @@ def main():
         if b'PASS: verified HTTPS' not in probe:
             raise RuntimeError('The board HTTPS/device-token preflight did not pass. Firmware has not been changed.')
         print('Verified trusted HTTPS and device authentication; no synthetic reading was inserted.')
-        console.run('if test -x /etc/init.d/res-ac-agent; then /etc/init.d/res-ac-agent stop; fi; true')
+        console.run('if test -x /etc/init.d/res-ac-agent; then /etc/init.d/res-ac-agent stop; fi')
+        console.run('if test -x /etc/init.d/res-ac-network; then /etc/init.d/res-ac-network stop; fi')
         console.upload(socket_wait, bridge_path + 'bridge_socket_wait.py', 0o644)
         console.upload(bridge_reader, bridge_path + 'packet.py.res-ac-pending', 0o644)
         console.run('test -f ' + bridge_path + 'packet.py.res-ac-original || '
@@ -150,6 +152,7 @@ def main():
                     'rm -f /tmp/res-ac-http.pending.gz /tmp/res_ac_agent.pending.py '
                     '/tmp/res-ac-curl /tmp/res-ac-curl.new')
         console.upload(agent_source, '/usr/lib/res-ac/res_ac_agent.py')
+        console.upload((root / 'device/service_supervisor.py').read_bytes(), '/usr/lib/res-ac/service_supervisor.py')
         if bridge_gzip is not None:
             console.upload(bridge_gzip, '/usr/lib/res-ac/bridge.gz')
             console.run('test -f /usr/bin/run-bridge.res-ac-original || '
@@ -163,14 +166,15 @@ def main():
         for name in ('timing_trace.py', 'bridge_timing.py', 'run_bridge_timing.py', 'native_bridge_protocol.py', 'cooperative_json.py', 'command_wire.py'):
             console.upload((root / 'device' / name).read_bytes(), '/usr/lib/res-ac/' + name)
         console.upload((root / 'device/dhcp_route_repair.py').read_bytes(), '/usr/lib/res-ac/dhcp_route_repair.py')
+        console.upload((root / 'device/wifi_roaming.py').read_bytes(), '/usr/lib/res-ac/wifi_roaming.py')
         console.upload((root / 'device/network_watchdog.py').read_bytes(), '/usr/lib/res-ac/network_watchdog.py')
         console.upload(data, staged)
         console.run('mv /etc/res-ac/agent.pending.json /etc/res-ac/agent.json; chmod 600 /etc/res-ac/agent.json')
         console.upload((root / 'device/res-ac-agent.init').read_bytes(), '/etc/init.d/res-ac-agent', 0o755)
         console.run('/etc/init.d/res-ac-agent enable')
-        console.run('if test -x /etc/init.d/res-ac-network; then /etc/init.d/res-ac-network stop; fi; true')
         console.upload((root / 'device/res-ac-network.init').read_bytes(), '/etc/init.d/res-ac-network', 0o755)
-        console.run('/etc/init.d/res-ac-network enable')
+        # Legacy rc.common can report failure while its valid S96 link exists.
+        console.run('/etc/init.d/res-ac-network enable || test -L /etc/rc.d/S96res-ac-network')
         # Preserve other user DHCP hooks; the helper only repairs missing routes.
         hook = ('# res-ac DHCP route repair\n'
                 'python /usr/lib/res-ac/dhcp_route_repair.py "$1" || :\n')
