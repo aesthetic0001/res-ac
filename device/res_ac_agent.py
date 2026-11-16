@@ -1517,7 +1517,7 @@ class Collector(object):
             status = self.bridge.get('resac_sensor_status')
             if status != self.last_status:
                 if status == 'read_error':
-                    log('DHT11 read failed; invalid samples are not uploaded')
+                    log('Sensor read failed; invalid samples are not uploaded')
                 self.last_status = status
             if not streaming:
                 frame = self.bridge.get('resac_sample')

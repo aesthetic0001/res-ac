@@ -3,7 +3,7 @@
 The target is to make avoidable software cost smaller than the measured network
 contribution on the deployed device, under ordinary operation and command bursts.
 Percentage improvement alone does not establish that target. Physical IR dwell
-and DHT sampling must remain visible separately. Network-bound completion has
+and sensor sampling must remain visible separately. Network-bound completion has
 not yet been demonstrated; burst profiling and further residual work remain.
 
 ## Production trial, 2026-11-06

@@ -788,7 +788,7 @@
         {
           "refId": "C",
           "expr": "resac_device_value{metric=\"sensor_errors_total\"}",
-          "legendFormat": "{{device}} — DHT11 read errors"
+          "legendFormat": "{{device}} — sensor read errors"
         }
       ],
       "fieldConfig": {
@@ -808,7 +808,7 @@
           "showLegend": true
         }
       },
-      "description": "Cumulative discarded readings and diagnostic records since the Linux agent started, plus failed DHT11 reads since the AVR reset. Values reset with their originating process/processor. Sensor read errors are distinct from network upload failures."
+      "description": "Cumulative discarded readings and diagnostic records since the Linux agent started, plus failed sensor reads since the AVR reset. Values reset with their originating process/processor. Sensor read errors are distinct from network upload failures."
     },
     {
       "id": 19,

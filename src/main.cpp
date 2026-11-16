@@ -1,7 +1,8 @@
 #include <Arduino.h>
 #include <Bridge.h>
 #include <Mailbox.h>
-#include <DHT.h>
+#include <Wire.h>
+#include <Adafruit_SHT4x.h>
 #include <stdlib.h>
 #include <string.h>
 #include <FanState.h>
@@ -33,18 +34,16 @@ ISR(PCINT0_vect) {
 }
 #endif
 
-// Software carrier leaves the Bridge UART, millis() and DHT11 pin available.
+// Software carrier leaves the Bridge UART, millis() and sensor I2C bus available.
 #define IR_SEND_PIN 9
 #define IR_SEND_DUTY_CYCLE_PERCENT 50
 #define DISABLE_CODE_FOR_RECEIVER
 #define NO_LED_FEEDBACK_CODE
 #include <IRremote.hpp>
 
-#define DHTPIN 3
-#define DHTTYPE DHT11
-
 namespace {
-DHT dht(DHTPIN, DHTTYPE);
+Adafruit_SHT4x sht40;
+bool sensorReady = false;
 const unsigned long DEFAULT_INTERVAL_MS = 10000;
 #if RESAC_COMMAND_GPIO
 bool commandLowHandled = false;
@@ -470,6 +469,26 @@ void publishSensorDiagnostic(const char *epoch, unsigned long duration, bool ok)
   publishValue("resac_sensor_diagnostic", frame);
 }
 
+bool beginSensor() {
+  sensorReady = sht40.begin(&Wire);
+  if (sensorReady) {
+    sht40.setPrecision(SHT4X_HIGH_PRECISION);
+    sht40.setHeater(SHT4X_NO_HEATER);
+  }
+  return sensorReady;
+}
+
+bool readSensor(float &temperature, float &humidity) {
+  // Retry detection at the sample cadence without blocking Bridge/IR startup.
+  if (!sensorReady && !beginSensor()) return false;
+  sensors_event_t humidityEvent, temperatureEvent;
+  if (!sht40.getEvent(&humidityEvent, &temperatureEvent)) return false;
+  temperature = temperatureEvent.temperature;
+  humidity = humidityEvent.relative_humidity;
+  return !isnan(humidity) && !isnan(temperature) && humidity >= 0 && humidity <= 100 &&
+         temperature >= -80 && temperature <= 150;
+}
+
 #if RESAC_BATCHED_COMMANDS
 struct SensorPublication {
   char epoch[33];
@@ -489,10 +508,9 @@ void publishSample() {
       bridgeGet("resac_epoch", sample.epoch, sizeof(sample.epoch) - 1);
       const unsigned long started = millis();
       ++sensorAttempts;
-      const float humidity = dht.readHumidity(), temperature = dht.readTemperature();
+      float humidity, temperature;
+      sample.valid = readSensor(temperature, humidity);
       sample.duration = millis() - started; sample.sampledAt = millis();
-      sample.valid = !isnan(humidity) && !isnan(temperature) && humidity >= 0 && humidity <= 100 &&
-                     temperature >= -80 && temperature <= 150;
       if (!sample.valid) ++sensorErrors;
       else {
         sample.temperatureMilli = lround(temperature * 1000.0f);
@@ -536,15 +554,14 @@ void publishSample() {
   bridgeGet("resac_epoch", epoch, sizeof(epoch) - 1);
   const unsigned long started = millis();
   ++sensorAttempts;
-  const float humidity = dht.readHumidity();
-  const float temperature = dht.readTemperature();
+  float humidity, temperature;
+  const bool valid = readSensor(temperature, humidity);
   const unsigned long duration = static_cast<unsigned long>(millis() - started);
-  if (isnan(humidity) || isnan(temperature) || humidity < 0 || humidity > 100 ||
-      temperature < -80 || temperature > 150) {
+  if (!valid) {
     ++sensorErrors;
     publishSensorDiagnostic(epoch, duration, false);
     publishValue("resac_sensor_status", "read_error");
-    Serial.println(F("DHT11 read failed; no sample published"));
+    Serial.println(F("SHT40 read failed; no sample published"));
     return;
   }
   Serial.print(F("Temperature: ")); Serial.print(temperature, 1);
@@ -584,7 +601,10 @@ void setup() {
   commandNotificationsReady = false;
   controlSession[0] = 0;
   Serial.begin(115200);
-  dht.begin();
+  Wire.begin();
+  // Bound bus faults so a disconnected/stuck sensor cannot stall fan commands.
+  Wire.setWireTimeout(25000, true);
+  if (!beginSensor()) Serial.println(F("SHT40 not found; retrying at sample interval"));
   IrSender.begin();
   Serial.println(F("Starting sensor Bridge; Linux boot may take a moment..."));
   Bridge.begin();
@@ -629,7 +649,7 @@ void setup() {
 #endif
   publishValue("resac_command_ready", "v4");
   publishValue("resac_events", "v1");
-  Serial.println(F("Bridge ready; DHT11 on digital pin 3"));
+  Serial.println(F("Bridge ready; SHT40 on I2C (0x44)"));
   Serial.println(F("IR on digital pin 9; calibration required before sending"));
   lastSampleMs = millis() - DEFAULT_INTERVAL_MS;
   commandNotificationsReady = true;
@@ -646,7 +666,7 @@ void serviceCommandNotification() {
     commandWake = false;
     pending = (PINB & _BV(PB2)) == 0;
   }
-  // A held level also catches assertion during DHT's interrupt-masked section.
+  // A held level also catches assertions while interrupts are masked.
   // Reading the local input does not generate a Bridge transaction.
   if (!pending) commandLowHandled = false;
   if (pending && (wake || !commandLowHandled)) {

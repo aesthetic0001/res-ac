@@ -160,6 +160,6 @@ Run backend and agent tests and compile the firmware. Cover auth/validation,
 retry identity, bounded diagnostic buffers, failed HTTP attempts, command context
 persistence and redelivery, and telemetry sink outages. Validate Compose/configs
 and, when Docker is available, run an ingestion smoke test. On hardware, verify
-DHT11 disconnection, Bridge unavailability, Wi-Fi loss/recovery, AVR timeout/reset,
+SHT40 disconnection, Bridge unavailability, Wi-Fi loss/recovery, AVR timeout/reset,
 and command redelivery. Missing device reports should alert during an outage;
 local failure details appear after reconnection if the bounded RAM queue survives.

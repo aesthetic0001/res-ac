@@ -1,7 +1,7 @@
 # Woozoo PCF-SC15T-CT infrared control
 
 The Seeeduino Cloud AVR sends **38 kHz extended NEC** on **digital pin 9**.
-The DHT11 remains on digital pin 3. Arduino-IRremote is pinned to 4.4.1 and uses
+The SHT40 uses the Grove I2C connector. Arduino-IRremote is pinned to 4.4.1 and uses
 a software carrier at 50% duty; no receive timer or IR input is enabled.
 Nothing transmits automatically at startup.
 
@@ -135,7 +135,7 @@ from off to level 5 at 24 °C. The solid line connects the control points; the
 dashed step curve shows the applied discrete levels. Cooling hysteresis still
 applies, including dropping an equal-threshold group together.
 
-The Seeeduino's Linux agent evaluates fresh DHT11 samples locally, so operation
+The Seeeduino's Linux agent evaluates fresh SHT40 samples locally, so operation
 does not depend on a backend temperature polling job. On heating, a threshold
 applies as soon as it is reached. On cooling, its configurable hysteresis (default
 1 °C) must also be crossed: with the balanced preset, level 3 begins at 26 °C

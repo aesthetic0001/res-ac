@@ -98,14 +98,31 @@ class FirmwareSchedulingTests(unittest.TestCase):
                 };
                 extern TestMailbox Mailbox;
             ''',
-            'DHT.h': r'''
+            'Wire.h': r'''
                 #pragma once
-                #define DHT11 11
-                struct DHT {
-                  DHT(int, int) {}
+                struct TwoWire {
                   void begin() {}
-                  float readHumidity() { return 50; }
-                  float readTemperature() { return 22; }
+                  void setWireTimeout(unsigned long, bool) {}
+                } Wire;
+            ''',
+            'Adafruit_SHT4x.h': r'''
+                #pragma once
+                #include "Wire.h"
+                enum {SHT4X_HIGH_PRECISION, SHT4X_NO_HEATER};
+                struct sensors_event_t { float temperature, relative_humidity; };
+                struct Adafruit_SHT4x {
+                  bool present = true, readOk = true;
+                  float temperature = 22, humidity = 50;
+                  unsigned int reads = 0, begins = 0;
+                  bool begin(TwoWire *) { ++begins; return present; }
+                  void setPrecision(int) {}
+                  void setHeater(int) {}
+                  bool getEvent(sensors_event_t *h, sensors_event_t *t) {
+                    ++reads;
+                    delay(10);
+                    h->relative_humidity = humidity; t->temperature = temperature;
+                    return present && readOk;
+                  }
                 };
             ''',
             'IRremote.hpp': r'''
@@ -142,6 +159,8 @@ class FirmwareSchedulingTests(unittest.TestCase):
             const char *id2 = "22222222-2222-4222-8222-222222222222";
             void reset() {
               testClock = lastSampleMs = lastHousekeepingMs = 0;
+              sensorReady = false; sht40 = Adafruit_SHT4x();
+              sequence = sensorAttempts = sensorErrors = 0;
               commandNotificationsReady = true; commandExecuting = false; fanStatePending = false; fanRevision=0; readHook = nullptr; mailboxHook = nullptr;
               #if RESAC_BATCHED_COMMANDS
               sensorPublication.stage=0;
@@ -175,7 +194,39 @@ class FirmwareSchedulingTests(unittest.TestCase):
             int main(int argc, char **argv) {
               assert(argc == 2); reset();
               const std::string mode = argv[1];
-              if (mode == "gpio") {
+              if (mode == "sensor") {
+                auto sample = []() {
+                  publishSample();
+                  #if RESAC_BATCHED_COMMANDS
+                  while (sensorPublication.stage) publishSample();
+                  #endif
+                };
+                sht40.present = false;
+                setup(); // Missing sensor must not prevent Bridge startup.
+                assert(Bridge.values["resac_command_ready"] == "v4");
+                Bridge.values["resac_epoch"] = session;
+                sample();
+                assert(Bridge.values["resac_sensor_status"] == "read_error");
+                assert(Bridge.values["resac_sample"].empty());
+                assert(sequence == 0 && sensorErrors == 1 && sht40.reads == 0);
+                sht40.present = true; sht40.temperature = 23.125f; sht40.humidity = 48.75f;
+                sample();
+                assert(Bridge.values["resac_sensor_status"] == "ok");
+                assert(Bridge.values["resac_sample"].find(",1,23125,48750,") != std::string::npos);
+                assert(sequence == 1 && sensorErrors == 1 && sht40.reads == 1);
+                const auto goodSample = Bridge.values["resac_sample"];
+                // A driver/CRC error must reject even plausible event values.
+                sht40.readOk = false; sample();
+                assert(Bridge.values["resac_sensor_status"] == "read_error");
+                assert(Bridge.values["resac_sample"] == goodSample && sequence == 1);
+                sht40.readOk = true; sht40.humidity = 101; sample();
+                sht40.humidity = 50; sht40.temperature = std::numeric_limits<float>::quiet_NaN(); sample();
+                assert(sensorErrors == 4 && sequence == 1);
+                sht40.temperature = -2.5f; sample();
+                assert(Bridge.values["resac_sensor_status"] == "ok" && sequence == 2);
+                assert(Bridge.values["resac_sample"].find(",2,-2500,50000,") != std::string::npos);
+                assert(sensorAttempts == 6 && sht40.reads == 5 && sht40.begins == 3);
+              } else if (mode == "gpio") {
                 #if RESAC_COMMAND_GPIO
                 Bridge.values["resac_command"] = std::string("v1,") + id1 + ",ping";
                 for (unsigned long t=1; t<250; ++t) { testClock=t; loop(); }
@@ -430,6 +481,10 @@ class FirmwareSchedulingTests(unittest.TestCase):
 
     def test_sensor_publication_returns_to_command_loop_between_ordered_stages(self):
         subprocess.run([self.batched_binary, 'sensor-priority'], check=True)
+
+    def test_sht40_missing_sensor_read_failures_and_recovery(self):
+        for binary in (self.binary, self.batched_binary):
+            subprocess.run([binary, 'sensor'], check=True)
 
     def test_opt_in_timing_captures_irq_handler_and_uart_without_recursive_work(self):
         subprocess.run([self.timing_binary, 'timing'], check=True)
