@@ -33,7 +33,7 @@ use their own tokens; browser logins use server-side cookie sessions.
 
 ## Device status
 
-`src/main.cpp` reads a DHT11 on digital pin 3 and publishes temperature/humidity
+`src/main.cpp` reads an SHT40 on the Grove I2C connector and publishes temperature/humidity
 through the internal Arduino Bridge. A Linux-side agent posts readings over
 verified HTTPS every 10 seconds, buffers samples during short outages, and
 retries with stable IDs to avoid duplicate records. Device credentials and the

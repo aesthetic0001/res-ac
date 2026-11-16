@@ -1,14 +1,24 @@
 # Seeeduino Cloud telemetry and fan control
 
 [Woozoo IR setup](IR.md) covers digital pin 9, emitter wiring, named fan buttons,
-raw NEC commands, and local serial testing. The DHT11 stays on digital pin 3.
+raw NEC commands, and local serial testing. The SHT40 uses the Grove I2C connector.
 
 For Linux OS upgrades, see the [firmware compatibility assessment](../FIRMWARE.md).
 
-The AVR sketch in `src/main.cpp` reads a **DHT11 on digital pin 3**. It uses the
+The AVR sketch in `src/main.cpp` reads an **SHT40 on the Grove I2C connector (address `0x44`)**. It uses the
 internal Arduino Bridge to publish a single sample containing temperature,
 humidity, a sequence number, and a Linux-provided boot/session epoch. Invalid
 sensor reads are reported as errors rather than uploaded as zero or stale data.
+
+The sensor uses the Arduino `Wire` bus with the Adafruit SHT4x driver, high
+precision, and its heater disabled. Each measurement reads temperature and
+humidity together. Failed detection retries at the configured sample interval;
+read/CRC failures publish `read_error` and do not create a sample. I2C waits have
+a 25 ms timeout with bus reset enabled so bus faults return to the command loop.
+
+Connect the SHT40 breakout to the board's **I2C** Grove socket (SDA, SCL, VCC,
+GND), rather than its UART socket. Use a breakout rated for the connector's
+power and logic levels. Pin 3 is no longer used by the sensor.
 
 `res_ac_agent.py` runs on the Linux processor. A small event loop receives pushed
 Bridge Mailbox events while one persistent libcurl helper handles HTTPS asynchronously. This works with

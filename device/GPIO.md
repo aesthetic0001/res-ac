@@ -37,7 +37,7 @@ interprocessor wiring despite using the same PlatformIO AVR target.
 4. The AVR's `PCINT0` ISR records a flag. The main loop checks the flag and held
    input, then reads Bridge once and runs the existing command handler. No
    Bridge calls or IR work run in the interrupt. Checking the held input catches
-   an assertion during a DHT section that masks interrupts.
+   an assertion while interrupts are masked.
 5. The matching AVR result wakes Linux through the existing Mailbox stream.
    Validated completion releases the GPIO before persisting/reporting the result.
    Duplicate IDs still return their retained result without repeating IR work.
